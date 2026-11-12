@@ -1,0 +1,22 @@
+[package]
+name = "file-tidy-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Read-only, no-follow native filesystem primitives for file-tidy"
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

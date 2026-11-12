@@ -1,0 +1,4 @@
+/target/
+/crates/gui/node_modules/
+/crates/gui/dist/
+*.part

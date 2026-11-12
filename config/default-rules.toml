@@ -1,0 +1,38 @@
+# Classification suggestions only. These rules never grant filesystem access.
+# Custom rules replace these mappings; unknown keys and path/script fields fail.
+schema_version = 1
+
+[[rules]]
+category = "document"
+extensions = ["txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub"]
+mime_types = ["application/pdf", "application/rtf", "application/epub+zip", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "text/plain"]
+
+[[rules]]
+category = "image"
+extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "svg", "ico", "raw"]
+mime_prefixes = ["image/"]
+
+[[rules]]
+category = "video"
+extensions = ["mp4", "mkv", "mov", "avi", "webm", "m4v", "mpeg", "mpg", "wmv"]
+mime_prefixes = ["video/"]
+
+[[rules]]
+category = "audio"
+extensions = ["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aiff", "wma"]
+mime_prefixes = ["audio/"]
+
+[[rules]]
+category = "archive"
+extensions = ["zip", "tar", "gz", "tar.gz", "bz2", "tar.bz2", "xz", "tar.xz", "zst", "tar.zst", "7z", "rar"]
+mime_types = ["application/zip", "application/gzip", "application/x-tar", "application/x-bzip2", "application/x-xz", "application/zstd", "application/x-7z-compressed", "application/x-rar-compressed", "application/vnd.rar"]
+
+[[rules]]
+category = "code"
+extensions = ["rs", "py", "js", "jsx", "ts", "tsx", "go", "c", "h", "cpp", "hpp", "java", "kt", "swift", "sh", "ps1", "html", "css", "json", "toml", "yaml", "yml", "xml", "md", "tex", "sql", "ipynb"]
+mime_types = ["application/json", "application/xml", "text/html", "text/css", "text/javascript", "application/javascript", "text/x-python", "text/x-shellscript"]
+
+[[rules]]
+category = "installer"
+extensions = ["exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "appimage", "apk"]
+mime_types = ["application/vnd.microsoft.portable-executable", "application/x-msdownload", "application/x-msi", "application/vnd.debian.binary-package", "application/x-rpm", "application/vnd.android.package-archive", "application/x-apple-diskimage"]
