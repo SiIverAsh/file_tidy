@@ -1,6 +1,6 @@
-# 阶段 0 验证记录
+# Journal 表结构检查
 
-日期：2026-11-12。本阶段完成架构设计、安全测试规格、依赖选型及 journal 表结构设计。
+本文说明 journal 表结构的 SQLite 约束检查方法和结果。
 
 ## 验证环境
 
@@ -11,7 +11,7 @@
 
 ## SQLite 表结构与约束
 
-加载 [journal-v1.sql](journal-v1.sql) 后，检查结果如下：
+加载 [journal.sql](journal.sql) 后，检查结果如下：
 
 - 7 个 STRICT 表创建成功，schema `user_version = 1`。
 - 合法的 copy 与 permanent_delete 记录可插入；永久删除记录要求显式标记 irreversible。
@@ -23,7 +23,7 @@
 在工程根目录复查基本 DDL：
 
 ```sh
-sqlite3 :memory: ".read docs/journal-v1.sql" \
+sqlite3 :memory: ".read docs/journal.sql" \
   "PRAGMA foreign_key_check;" \
   "PRAGMA integrity_check;" \
   "PRAGMA user_version;"
@@ -33,4 +33,4 @@ sqlite3 :memory: ".read docs/journal-v1.sql" \
 
 ## 后续验证安排
 
-Rust 工程构建、扫描和报告验证见[阶段 1 记录](stage-1-validation.md)。授权、文件操作、崩溃恢复与平台场景按[安全验收矩阵](security-test-matrix.md)执行。
+Rust 工程构建、扫描和报告验证见[测试说明](testing.md)。授权、文件操作、崩溃恢复与平台场景按[安全验收矩阵](security-test-matrix.md)执行。

@@ -14,8 +14,8 @@ use file_tidy_core::{CancellationToken, Progress, Rules, ScanOptions, render_tex
 #[command(
     name = "file-tidy",
     version,
-    about = "本地文件整理工具：阶段 1 只读扫描、分类和报告",
-    long_about = "本地文件整理工具：阶段 1 只读扫描、分类和报告。\n\
+    about = "本地文件整理工具：只读扫描、分类和报告",
+    long_about = "本地文件整理工具：只读扫描、分类和报告。\n\
 不移动、重命名、复制或删除文件，不创建缓存、journal 或文件日志。\n\
 敏感区域默认只读取元数据，重复结果仅供审阅。"
 )]

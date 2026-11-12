@@ -1,4 +1,4 @@
--- Journal v1 表结构设计：授权、操作状态、确认审计与隔离区记录。
+-- Journal 表结构设计：授权、操作状态、确认审计与隔离区记录。
 -- 应用打开已授权、私有、本地状态目录后再设置并读取验证：
 -- foreign_keys=ON; journal_mode=DELETE; synchronous=EXTRA;
 -- macOS 按支持情况启用 fullfsync；所有状态写入单写者串行化。

@@ -1,6 +1,6 @@
-# 阶段 1 验证记录
+# 测试说明
 
-日期：2026-11-12。本阶段完成只读扫描、分类、查重与 CLI 报告。
+本文记录只读扫描、分类、查重与 CLI 报告的检查方法和结果。
 
 ## 实现内容
 
@@ -31,7 +31,7 @@ cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo test --workspace --locked --offline
 ```
 
-提交前复查 `cargo test --locked --workspace`：**50 passed，0 failed，3 ignored**。
+`cargo test --locked --workspace` 运行结果：**50 passed，0 failed，3 ignored**。
 
 | 测试组 | 通过 | 跳过 |
 | --- | --- | --- |
@@ -57,16 +57,16 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 
 对本地卷执行 `--metadata-only --max-entries 32`：退出码 3，`limit_reached = true`、`complete = false`，扫描内容打开次数及读取字节数均为 0。
 
-参数与退出码见[阶段 1 使用说明](stage-1-usage.md)。
+参数与退出码见[使用说明](usage.md)。
 
 ## 平台与后续验证
 
 | 项目 | 当前记录与安排 |
 | --- | --- |
 | macOS | 已验证常规文件、目录、链接、硬链接、FIFO、socket、挂载枚举和 Data 卷敏感目录身份；云占位、TCC、外接卷及其他文件系统场景按矩阵补测 |
-| Windows 10/11 | 已编写平台分支和条件测试；原生构建、junction/reparse、长路径、文件 ID 与共享模式安排在阶段 5 |
-| Linux | 已运行 mountinfo 解析与 bind 边界数据测试；原生构建、真实挂载与特殊文件系统场景安排在阶段 5 |
+| Windows 10/11 | 已编写平台分支和条件测试；原生构建、junction/reparse、长路径、文件 ID 与共享模式列入原生平台验证 |
+| Linux | 已运行 mountinfo 解析与 bind 边界数据测试；原生构建、真实挂载与特殊文件系统场景列入原生平台验证 |
 | 资源规模 | 默认 250000 条目，上限 1000000；达到上限输出不完整报告，百万条目性能与内存压测待执行 |
 | 内容策略 | 扫描已确认的本地文件系统，敏感识别覆盖常见名字、目录和本次清单内的已知身份；`--metadata-only` 适用于全局零内容读取 |
-| 授权与文件操作 | 阶段 2 实现授权及计划，阶段 3 实现执行、journal、恢复与撤销 |
-| GUI 与依赖审计 | GUI 在阶段 4 实现，三平台 CI、打包、漏洞与许可证检查在阶段 5 执行 |
+| 授权与文件操作 | 后续实现授权、计划、执行、journal、恢复与撤销 |
+| GUI 与依赖审计 | 后续实现 GUI，并配置三平台 CI、打包、漏洞与许可证检查 |

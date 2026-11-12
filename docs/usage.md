@@ -1,6 +1,6 @@
-# 阶段 1 只读扫描与报告
+# 使用说明
 
-阶段 1 提供 Rust core、平台只读适配层和 clap CLI。扫描选定目录或本地卷，显示文件元数据、类型分类、空间占用、陈旧文件、重复组与跳过原因。后续功能安排见 [README 路线图](../README.md)。
+工具提供 Rust core、平台只读适配层和 clap CLI。扫描选定目录或本地卷，显示文件元数据、类型分类、空间占用、陈旧文件、重复组与跳过原因。
 
 ## 构建与运行
 
@@ -52,7 +52,7 @@ cargo run --locked -p file-tidy-cli -- scan --all --metadata-only
 
 显式指定 `--rules` 时需要读取该 TOML 配置。配置读取同样检查普通本地文件、无链接跟随和敏感区限制；其内容不写入错误日志。规则不能解除敏感区域、系统保护区域或节点过滤。
 
-隐藏文件和点文件可出现在只读清单中；后续整理计划仍将默认排除它们。项目、依赖目录和 `.app` 等整体会被标记，不会在阶段 1 触发任何修改。链接、Windows reparse point、特殊节点、虚拟文件系统、非本地卷和不确定的内容读取会被阻止或记录为跳过。
+隐藏文件和点文件可出现在只读清单中；后续整理计划仍将默认排除它们。项目、依赖目录和 `.app` 等整体会被标记，扫描期间仅采集和分析信息。链接、Windows reparse point、特殊节点、虚拟文件系统、非本地卷和不确定的内容读取会被阻止或记录为跳过。
 
 JSON 的路径结构包含展示文本、平台编码和原始整数单元，支持非 UTF-8 文件名。展示文本用于阅读，不能反向构造执行路径。大小等可能超过 JavaScript 安全整数范围的量使用十进制字符串；例如 `summary.content_bytes_read` 为 `"0"` 时表示没有读取扫描内容。
 
@@ -132,4 +132,4 @@ CLI 集成测试使用独立夹具验证 JSON、仅元数据读取统计、文�
 cargo test -p file-tidy-cli --test scan_cli non_utf8 -- --ignored
 ```
 
-各测试组结果见[阶段 1 验证记录](stage-1-validation.md)。Windows/Linux 原生运行、平台权限、挂载和打包 GUI 场景按[安全验收矩阵](security-test-matrix.md)执行。
+各测试组结果见[测试说明](testing.md)。Windows/Linux 原生运行、平台权限、挂载和打包 GUI 场景按[安全验收矩阵](security-test-matrix.md)执行。

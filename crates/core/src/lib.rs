@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Read-only inventory. There are no user-file write APIs in stage 1.
+//! Read-only file inventory, classification, and duplicate detection.
 
 pub mod classify;
 mod content;
