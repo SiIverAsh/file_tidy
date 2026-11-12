@@ -49,3 +49,7 @@ cargo run --locked -p file-tidy-cli -- scan --all --metadata-only
 ```
 
 报告输出到 stdout，进度输出到 stderr。更多参数见[使用说明](docs/usage.md)，分类规则见[默认配置](config/default-rules.toml)。
+
+## CI 与发布
+
+GitHub Actions 在 Linux、Windows 和 macOS 上运行构建与测试，并定期检查依赖安全与许可证。在 Actions 中手动运行 Release 并填写已推送的版本标签，检查通过后发布 CLI 下载包；配置与操作见 [CI 与发布说明](docs/ci-cd.md)。

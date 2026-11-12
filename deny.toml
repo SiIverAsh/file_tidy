@@ -1,0 +1,17 @@
+# Keep all platform-specific dependencies in the policy graph.
+[graph]
+all-features = true
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+# OptionExt is MPL-2.0; keep this approval scoped to the existing dependency.
+exceptions = [{ crate = "option-ext", allow = ["MPL-2.0"] }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

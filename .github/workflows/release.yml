@@ -1,0 +1,212 @@
+name: Release
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Validate version tag format
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Expected a version tag such as v0.1.0 or v0.2.0-rc.1' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Record immutable release commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: Release checks
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  security:
+    name: Release security
+    needs: resolve
+    uses: ./.github/workflows/security.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  plan:
+    name: Plan release
+    needs: [resolve, ci, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      commit: ${{ needs.resolve.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-dist@0.33.0
+      - name: Validate tag and plan artifacts
+        id: plan
+        run: |
+          dist plan --tag "$RELEASE_TAG" --output-format=json > plan.json
+          echo "matrix=$(jq -c '.ci.github.artifacts_matrix' plan.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-plan
+          path: plan.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Package (${{ join(matrix.targets, ', ') }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-dist@0.33.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: dist-${{ join(matrix.targets, '-') }}
+          save-if: false
+      - name: Build archives and checksums
+        id: build
+        env:
+          DIST_ARGS: ${{ matrix.dist_args }}
+          BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+        run: |
+          # dist supplies a whitespace-separated list of target flags.
+          read -r -a args <<< "$DIST_ARGS"
+          dist build --tag "$RELEASE_TAG" --output-format=json "${args[@]}" > dist-manifest.json
+          {
+            echo 'paths<<EOF'
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-local-${{ join(matrix.targets, '-') }}
+          path: |
+            ${{ steps.build.outputs.paths }}
+            target/distrib/*-dist-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  installers:
+    name: Build installers
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-dist@0.33.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-local-*
+          path: target/distrib
+          merge-multiple: true
+      - name: Build installers and release manifest
+        id: build
+        run: |
+          dist build --tag "$RELEASE_TAG" --artifacts=global --output-format=json > dist-manifest.json
+          {
+            echo 'paths<<EOF'
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-global
+          path: |
+            ${{ steps.build.outputs.paths }}
+            dist-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [ci, security, plan, build, installers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-local-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: dist-global
+          path: artifacts
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          title=$(jq -r '.announcement_title' artifacts/dist-manifest.json)
+          jq -r '.announcement_github_body' artifacts/dist-manifest.json > release-notes.md
+          args=()
+          if jq -e '.announcement_is_prerelease' artifacts/dist-manifest.json > /dev/null; then
+            args+=(--prerelease)
+          fi
+          # Internal per-platform manifests are not release assets.
+          find artifacts -name '*-dist-manifest.json' -delete
+          gh release create "$RELEASE_TAG" --verify-tag --target "$RELEASE_COMMIT" \
+            --title "$title" --notes-file release-notes.md "${args[@]}" artifacts/*

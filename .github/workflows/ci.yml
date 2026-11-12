@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check when called by the release workflow.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  tooling:
+    name: Formatting and workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-dist@0.33.0
+      - name: Install actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          gh release download v1.7.12 --repo rhysd/actionlint \
+            --pattern actionlint_1.7.12_linux_amd64.tar.gz --dir "$RUNNER_TEMP/actionlint"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Validate workflows
+        run: actionlint -color
+      - name: Validate release configuration
+        run: dist plan --output-format=json > /dev/null
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        shell: bash
+    env:
+      FILE_TIDY_TEST_ROOT: ${{ github.workspace }}/target/ci-test-fixtures
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Build release CLI
+        run: cargo build --release --locked -p file-tidy-cli
+      - name: Smoke test CLI
+        env:
+          EXE_SUFFIX: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: ./target/release/file-tidy"$EXE_SUFFIX" --help

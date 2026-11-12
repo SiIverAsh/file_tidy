@@ -1,0 +1,27 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = ["github"]
+hosting = ["github"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+installers = ["shell", "powershell"]
+# The repository maintains release.yml to enforce checks before publishing.
+# dist owns planning and packaging, but must not overwrite the workflow.
+allow-dirty = ["ci"]
+pr-run-mode = "skip"
+github-attestations = false
+
+[dist.github-custom-runners]
+global = "ubuntu-24.04"
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15"
+x86_64-pc-windows-msvc = "windows-2025"
+# Build against glibc 2.35 for compatibility with Ubuntu 22.04 and newer.
+x86_64-unknown-linux-gnu = "ubuntu-22.04"

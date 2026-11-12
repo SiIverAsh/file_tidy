@@ -1,0 +1,78 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/security.yml
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/security.yml
+  schedule:
+    # Daily at 10:23 Asia/Shanghai (02:23 UTC).
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check when called by the release workflow.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Dependency vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+      # Direct invocation also works on fork PRs with a read-only GITHUB_TOKEN.
+      - name: Audit locked dependencies
+        run: cargo audit --file Cargo.lock --json > audit-report.json
+      - name: Save audit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dependency-audit
+          path: audit-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  policy:
+    name: Dependency licenses and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          rust-version: 1.99.0
+          arguments: --locked --all-features
+          command: check bans licenses sources
