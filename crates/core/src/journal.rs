@@ -522,12 +522,14 @@ fn native_path(encoding: &str, bytes: &[u8]) -> Result<NativePath> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt;
-        if encoding != "windows_wide_le" || bytes.is_empty() || bytes.len() % 2 != 0 {
+        if encoding != "windows_wide_le" || bytes.is_empty() || !bytes.len().is_multiple_of(2) {
             return Err(E::StorageUnavailable);
         }
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
             .collect();
         if units.contains(&0) {
             return Err(E::StorageUnavailable);

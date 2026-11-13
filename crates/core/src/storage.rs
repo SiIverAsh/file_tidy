@@ -61,7 +61,7 @@ pub(crate) struct StateStore {
     storage_identity: Identity,
     _anchor: PinnedDirectory,
     _directory: PinnedDirectory,
-    directory: Dir,
+    _directory_cap: Dir,
     _lock: File,
     database: File,
     writable: bool,
@@ -251,7 +251,7 @@ impl StateStore {
             storage_identity: directory_info.identity.ok_or(E::StorageUnavailable)?.into(),
             _anchor: anchor,
             _directory: pinned,
-            directory,
+            _directory_cap: directory,
             _lock: lock,
             database: db_file,
             writable: true,
@@ -348,7 +348,7 @@ impl StateStore {
             storage_identity: state.storage_identity.clone(),
             _anchor: anchor,
             _directory: pinned,
-            directory,
+            _directory_cap: directory,
             _lock: lock,
             database: db,
             writable,
@@ -433,7 +433,10 @@ impl StateStore {
     }
     fn sync_directory(&self) -> Result<()> {
         #[cfg(unix)]
-        self.directory.try_clone()?.into_std_file().sync_all()?;
+        self._directory_cap
+            .try_clone()?
+            .into_std_file()
+            .sync_all()?;
         Ok(())
     }
 }

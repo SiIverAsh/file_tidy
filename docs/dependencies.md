@@ -30,7 +30,7 @@
 | [rustix](https://docs.rs/rustix/latest/rustix/) | 1.1.6 | Unix 安全 fd 包装、文件系统身份/空间与原子操作，按平台和 feature 引入 | 已用于平台读取 |
 | [windows-sys](https://docs.rs/windows-sys/latest/windows_sys/) | 0.61.2 | Windows 常量与必要句柄 API；FFI 只在 platform crate，按需启用 Win32 模块 | 已用于平台读取 |
 | [getrandom](https://docs.rs/getrandom/latest/getrandom/) | 0.4.3 | 计划/操作随机 ID、确认挑战和临时对象随机名；失败则拒绝生成能力 | 已用于授权、计划与确认 ID |
-| [rusqlite](https://docs.rs/rusqlite/latest/rusqlite/) | 0.42.0 | SQLite journal；拟使用 bundled 统一 SQLite，最终 feature 与底层版本须实际构建核实 | 已用于授权与确认快照 |
+| [rusqlite](https://docs.rs/rusqlite/latest/rusqlite/) | 0.42.0 | SQLite journal，使用 bundled SQLite | 已用于授权、确认快照和执行日志 |
 | [tauri](https://docs.rs/tauri/latest/tauri/) | 2.12.5 | 本地 IPC GUI，不需要产品运行时 HTTP 服务 | GUI 候选 |
 | [tauri-build](https://docs.rs/tauri-build/latest/tauri_build/) | 2.7.4 | GUI 构建及应用命令权限清单；与 tauri 的实际组合待构建 | GUI 候选 |
 
@@ -50,4 +50,4 @@ TypeScript、前端构建工具、Tauri JavaScript API、对话框库、打包�
 
 当前工具链为 `rustc 1.99.0`、`cargo 1.99.0`，平台 Darwin arm64。Workspace 使用 Rust 2024 edition，`rust-version` 设为 1.99。跨平台最小支持版本通过 CI 矩阵验证。
 
-CI 计划引入 cargo-audit 检查 workspace 锁文件及 GUI 依赖，并评估用 cargo-deny 检查许可证与来源策略。审计结果随 CI 记录保存。
+CI 使用 cargo-audit 检查锁定依赖，使用 cargo-deny 检查许可证与来源。`foldhash 0.2.0` 的 Zlib 和 `winx 0.36.4` 的 Apache-2.0 WITH LLVM-exception 已按包内 LICENSE 核对，许可记录限定到对应包与版本；配置格式见 [cargo-deny 许可证规则](https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html)。审计结果随 CI 保存。
