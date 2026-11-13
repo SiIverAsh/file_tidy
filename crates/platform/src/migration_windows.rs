@@ -2,9 +2,8 @@ use super::*;
 use std::ffi::{OsString, c_void};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::AsRawHandle;
 use std::ptr;
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -17,6 +16,10 @@ const EA: u32 = 2;
 const SECURITY: u32 = 3;
 const ALTERNATE: u32 = 4;
 const SPARSE: u32 = 9;
+fn native_error(action: &'static str) -> io::Error {
+    let error = io::Error::last_os_error();
+    io::Error::new(error.kind(), format!("{action}: {error}"))
+}
 
 pub(super) fn check_metadata(metadata: &MetadataInventory) -> io::Result<()> {
     let supported = FILE_ATTRIBUTE_READONLY
@@ -65,7 +68,7 @@ impl<'a> Backup<'a> {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(native_error("read migration backup stream"));
         }
         if used as usize > buffer.len() {
             return Err(invalid("backup read exceeded buffer"));
@@ -90,7 +93,7 @@ impl<'a> Backup<'a> {
                 )
             } == 0
             {
-                return Err(io::Error::last_os_error());
+                return Err(native_error("restore migration backup stream"));
             }
             if written == 0 || written as usize > buffer.len() - offset {
                 return Err(invalid("backup write made invalid progress"));
@@ -260,24 +263,6 @@ fn header(reader: &mut Reader<'_>) -> io::Result<Option<Header>> {
     }))
 }
 
-fn security_handle(file: &File) -> io::Result<File> {
-    // SAFETY: ReOpenFile refers to this live owned payload, not a pathname. The
-    // new handle permits native ACL restoration and shares the existing DELETE
-    // handle while the private envelope continues to protect pathname access.
-    let handle = unsafe {
-        ReOpenFile(
-            file.as_raw_handle(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: ReOpenFile transferred a unique valid synchronous handle.
-    Ok(unsafe { File::from_raw_handle(handle) })
-}
 fn control(file: &File, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<()> {
     let mut used = 0u32;
     // SAFETY: both buffers cover their stated lengths and the synchronous live
@@ -303,7 +288,7 @@ fn control(file: &File, code: u32, input: &[u8], output: &mut [u8]) -> io::Resul
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(native_error("restore migration storage attributes"));
     }
     if used as usize != output.len() {
         return Err(invalid("filesystem control response has invalid length"));
@@ -319,7 +304,7 @@ pub(super) fn copy(
     let mut source = source.try_clone()?;
     source.seek(SeekFrom::Start(0))?;
     target.seek(SeekFrom::Start(0))?;
-    let security_target = security_handle(target)?;
+    let security_target = target.try_clone()?;
     if metadata.native_flags() & u64::from(FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
         control(&security_target, FSCTL_SET_SPARSE, &[], &mut [])?;
     }
@@ -360,7 +345,7 @@ pub(super) fn copy(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(native_error("inspect migration file times"));
     }
     basic.ChangeTime = 0;
     basic.FileAttributes &= !(FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE);
@@ -377,7 +362,7 @@ pub(super) fn copy(
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(native_error("restore migration file times and attributes"));
     }
     check()
 }

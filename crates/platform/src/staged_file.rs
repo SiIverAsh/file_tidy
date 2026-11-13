@@ -62,6 +62,7 @@ impl StagedFile {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
+    #[cfg(unix)]
     pub(crate) fn into_file(self) -> File {
         self.file
     }

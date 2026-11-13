@@ -110,15 +110,24 @@ impl User {
 }
 
 pub(super) fn create_directory(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, true, false)
+    create_object(parent, name, true, false, 0)
 }
 pub(super) fn create_file(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, false, false)
+    create_object(parent, name, false, false, 0)
 }
 pub(super) fn create_staged_file(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, false, true)
+    create_object(parent, name, false, true, 0)
 }
-fn create_object(parent: &File, name: &OsStr, directory: bool, staged: bool) -> io::Result<File> {
+pub(super) fn create_migration_file(parent: &File, name: &OsStr) -> io::Result<File> {
+    create_object(parent, name, false, true, WRITE_DAC | WRITE_OWNER)
+}
+fn create_object(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    staged: bool,
+    extra_access: u32,
+) -> io::Result<File> {
     let user = User::current()?;
     let sid = user.sid_text()?;
     let inheritance = if directory { "OICI" } else { "" };
@@ -188,7 +197,7 @@ fn create_object(parent: &File, name: &OsStr, directory: bool, staged: bool) -> 
                     | FILE_GENERIC_WRITE
                     | READ_CONTROL
                     | if staged { DELETE } else { 0 }
-            },
+            } | extra_access,
             &attributes,
             &mut status_block,
             ptr::null(),
@@ -285,7 +294,7 @@ pub(super) fn verify(file: &File, directory: bool) -> io::Result<()> {
 }
 
 pub(super) fn create_staged_directory(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, true, true)
+    create_object(parent, name, true, true, 0)
 }
 pub(super) fn open_staged_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     open_staged_object(parent, name, true)

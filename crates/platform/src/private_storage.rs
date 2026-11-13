@@ -133,6 +133,10 @@ mod windows;
 pub(crate) fn create_staged_handle(parent: &File, name: &OsStr) -> io::Result<File> {
     windows::create_staged_file(parent, name)
 }
+#[cfg(windows)]
+pub(crate) fn create_migration_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::create_migration_file(parent, name)
+}
 
 #[cfg(windows)]
 pub(crate) fn create_staged_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {

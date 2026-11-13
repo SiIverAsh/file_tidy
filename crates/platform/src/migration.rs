@@ -48,7 +48,10 @@ impl MigrationFile {
     /// can leave an owned directory or payload requiring reconciliation.
     pub fn create(parent: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
         let envelope = StagedDirectory::create(parent, expected, name)?;
+        #[cfg(unix)]
         let file = envelope.create_file(Path::new("payload"))?.into_file();
+        #[cfg(windows)]
+        let file = envelope.create_migration_file()?;
         let envelope_path = parent.join(name);
         let value = Self {
             path: envelope_path.join("payload"),

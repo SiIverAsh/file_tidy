@@ -175,6 +175,14 @@ impl StagedDirectory {
                 .ok_or_else(|| io::Error::other("child name required"))?,
         )
     }
+    #[cfg(windows)]
+    pub(crate) fn create_migration_file(&self) -> io::Result<File> {
+        let parent = self.directory(Path::new(""))?;
+        crate::private_storage::create_migration_handle(
+            &parent.try_clone_file()?,
+            OsStr::new("payload"),
+        )
+    }
     pub fn create_symlink(
         &self,
         relative: &Path,
