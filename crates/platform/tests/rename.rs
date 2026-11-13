@@ -193,12 +193,13 @@ fn moves_windows_symlink_without_following_target() -> Result<(), Box<dyn std::e
     let target = root.join("renamed-link");
     let missing = root.join("absent");
     std::os::windows::fs::symlink_file(&missing, &source)?;
+    let link_target = fs::read_link(&source)?;
     let before = inspect(&source)?;
     assert_eq!(before.kind, file_tidy_platform::NodeKind::Symlink);
     assert!(before.identity.is_some());
     rename(&source, &before, &target)?;
     assert!(before.matches(&inspect(&target)?));
-    assert_eq!(fs::read_link(&target)?, missing);
+    assert_eq!(fs::read_link(&target)?, link_target);
     assert!(fs::symlink_metadata(&source).is_err());
     Ok(())
 }

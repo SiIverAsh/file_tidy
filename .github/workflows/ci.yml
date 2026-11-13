@@ -91,6 +91,7 @@ jobs:
               output.write(f"FILE_TIDY_TEST_ROOT={root.resolve()}\n")
           PY
       - name: Check lints
+        id: lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run workspace tests
         run: |
@@ -101,6 +102,7 @@ jobs:
           fi
           cargo test --workspace --locked
       - name: Run authorized filesystem tests
+        if: ${{ !cancelled() && steps.lints.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import os
