@@ -243,6 +243,37 @@ cargo run --locked -p file-tidy-cli -- quarantine restore ITEM_ID \
 
 恢复完成会追加独立批次，并记录与原隔离操作的关联。`recover` 可核对隔离或恢复中断后的实际位置与未完成日志。
 
+## 永久删除与隔离区清理
+
+预览并永久删除授权目录内的对象：
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan permanent-delete /absolute/local/workspace/source \
+  --state /absolute/local/workspace --include-hidden --permanent --execute
+```
+
+计划列出完整清单、总量、需要创建的私有目录和删除前的暂存位置。确认时输入 `PERMANENT <数量> <挑战码>`；超过 10 个文件/链接或 1 GiB 时另行核对数量，敏感项逐项确认写入范围。`--permanent` 与永久删除操作配合使用。
+
+执行先在同卷私有位置捕获原对象，再逐项移除文件、链接及空目录，每项分别保存意图与结果。链接处理链接本身。执行历史保留不可撤销的已删除项，`recover` 列出已确认移除数量、待核对的删除意图和当前尚存清单。
+
+清理已登记的隔离项：
+
+```sh
+cargo run --locked -p file-tidy-cli -- quarantine purge ITEM_ID \
+  --state /absolute/local/workspace --permanent --execute
+cargo run --locked -p file-tidy-cli -- quarantine purge --batch BATCH_ID \
+  --state /absolute/local/workspace --include-hidden --permanent --execute
+```
+
+清理重新审阅当前载荷、授权和确认词。中断后可对尚存清单生成新的清理计划，或显式恢复尚存内容：
+
+```sh
+cargo run --locked -p file-tidy-cli -- quarantine restore ITEM_ID \
+  --state /absolute/local/workspace --remaining --include-hidden --execute
+```
+
+`--remaining` 展示并恢复当前保留的清单；原操作中已删除的项继续保留在删除记录中。完整恢复使用普通 `quarantine restore`，按批次恢复尚存内容可加 `--batch BATCH_ID`。
+
 ## 撤销操作
 
 预览并撤销已完成的批次：

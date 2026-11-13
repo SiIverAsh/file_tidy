@@ -73,6 +73,9 @@ enum QuarantineCommand {
         to: Option<PathBuf>,
         #[arg(long)]
         include_hidden: bool,
+        /// 恢复当前尚存清单，保留原删除记录
+        #[arg(long)]
+        remaining: bool,
         #[arg(long, conflicts_with = "execute")]
         approve: bool,
         #[arg(long)]
@@ -80,9 +83,57 @@ enum QuarantineCommand {
         #[arg(long, value_enum, default_value_t = PlanFormat::Text)]
         format: PlanFormat,
     },
+    /// 审阅并永久删除指定隔离项
+    Purge {
+        #[arg(required_unless_present="batch",num_args=1..)]
+        items: Vec<Id>,
+        #[arg(long, conflicts_with = "items")]
+        batch: Option<Id>,
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long, default_value_t = 100_000)]
+        max_entries: usize,
+        #[arg(long)]
+        permanent: bool,
+        #[arg(long, conflicts_with = "execute")]
+        approve: bool,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long,value_enum,default_value_t=PlanFormat::Text)]
+        format: PlanFormat,
+    },
 }
 pub(crate) fn run_quarantine(args: QuarantineArgs) -> Result<u8> {
     match args.command {
+        QuarantineCommand::Purge {
+            items,
+            batch,
+            state,
+            include_hidden,
+            max_entries,
+            permanent,
+            approve,
+            execute,
+            format,
+        } => {
+            if (approve || execute) && !permanent {
+                bail!("永久删除需要显式传入 --permanent");
+            }
+            let mut session = Session::open(&state)?;
+            let options = PlanOptions {
+                include_hidden,
+                max_entries,
+                ..Default::default()
+            };
+            let plan = if let Some(batch) = batch {
+                session.build_batch_purge_plan(&batch, options)?
+            } else {
+                session.build_purge_plan(&items, options)?
+            };
+            review_plan(&mut session, plan, format, approve, execute)
+        }
         QuarantineCommand::List {
             state,
             limit,
@@ -106,6 +157,7 @@ pub(crate) fn run_quarantine(args: QuarantineArgs) -> Result<u8> {
             state,
             to,
             include_hidden,
+            remaining,
             approve,
             execute,
             format,
@@ -116,9 +168,17 @@ pub(crate) fn run_quarantine(args: QuarantineArgs) -> Result<u8> {
                 ..Default::default()
             };
             let plan = if let Some(batch) = batch {
-                session.build_batch_restore_plan(&batch, to.as_deref(), options)?
+                if remaining {
+                    session.build_batch_remaining_restore_plan(&batch, to.as_deref(), options)?
+                } else {
+                    session.build_batch_restore_plan(&batch, to.as_deref(), options)?
+                }
             } else {
-                session.build_restore_plan(&items, to.as_deref(), options)?
+                if remaining {
+                    session.build_remaining_restore_plan(&items, to.as_deref(), options)?
+                } else {
+                    session.build_restore_plan(&items, to.as_deref(), options)?
+                }
             };
             review_plan(&mut session, plan, format, approve, execute)
         }
@@ -271,6 +331,9 @@ pub(crate) struct PlanArgs {
     /// 审阅后交互确认并保存计划快照
     #[arg(long, requires = "state")]
     approve: bool,
+    /// 明确选择永久删除，与永久删除操作配合使用
+    #[arg(long)]
+    permanent: bool,
     /// 审阅并确认后执行文件操作
     #[arg(long, requires = "state", conflicts_with = "approve")]
     execute: bool,
@@ -349,6 +412,14 @@ pub(crate) fn run_grant(args: GrantArgs) -> Result<u8> {
 }
 
 pub(crate) fn run_plan(args: PlanArgs) -> Result<u8> {
+    if matches!(args.action, Action::PermanentDelete) {
+        if (args.approve || args.execute) && !args.permanent {
+            bail!("永久删除需要显式传入 --permanent");
+        }
+    } else if args.permanent {
+        bail!("--permanent 仅用于永久删除");
+    }
+
     let mut session = match &args.state {
         Some(root) => Session::open(root)?,
         None => Session::new()?,

@@ -31,23 +31,24 @@ cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo test --workspace --locked --offline
 ```
 
-工作区与独立夹具测试合计 180 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
+工作区与独立夹具测试合计 189 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
 
 | 测试组 | 通过 | 跳过 |
 | --- | --- | --- |
 | CLI 单元 | 4 | 0 |
-| CLI 计划集成 | 5 | 0 |
+| CLI 计划集成 | 6 | 0 |
 | CLI 进程集成 | 7 | 1 |
-| core 单元 | 52 | 0 |
+| core 单元 | 53 | 0 |
 | core 授权与计划 | 14 | 0 |
 | core 文件执行 | 9 | 0 |
 | core 校验复制 | 7 | 0 |
 | core 目录复制 | 8 | 0 |
 | core 隔离与恢复 | 8 | 0 |
 | core 撤销 | 6 | 0 |
+| core 永久删除 | 5 | 0 |
 | core 名称拼写调整 | 4 | 0 |
 | core 只读集成 | 20 | 1 |
-| platform 单元 | 13 | 0 |
+| platform 单元 | 15 | 0 |
 | platform 集成 | 11 | 1 |
 | platform 重命名 | 9 | 0 |
 | platform 私有暂存 | 3 | 0 |
@@ -98,7 +99,7 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 
 ```sh
 FILE_TIDY_TEST_ROOT=/absolute/isolated/fixtures cargo test --workspace --locked \
-  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename --test copy --test staging --test tree_copy --test quarantine --test undo \
+  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename --test copy --test staging --test tree_copy --test quarantine --test undo --test permanent \
   -- --include-ignored
 ```
 
@@ -135,3 +136,10 @@ Windows 原生状态目录通过相对父句柄创建，采用当前用户专用
 ## 撤销检查
 
 撤销检查覆盖混合批次逆序、选择变更、同名冲突、原审计不变、重复撤销、后续操作依赖及逆序解除依赖、隔离与恢复的连续逆操作。副本检查覆盖原源已移走、完整目录及空目录、敏感内容重新确认，以及大小和修改时间均保持原值时的内容篡改；校验失败保留现有副本。复制证明按操作读取创建、验证与发布记录，独立于历史列表的事件分页。
+
+
+## 永久删除检查
+
+永久删除检查覆盖数量与敏感许可的组合确认、执行前新增项、完整目录及链接目标保持不变、按批清理隔离项、捕获后取消、第二条删除意图失败、删除后结果日志失败，以及部分删除后的显式尚存内容恢复。恢复诊断核对已确认移除数量、未确认意图和实际尚存清单，查询保持只读。
+
+平台检查覆盖删除前替换保留替换对象，以及删除后的同步失败产生待核对结果。Windows 删除入口另做交叉编译检查，实际行为由原生 CI 运行。GUI 并行开发期间，后端检查在只包含 core、platform、cli 和对应锁文件的临时副本中执行。

@@ -7,6 +7,7 @@ pub mod authorization;
 pub mod classify;
 pub mod execution;
 pub mod journal;
+pub mod permanent;
 pub mod plan;
 pub mod quarantine;
 pub mod recovery;

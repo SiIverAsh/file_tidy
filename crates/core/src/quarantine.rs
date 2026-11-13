@@ -22,23 +22,31 @@ use crate::plan::{
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedDirectory {
-    path: NativePath,
-    identity: Option<Identity>,
+    pub(crate) path: NativePath,
+    pub(crate) identity: Option<Identity>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QuarantineScope {
-    root: NativePath,
-    identity: Identity,
-    directories: Vec<ManagedDirectory>,
-    payload: NativePath,
-    retention_days: u64,
+    pub(crate) root: NativePath,
+    pub(crate) identity: Identity,
+    pub(crate) directories: Vec<ManagedDirectory>,
+    pub(crate) payload: NativePath,
+    pub(crate) retention_days: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ManagedOperation {
     Quarantine(QuarantineScope),
-    Restore { item: Id, scope: QuarantineScope },
+    Restore {
+        item: Id,
+        scope: QuarantineScope,
+        #[serde(default, skip_serializing_if = "is_false")]
+        remaining: bool,
+    },
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl ManagedOperation {
     fn scope(&self) -> &QuarantineScope {
@@ -87,7 +95,7 @@ fn root_key(identity: &Identity) -> Result<String> {
         blake3::hash(&serde_json::to_vec(identity)?).to_hex()
     ))
 }
-fn item_key(item: &Id) -> String {
+pub(crate) fn item_key(item: &Id) -> String {
     format!("quarantine-item:{item}")
 }
 fn metadata<T: for<'de> Deserialize<'de>>(session: &Session, key: &str) -> Result<Option<T>> {
@@ -108,7 +116,11 @@ fn metadata<T: for<'de> Deserialize<'de>>(session: &Session, key: &str) -> Resul
                 .transpose()
         })
 }
-fn save_metadata(tx: &rusqlite::Transaction<'_>, key: &str, value: &impl Serialize) -> Result<()> {
+pub(crate) fn save_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    value: &impl Serialize,
+) -> Result<()> {
     tx.execute("INSERT INTO store_metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, serde_json::to_vec(value)?])?;
     Ok(())
 }
@@ -117,6 +129,58 @@ fn absent(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         _ => Err(E::DestinationConflict),
     }
+}
+
+pub(crate) fn register_retained(
+    tx: &rusqlite::Transaction<'_>,
+    op: &PlannedOperation,
+    scope: &QuarantineScope,
+) -> Result<()> {
+    let retained = now()?;
+    let expires = retained
+        .checked_add(scope.retention_days.checked_mul(86400).ok_or(E::Overflow)?)
+        .ok_or(E::Overflow)?;
+    let (encoding, original) = path_bytes(&op.source)?;
+    tx.execute("INSERT INTO quarantine_items(item_id,op_id,grant_id,path_encoding,original_path,storage_path,manifest_digest,retained_at_s,expires_at_s,state) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,'stored')",params![id_bytes(&op.id)?,id_bytes(op.source_grant.as_ref().ok_or(E::OutsideGrant)?)?,encoding,original,path_bytes(&scope.payload)?.1,blake3::hash(&serde_json::to_vec(&op.manifest)?).as_bytes(),retained as i64,expires as i64])?;
+    save_metadata(tx, &item_key(&op.id), scope)
+}
+
+pub(crate) fn retain_sensitivity(
+    original: &PlannedOperation,
+    entries: &mut [ManifestEntry],
+    source: &Path,
+) -> Result<()> {
+    let root = original.source.to_path()?;
+    let mut sensitive_paths = BTreeSet::new();
+    let mut sensitive_directories = BTreeSet::new();
+    let identities = original
+        .manifest
+        .iter()
+        .filter(|entry| entry.sensitive)
+        .map(|entry| entry.stamp.object_key())
+        .collect::<BTreeSet<_>>();
+    for entry in original.manifest.iter().filter(|entry| entry.sensitive) {
+        let path = entry.path.to_path()?;
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| E::StorageUnavailable)?
+            .to_owned();
+        if entry.kind == "Directory" {
+            sensitive_directories.insert(relative.clone());
+        }
+        sensitive_paths.insert(relative);
+    }
+    for entry in entries {
+        let path = entry.path.to_path()?;
+        let relative = path.strip_prefix(source).map_err(|_| E::InvalidPath)?;
+        entry.sensitive |= sensitive_paths.contains(relative)
+            || relative
+                .ancestors()
+                .any(|ancestor| sensitive_directories.contains(ancestor))
+            || identities.contains(&entry.stamp.object_key())
+            || crate::plan::destination_sensitive(&root.join(relative));
+    }
+    Ok(())
 }
 
 impl Session {
@@ -206,7 +270,7 @@ impl Session {
         Ok((destination, scope))
     }
 
-    fn validate_scope(
+    pub(crate) fn validate_scope(
         &self,
         scope: &QuarantineScope,
         changed: &BTreeMap<PathBuf, Stamp>,
@@ -282,7 +346,7 @@ impl Session {
         Ok(pins)
     }
 
-    fn payload_permit(&self, scope: &QuarantineScope) -> Result<ManagedPayloadPermit> {
+    pub(crate) fn payload_permit(&self, scope: &QuarantineScope) -> Result<ManagedPayloadPermit> {
         if scope.directories.iter().any(|d| d.identity.is_none()) {
             return Err(E::StorageUnavailable);
         }
@@ -291,7 +355,7 @@ impl Session {
             path: scope.payload.to_path()?,
         })
     }
-    fn payload_manifest(
+    pub(crate) fn payload_manifest(
         &self,
         scope: &QuarantineScope,
         options: &PlanOptions,
@@ -433,9 +497,18 @@ impl Session {
         })
     }
 
-    fn load_quarantine_item(&self, item: &Id) -> Result<(QuarantineScope, PlannedOperation)> {
+    pub(crate) fn load_quarantine_item(
+        &self,
+        item: &Id,
+    ) -> Result<(QuarantineScope, PlannedOperation)> {
+        self.load_retained_item(item)
+    }
+    pub(crate) fn load_retained_item(
+        &self,
+        item: &Id,
+    ) -> Result<(QuarantineScope, PlannedOperation)> {
         let (batch, digest, original, storage) = self.store.as_ref().ok_or(E::StorageRequired)?.journal_read(|db| {
-            db.query_row("SELECT hex(o.batch_id),q.manifest_digest,q.original_path,q.storage_path FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE q.item_id=?1 AND q.op_id=q.item_id AND q.state='stored' AND o.state='done'", [id_bytes(item)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?))).map_err(E::from)
+            db.query_row("SELECT hex(o.batch_id),q.manifest_digest,q.original_path,q.storage_path FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE q.item_id=?1 AND q.op_id=q.item_id AND q.state IN ('stored','needs_recovery') AND (o.state='done' OR o.kind='permanent_delete')", [id_bytes(item)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?))).map_err(E::from)
         })?;
         let history = self.batch_history(&batch.parse()?)?;
         let preview: crate::plan::PlanPreview = serde_json::from_value(history.snapshot)?;
@@ -444,13 +517,25 @@ impl Session {
             .into_iter()
             .find(|op| {
                 &op.id == item
-                    && matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy)
+                    && matches!(
+                        op.kind,
+                        OperationKind::Quarantine
+                            | OperationKind::UndoCopy
+                            | OperationKind::PermanentDelete
+                    )
             })
             .ok_or(E::StorageUnavailable)?;
         let scope: QuarantineScope =
             metadata(self, &item_key(item))?.ok_or(E::StorageUnavailable)?;
-        let Some(ManagedOperation::Quarantine(planned)) = &op.managed else {
-            return Err(E::StorageUnavailable);
+        let planned = match &op.managed {
+            Some(ManagedOperation::Quarantine(scope)) => scope,
+            _ => {
+                &op.permanent
+                    .as_ref()
+                    .filter(|p| p.item.is_none())
+                    .ok_or(E::StorageUnavailable)?
+                    .storage
+            }
         };
         if planned.payload != scope.payload
             || planned.root != scope.root
@@ -462,6 +547,20 @@ impl Session {
             return Err(E::StorageUnavailable);
         }
         self.payload_permit(&scope)?;
+        let root = op
+            .manifest
+            .iter()
+            .find(|entry| entry.path == op.source)
+            .ok_or(E::StorageUnavailable)?;
+        if !root
+            .stamp
+            .same_identity(&platform::inspect(&checked_existing(
+                &scope.payload.to_path()?,
+                true,
+            )?)?)
+        {
+            return Err(E::ChangedSincePlan);
+        }
         Ok((scope, op))
     }
 
@@ -471,13 +570,30 @@ impl Session {
         destination: Option<&Path>,
         options: PlanOptions,
     ) -> Result<Plan> {
+        self.build_batch_restore_mode(batch, destination, options, false)
+    }
+    pub fn build_batch_remaining_restore_plan(
+        &self,
+        batch: &Id,
+        destination: Option<&Path>,
+        options: PlanOptions,
+    ) -> Result<Plan> {
+        self.build_batch_restore_mode(batch, destination, options, true)
+    }
+    fn build_batch_restore_mode(
+        &self,
+        batch: &Id,
+        destination: Option<&Path>,
+        options: PlanOptions,
+        remaining: bool,
+    ) -> Result<Plan> {
         let ids = self.store.as_ref().ok_or(E::StorageRequired)?.journal_read(|db| {
-            let mut query = db.prepare("SELECT hex(q.item_id) FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE o.batch_id=?1 AND q.state='stored' ORDER BY o.ordinal LIMIT 1001")?;
+            let mut query = db.prepare("SELECT hex(q.item_id) FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE o.batch_id=?1 AND q.state IN ('stored','needs_recovery') ORDER BY o.ordinal LIMIT 1001")?;
             let values = query.query_map([id_bytes(batch)?], |row|row.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
             if values.len()>1000 { return Err(E::Overflow); }
             values.iter().map(|v|v.parse()).collect::<Result<Vec<Id>>>()
         })?;
-        self.build_restore_plan(&ids, destination, options)
+        self.build_restore_plan_mode(&ids, destination, options, remaining)
     }
 
     pub fn build_restore_plan(
@@ -485,6 +601,23 @@ impl Session {
         items: &[Id],
         destination: Option<&Path>,
         options: PlanOptions,
+    ) -> Result<Plan> {
+        self.build_restore_plan_mode(items, destination, options, false)
+    }
+    pub fn build_remaining_restore_plan(
+        &self,
+        items: &[Id],
+        destination: Option<&Path>,
+        options: PlanOptions,
+    ) -> Result<Plan> {
+        self.build_restore_plan_mode(items, destination, options, true)
+    }
+    fn build_restore_plan_mode(
+        &self,
+        items: &[Id],
+        destination: Option<&Path>,
+        options: PlanOptions,
+        remaining: bool,
     ) -> Result<Plan> {
         // Reuse the option validation before examining retained objects.
         if items.is_empty()
@@ -512,39 +645,19 @@ impl Session {
             }
             let source = scope.payload.to_path()?;
             let mut manifest = self.payload_manifest(&scope, &options)?;
-            compare_relocated(
-                &original.source.to_path()?,
-                &original.manifest,
-                &source,
-                &manifest,
-            )?;
+            if !remaining {
+                compare_relocated(
+                    &original.source.to_path()?,
+                    &original.manifest,
+                    &source,
+                    &manifest,
+                )?;
+            }
             budget = budget
                 .checked_sub(manifest.len())
                 .ok_or(E::IncompleteManifest)?;
             let old_source = original.source.to_path()?;
-            let original_entries = original
-                .manifest
-                .iter()
-                .map(|entry| {
-                    Ok((
-                        entry
-                            .path
-                            .to_path()?
-                            .strip_prefix(&old_source)
-                            .map_err(|_| E::InvalidPath)?
-                            .to_owned(),
-                        entry,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?;
-            for entry in &mut manifest {
-                let path = entry.path.to_path()?;
-                let relative = path.strip_prefix(&source).map_err(|_| E::InvalidPath)?;
-                entry.sensitive |= original_entries
-                    .get(relative)
-                    .ok_or(E::ChangedSincePlan)?
-                    .sensitive;
-            }
+            retain_sensitivity(&original, &mut manifest, &source)?;
             let target = match destination {
                 None => old_source,
                 Some(root) if items.len() > 1 => {
@@ -592,6 +705,7 @@ impl Session {
                 source_grant: Some(self.grant_for(&source, &policy)?.id().clone()),
                 destination: Some(target),
                 inverse: None,
+                permanent: None,
                 manifest,
                 source_parent_stamp: Stamp::capture(&platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
@@ -599,6 +713,7 @@ impl Session {
                 managed: Some(ManagedOperation::Restore {
                     item: item.clone(),
                     scope,
+                    remaining,
                 }),
             });
         }
@@ -764,20 +879,23 @@ impl Session {
         ))
     }
 
-    pub(crate) fn execute_managed(
+    pub(crate) fn prepare_quarantine_directories(
         &mut self,
-        approved: &crate::approval::ApprovedPlan,
+        plan: &Plan,
         op: &PlannedOperation,
+        scope: &QuarantineScope,
         parents: &mut BTreeMap<PathBuf, Stamp>,
         cancel: &CancellationToken,
-    ) -> std::result::Result<(), CopyFailure> {
+    ) -> std::result::Result<(QuarantineScope, bool), CopyFailure> {
+        let mut scope = scope.clone();
         let mut created = false;
         let mut journal = false;
-        let plan = &approved.plan;
-        let mut step = "quarantine_directory";
+        let step = if op.kind == OperationKind::PermanentDelete {
+            "permanent_directory"
+        } else {
+            "quarantine_directory"
+        };
         let mut run = || -> Result<()> {
-            let managed = op.managed.as_ref().ok_or(E::InvalidPlan)?;
-            let mut scope = managed.scope().clone();
             for index in 0..scope.directories.len() {
                 let path = scope.directories[index].path.to_path()?;
                 if scope.directories[index].identity.is_some() {
@@ -793,7 +911,7 @@ impl Session {
                     continue;
                 }
                 checkpoint(cancel)?;
-                self.validate_managed_operation(plan, op, parents)?;
+                self.validate_operation(plan, op, parents)?;
                 let parent = path.parent().ok_or(E::InvalidPath)?;
                 let before = platform::inspect(parent)?;
                 let pin = platform::open_directory_pinned(parent, &before)?;
@@ -803,7 +921,7 @@ impl Session {
                     .ok_or(E::StorageRequired)?
                     .record_intent(&op.id, step, &intent)
                     .inspect_err(|_| journal = true)?;
-                self.validate_managed_operation(plan, op, parents)?;
+                self.validate_operation(plan, op, parents)?;
                 checkpoint(cancel)?;
                 created = true;
                 let file = platform::create_private_directory(
@@ -830,6 +948,39 @@ impl Session {
                 self.store.as_mut().ok_or(E::StorageRequired)?.record_managed_result(&op.id, step, &json!({"directory": NativePath::new(&path), "stamp": Stamp::capture(&node)?}), OperationState::Prepared,
                     |tx| save_metadata(tx, &key, &record)).inspect_err(|_| journal = true)?;
             }
+            Ok(())
+        };
+        run().map_err(|error| CopyFailure {
+            error,
+            created,
+            journal,
+            step,
+        })?;
+        Ok((scope, created))
+    }
+
+    pub(crate) fn execute_managed(
+        &mut self,
+        approved: &crate::approval::ApprovedPlan,
+        op: &PlannedOperation,
+        parents: &mut BTreeMap<PathBuf, Stamp>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), CopyFailure> {
+        let mut created = false;
+        let mut journal = false;
+        let plan = &approved.plan;
+        let mut step = "quarantine_directory";
+        let mut run = || -> Result<()> {
+            let managed = op.managed.as_ref().ok_or(E::InvalidPlan)?;
+            let (scope, made) = self
+                .prepare_quarantine_directories(plan, op, managed.scope(), parents, cancel)
+                .map_err(|failure| {
+                    created |= failure.created;
+                    journal |= failure.journal;
+                    step = failure.step;
+                    failure.error
+                })?;
+            created |= made;
             if op.kind == OperationKind::UndoCopy {
                 step = "undo_verify";
                 self.store
@@ -917,21 +1068,14 @@ impl Session {
             update_parent(source_parent, &source_parent_before, parents)?;
             update_parent(target_parent, &target_parent_before, parents)?;
             self.validate_scope(&scope, parents)?;
-            let retained = now()?;
-            let expires = retained
-                .checked_add(scope.retention_days.checked_mul(86400).ok_or(E::Overflow)?)
-                .ok_or(E::Overflow)?;
             let result = json!({"source": op.source, "destination": NativePath::new(&destination), "observed_manifest": actual});
             self.store.as_mut().ok_or(E::StorageRequired)?.record_managed_result(&op.id, step, &result, OperationState::Done, |tx| {
                 match managed {
                     ManagedOperation::Quarantine(_) => {
-                        let (encoding, original) = path_bytes(&op.source)?;
-                        tx.execute("INSERT INTO quarantine_items(item_id,op_id,grant_id,path_encoding,original_path,storage_path,manifest_digest,retained_at_s,expires_at_s,state) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,'stored')",
-                            params![id_bytes(&op.id)?, id_bytes(op.source_grant.as_ref().ok_or(E::OutsideGrant)?)?, encoding, original, path_bytes(&scope.payload)?.1, blake3::hash(&serde_json::to_vec(&op.manifest)?).as_bytes(), retained as i64, expires as i64])?;
-                        save_metadata(tx, &item_key(&op.id), &scope)?;
+                        register_retained(tx,op,&scope)?;
                     }
                     ManagedOperation::Restore { item, .. } => {
-                        if tx.execute("UPDATE quarantine_items SET state='restored' WHERE item_id=?1 AND state='stored'", [id_bytes(item)?])? != 1 { return Err(E::StorageUnavailable); }
+                        if tx.execute("UPDATE quarantine_items SET state='restored' WHERE item_id=?1 AND state IN ('stored','needs_recovery')", [id_bytes(item)?])? != 1 { return Err(E::StorageUnavailable); }
                     }
                 }
                 Ok(())
@@ -947,7 +1091,7 @@ impl Session {
     }
 }
 
-fn compare_relocated(
+pub(crate) fn compare_relocated(
     source: &Path,
     expected: &[ManifestEntry],
     destination: &Path,

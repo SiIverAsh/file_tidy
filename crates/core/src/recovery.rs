@@ -15,6 +15,8 @@ use crate::plan::{OperationKind, PlanPreview, PlannedOperation, policy_digest};
 pub enum RecoveryDisposition {
     /// The reviewed source is present and the destination is absent.
     NotCommitted,
+    /// Irreversible per-entry results and the current retained payload are listed.
+    PermanentProgressObserved,
     /// The first rename reached the reviewed intermediate name; completion needs review.
     TemporaryObserved,
     /// A durable rename intent matches the relocated object; journal completion is pending.
@@ -42,6 +44,8 @@ pub struct RecoveryItem {
     pub policy_changed: bool,
     pub disposition: RecoveryDisposition,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permanent: Option<crate::permanent::PermanentProgress>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,7 +82,17 @@ impl Session {
                 // Diagnosis grants no execution capability. Recheck current
                 // policy below, including for records from an older binary.
                 let policy_changed = preview.policy_digest != policy_digest();
-                let (disposition, reason) = if history.events_truncated {
+                let mut permanent = None;
+                let (disposition, reason) = if operation.kind == OperationKind::PermanentDelete {
+                    match self.inspect_permanent_progress(operation, &history) {
+                        Ok(progress) => {
+                            let result = (progress.disposition, progress.reason.clone());
+                            permanent = Some(progress);
+                            result
+                        }
+                        Err(error) => (RecoveryDisposition::Unavailable, error.to_string()),
+                    }
+                } else if history.events_truncated {
                     (
                         RecoveryDisposition::NeedsAttention,
                         "event_history_incomplete".to_owned(),
@@ -113,6 +127,7 @@ impl Session {
                     policy_changed,
                     disposition,
                     reason,
+                    permanent,
                 });
             }
         }

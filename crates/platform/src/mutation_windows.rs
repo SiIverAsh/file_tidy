@@ -16,7 +16,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-fn source_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+pub(super) fn source_handle(parent: &File, name: &OsStr) -> io::Result<File> {
     let mut units = name.encode_wide().collect::<Vec<_>>();
     if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
         return Err(invalid("invalid native source component"));

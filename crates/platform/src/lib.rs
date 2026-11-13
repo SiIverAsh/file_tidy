@@ -13,6 +13,8 @@ use std::time::SystemTime;
 mod mounts;
 mod mutation;
 pub use mutation::{RenameError, rename_noreplace};
+mod removal;
+pub use removal::{RemovalError, remove_verified};
 mod staged_directory;
 pub use staged_directory::StagedDirectory;
 mod staged_file;

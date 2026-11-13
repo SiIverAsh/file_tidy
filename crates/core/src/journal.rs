@@ -324,6 +324,16 @@ impl StateStore {
         self.record_event(operation, step, "result", payload, Some(state), |_| Ok(()))
     }
 
+    pub(crate) fn record_managed_intent(
+        &mut self,
+        operation: &Id,
+        step: &str,
+        payload: &impl Serialize,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.record_event(operation, step, "intent", payload, None, write)
+    }
+
     pub(crate) fn record_managed_result(
         &mut self,
         operation: &Id,

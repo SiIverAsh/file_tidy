@@ -400,3 +400,11 @@ pub(crate) fn publish_open_file(
 ) -> io::Result<()> {
     windows::rename_open_file(source, parent, name)
 }
+
+#[cfg(windows)]
+pub(crate) fn open_mutation_source(
+    parent: &std::fs::File,
+    name: &OsStr,
+) -> io::Result<std::fs::File> {
+    windows::source_handle(parent, name)
+}

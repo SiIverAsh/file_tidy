@@ -61,6 +61,19 @@ pub struct PlanOptions {
 fn default_retention() -> u64 {
     30
 }
+pub(crate) fn validate_options(options: &PlanOptions) -> Result<()> {
+    if !(1..=1_000_000).contains(&options.max_entries)
+        || !(1..=900).contains(&options.expires_after_seconds)
+        || options.large_item_count > 100
+        || options.large_byte_count > 10 * 1024 * 1024 * 1024
+        || options.permanent_item_count > 10
+        || options.permanent_byte_count > 1024 * 1024 * 1024
+        || !(1..=36500).contains(&options.quarantine_retention_days)
+    {
+        return Err(E::InvalidRequest);
+    }
+    Ok(())
+}
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
@@ -167,6 +180,8 @@ pub struct PlannedOperation {
     pub inverse: Option<crate::undo::InverseReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) managed: Option<crate::quarantine::ManagedOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) permanent: Option<crate::permanent::PermanentScope>,
     pub(crate) source_parent_stamp: Stamp,
 }
 
@@ -338,6 +353,17 @@ impl Session {
             } else {
                 None
             };
+            let permanent = if request.kind == OperationKind::PermanentDelete {
+                let (_, storage) =
+                    self.plan_quarantine(&source, &batch_id, &operation_id, &options)?;
+                Some(crate::permanent::PermanentScope {
+                    storage,
+                    item: None,
+                    original: NativePath::new(&source),
+                })
+            } else {
+                None
+            };
             let destination_grant = if let Some(destination) = &destination {
                 let parent = destination.existing_parent.to_path()?;
                 if policy.labels(&parent).protected {
@@ -386,6 +412,7 @@ impl Session {
                 destination_grant,
                 inverse: None,
                 managed,
+                permanent,
                 source_parent_stamp: Stamp::capture(&file_tidy_platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
                 )?)?,
@@ -401,6 +428,7 @@ impl Session {
         options: PlanOptions,
         batch_id: Id,
     ) -> Result<Plan> {
+        validate_options(&options)?;
         if operations.is_empty() || operations.len() > 10000 || operations.len() != resolved.len() {
             return Err(E::InvalidRequest);
         }
@@ -551,6 +579,14 @@ impl Session {
             .preview
             .operations
             .iter()
+            .any(|op| op.permanent.as_ref().is_some_and(|p| p.item.is_some()))
+        {
+            return self.select_purges(plan, &wanted);
+        }
+        if plan
+            .preview
+            .operations
+            .iter()
             .any(|op| op.inverse.is_some())
         {
             return self.select_inverse_operations(plan, &wanted);
@@ -608,6 +644,9 @@ impl Session {
     ) -> Result<()> {
         self.validate_plan_context(plan)?;
         let policy = planning_policy()?;
+        if operation.permanent.is_some() {
+            return self.validate_permanent_operation(plan, operation, changed_parents);
+        }
         if operation.managed.is_some() {
             return self.validate_managed_operation(plan, operation, changed_parents);
         }
@@ -1164,6 +1203,33 @@ impl Plan {
                     "\n   保留 {} 天，到期后列入提醒",
                     self.preview.options.quarantine_retention_days
                 ));
+            }
+            if matches!(
+                &operation.managed,
+                Some(crate::quarantine::ManagedOperation::Restore {
+                    remaining: true,
+                    ..
+                })
+            ) {
+                output.push_str("\n   恢复当前保留清单；已删除项记录在原操作中");
+            }
+            if let Some(permanent) = &operation.permanent {
+                if permanent.item.is_none() {
+                    output.push_str(&format!(
+                        "\n   删除前暂存：{}",
+                        permanent.storage.payload.display
+                    ));
+                    for directory in permanent
+                        .storage
+                        .directories
+                        .iter()
+                        .filter(|d| d.identity.is_none())
+                    {
+                        output.push_str(&format!("\n   创建目录：{}", directory.path.display));
+                    }
+                } else {
+                    output.push_str(&format!("\n   清理隔离项：{}", permanent.original.display));
+                }
             }
             if let Some(inverse) = &operation.inverse {
                 output.push_str(&format!(

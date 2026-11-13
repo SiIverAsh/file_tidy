@@ -204,18 +204,20 @@ impl Session {
                     | OperationKind::Quarantine
                     | OperationKind::Restore
                     | OperationKind::UndoCopy
+                    | OperationKind::PermanentDelete
             ) || (operation.kind == OperationKind::Copy
                 && !operation.manifest.iter().any(|entry| {
                     entry.path == operation.source
                         && matches!(entry.kind.as_str(), "Regular" | "Directory")
                 }))
-                || operation.destination.as_ref().is_none_or(|d| {
-                    !d.create_directories.is_empty()
-                        && !matches!(
-                            operation.kind,
-                            OperationKind::Quarantine | OperationKind::UndoCopy
-                        )
-                })
+                || (operation.kind != OperationKind::PermanentDelete
+                    && operation.destination.as_ref().is_none_or(|d| {
+                        !d.create_directories.is_empty()
+                            && !matches!(
+                                operation.kind,
+                                OperationKind::Quarantine | OperationKind::UndoCopy
+                            )
+                    }))
             {
                 return Err(E::UnsupportedSafetyGuarantee);
             }
@@ -278,11 +280,15 @@ impl Session {
                     id: op.id.clone(),
                     source: op.source.clone(),
                     destination: op.destination.as_ref().map(|d| d.path.clone()),
-                    temporary: op.destination.as_ref().and_then(|d| {
-                        d.spelling_temporary
-                            .clone()
-                            .or_else(|| d.copy_temporary.clone())
-                    }),
+                    temporary: op
+                        .destination
+                        .as_ref()
+                        .and_then(|d| {
+                            d.spelling_temporary
+                                .clone()
+                                .or_else(|| d.copy_temporary.clone())
+                        })
+                        .or_else(|| op.permanent.as_ref().map(|p| p.storage.payload.clone())),
                     status: ExecutionStatus::NotStarted,
                     reason: None,
                 })
@@ -299,8 +305,13 @@ impl Session {
                 self.fail_operation(&mut report, index, operation, error, false);
                 break;
             }
-            if operation.kind == OperationKind::Copy || operation.managed.is_some() {
-                let result = if operation.managed.is_some() {
+            if operation.kind == OperationKind::Copy
+                || operation.managed.is_some()
+                || operation.kind == OperationKind::PermanentDelete
+            {
+                let result = if operation.kind == OperationKind::PermanentDelete {
+                    self.execute_permanent(&approved, operation, &mut changed_parents, cancellation)
+                } else if operation.managed.is_some() {
                     self.execute_managed(&approved, operation, &mut changed_parents, cancellation)
                 } else if operation
                     .manifest
@@ -488,7 +499,18 @@ impl Session {
             .store
             .as_mut()
             .ok_or(E::StorageRequired)
-            .and_then(|store| store.record_result(&operation.id, "rename", result, journal_state));
+            .and_then(|store| {
+                store.record_result(
+                    &operation.id,
+                    if operation.kind == OperationKind::PermanentDelete {
+                        "permanent_prepare"
+                    } else {
+                        "rename"
+                    },
+                    result,
+                    journal_state,
+                )
+            });
         if let Err(error) = write {
             report.journal_error = Some(error.to_string());
         }

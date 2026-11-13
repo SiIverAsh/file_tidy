@@ -226,3 +226,45 @@ fn quarantine_commands_preview_restore_and_reject_noninteractive_execution() -> 
     assert_eq!(session.history(10)?.len(), 1);
     Ok(())
 }
+
+#[test]
+#[cfg_attr(
+    any(target_os = "macos", windows),
+    ignore = "requires independent FILE_TIDY_TEST_ROOT"
+)]
+fn permanent_cli_requires_the_explicit_flag_and_an_interactive_review() -> TestResult {
+    use file_tidy_core::authorization::Session;
+    let directory = fixture()?;
+    let root = directory.path();
+    let mut session = Session::new()?;
+    let grant = session.grant(root, false)?;
+    let storage = session.storage_plan(&grant)?;
+    let digest = storage.digest().to_owned();
+    session.initialize_storage(storage, &digest)?;
+    drop(session);
+    std::fs::write(root.join("file"), b"keep")?;
+    let missing = executable()
+        .args(["plan", "permanent-delete"])
+        .arg(root.join("file"))
+        .arg("--state")
+        .arg(root)
+        .arg("--execute")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--permanent"));
+    let terminal = executable()
+        .args(["plan", "permanent-delete"])
+        .arg(root.join("file"))
+        .arg("--state")
+        .arg(root)
+        .args(["--execute", "--permanent"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!terminal.status.success());
+    assert!(String::from_utf8_lossy(&terminal.stderr).contains("交互终端"));
+    assert_eq!(std::fs::read(root.join("file"))?, b"keep");
+    assert!(!root.join(".file-tidy/quarantine").exists());
+    assert!(Session::open(root)?.history(10)?.is_empty());
+    Ok(())
+}
