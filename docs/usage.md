@@ -199,6 +199,17 @@ cargo run --locked -p file-tidy-cli -- plan move /absolute/local/workspace/sourc
 
 每次文件操作先保存意图，完成后核验原生身份与清单并记录结果。批内某项失败、日志不可写或收到 Ctrl-C 时停止后续项，报告保留已完成、未开始和待恢复的操作。执行成功返回 0，部分完成或失败返回 2，取消返回 130。`--execute` 与仅保存快照的 `--approve` 分别使用。
 
+## 校验复制
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan copy /absolute/source/file \
+  --to /absolute/local/workspace/copy --state /absolute/local/workspace --execute
+```
+
+`copy --execute` 复制普通文件的主数据流，目标父目录须已存在并在当前授权内。源可以位于授权目录之外；敏感源按清单逐项确认内容读取许可。副本保留修改时间，使用当前用户私有权限；ACL、扩展属性、资源叉及附加数据流不在该主数据流复制策略的范围内。
+
+预览列出目标旁的暂存位置。执行时检查目标卷可用空间与预留量，流式计算源 BLAKE3，写入并同步暂存文件，再完整复读暂存副本核对哈希和长度，最后无覆盖发布。源变化、校验不一致、目标被占用或取消会停止发布。保留的暂存对象及其身份记录可通过 `recover` 查看。
+
 ## 执行历史与恢复诊断
 
 ```sh
@@ -207,4 +218,4 @@ cargo run --locked -p file-tidy-cli -- history --state /absolute/local/workspace
 cargo run --locked -p file-tidy-cli -- recover --state /absolute/local/workspace
 ```
 
-历史按批次展示操作、确认快照、步骤意图与结果。恢复诊断只读核验未完成记录，区分尚未提交、已观察到移动结果、需检查的对象变化，以及授权或介质不可用。已取消批次中仍有未完成意图的操作也会列出。诊断结果以 JSON 输出，`--batch` 指定批次，`--limit` 设置批次数量上限。
+历史按批次展示操作、确认快照、步骤意图与结果。恢复诊断只读核验未完成记录，区分尚未提交、已观察到移动结果、复制半成品、已校验待发布副本、已发布待记账副本、需检查的对象变化，以及授权或介质不可用。已取消批次中仍有未完成意图的操作也会列出。诊断结果以 JSON 输出，`--batch` 指定批次，`--limit` 设置批次数量上限。

@@ -31,21 +31,23 @@ cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo test --workspace --locked --offline
 ```
 
-工作区与独立夹具测试合计 134 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
+工作区与独立夹具测试合计 148 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
 
 | 测试组 | 通过 | 跳过 |
 | --- | --- | --- |
 | CLI 单元 | 4 | 0 |
 | CLI 计划集成 | 4 | 0 |
 | CLI 进程集成 | 7 | 1 |
-| core 单元 | 39 | 0 |
+| core 单元 | 44 | 0 |
 | core 授权与计划 | 14 | 0 |
 | core 文件执行 | 9 | 0 |
+| core 校验复制 | 7 | 0 |
 | core 名称拼写调整 | 4 | 0 |
 | core 只读集成 | 20 | 1 |
 | platform 单元 | 13 | 0 |
 | platform 集成 | 11 | 1 |
 | platform 重命名 | 9 | 0 |
+| platform 私有暂存 | 2 | 0 |
 
 3 项跳过用例需要创建含非法 UTF-8 字节的原生文件名，本机 APFS 返回 EPERM。这些用例可在支持该名称的文件系统上显式运行。非 UTF-8 路径编码、敏感后缀和分类单元测试均通过。
 
@@ -84,7 +86,7 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 | Linux | 已运行 mountinfo 解析与 bind 边界数据测试；原生构建、真实挂载与特殊文件系统场景列入原生平台验证 |
 | 资源规模 | 默认 250000 条目，上限 1000000；达到上限输出不完整报告，百万条目性能与内存压测待执行 |
 | 内容策略 | 扫描已确认的本地文件系统，敏感识别覆盖常见名字、目录和本次清单内的已知身份；`--metadata-only` 适用于全局零内容读取 |
-| 授权与文件操作 | 授权、计划、同卷移动与重命名、journal 和只读恢复已覆盖；复制、跨卷迁移、隔离和撤销继续按矩阵实现 |
+| 授权与文件操作 | 授权、计划、同卷移动与重命名、普通文件校验复制、journal 和只读恢复已覆盖；目录复制、跨卷迁移、隔离和撤销继续按矩阵实现 |
 | GUI 与依赖审计 | CLI 三平台 CI、发布和依赖检查已配置；GUI 与其原生验证继续按矩阵实现 |
 
 ## 授权与计划检查
@@ -93,7 +95,7 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 
 ```sh
 FILE_TIDY_TEST_ROOT=/absolute/isolated/fixtures cargo test --workspace --locked \
-  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename \
+  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename --test copy --test staging \
   -- --include-ignored
 ```
 
@@ -110,3 +112,8 @@ Windows 原生状态目录通过相对父句柄创建，采用当前用户专用
 平台测试覆盖原生无覆盖重命名、文件身份保持、无内容读取权限文件、目录与链接、父目录替换、提交瞬间的目标占位和来源替换，以及移动后同步错误。Unix 使用目录句柄相对的 rename；Windows 使用源对象句柄。Windows 分支已通过交叉编译与 Clippy，原生行为由 Windows CI 验证。
 
 恢复测试核对未提交意图、已迁移目录、缺少意图的外部移动、变化或歧义对象、撤销授权和快照篡改，并验证诊断不写入状态库或用户目录。CLI 的真实终端检查覆盖状态初始化、授权、确认后移动、敏感项重命名、历史列表与恢复诊断。
+
+
+## 校验复制检查
+
+复制测试覆盖授权区外的只读源、多块数据与空文件、同父目录批量复制、修改时间与私有权限、敏感内容逐项许可、暂存损坏、源变化、目标竞态和取消。日志触发器分别在创建结果、发布意图和发布结果处注入故障，核对未知归属暂存、已校验暂存及已发布副本的只读恢复状态。日志保存指纹、长度和哈希。

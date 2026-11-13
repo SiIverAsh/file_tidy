@@ -150,7 +150,7 @@ pub(crate) struct PlanArgs {
     /// 审阅后交互确认并保存计划快照
     #[arg(long, requires = "state")]
     approve: bool,
-    /// 审阅并确认后执行移动或重命名
+    /// 审阅并确认后执行复制、移动或重命名
     #[arg(long, requires = "state", conflicts_with = "approve")]
     execute: bool,
 }

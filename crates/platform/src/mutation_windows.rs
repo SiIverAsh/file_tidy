@@ -91,9 +91,33 @@ pub(super) fn rename(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    rename_open_file(&source, &to, destination_name).map_err(RenameError::from_rename)?;
+    // Win32 does not provide a portable directory fsync. Keep the source handle
+    // and no-delete ancestor guards until metadata and namespace checks finish.
+    let after = || -> io::Result<()> {
+        if !expected.matches(&crate::inspect_file(&source)?)
+            || !expected.matches(&crate::inspect(&destination)?)
+        {
+            return Err(invalid("destination changed during rename"));
+        }
+        parent_matches(expected_source_parent, &crate::inspect(source_parent)?)?;
+        parent_matches(
+            expected_destination_parent,
+            &crate::inspect(destination_parent)?,
+        )?;
+        Ok(())
+    };
+    after().map_err(RenameError::after_rename)
+}
+
+pub(crate) fn rename_open_file(
+    source: &File,
+    parent: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
     let units = destination_name.encode_wide().collect::<Vec<_>>();
     if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
-        return Err(invalid("invalid native destination component").into());
+        return Err(invalid("invalid native destination component"));
     }
     let name_bytes = units
         .len()
@@ -112,7 +136,7 @@ pub(super) fn rename(
     // the two pointers refer to disjoint live allocations. The default false
     // ReplaceIfExists is deliberately retained. All handles live until return.
     unsafe {
-        (*information).RootDirectory = to.as_raw_handle();
+        (*information).RootDirectory = parent.as_raw_handle();
         (*information).FileNameLength = name_bytes as u32;
         ptr::copy_nonoverlapping(
             units.as_ptr(),
@@ -136,22 +160,7 @@ pub(super) fn rename(
         )
     };
     if status < 0 {
-        return Err(RenameError::from_rename(nt_error(status)));
+        return Err(nt_error(status));
     }
-    // Win32 does not provide a portable directory fsync. Keep the source handle
-    // and no-delete ancestor guards until metadata and namespace checks finish.
-    let after = || -> io::Result<()> {
-        if !expected.matches(&crate::inspect_file(&source)?)
-            || !expected.matches(&crate::inspect(&destination)?)
-        {
-            return Err(invalid("destination changed during rename"));
-        }
-        parent_matches(expected_source_parent, &crate::inspect(source_parent)?)?;
-        parent_matches(
-            expected_destination_parent,
-            &crate::inspect(destination_parent)?,
-        )?;
-        Ok(())
-    };
-    after().map_err(RenameError::after_rename)
+    Ok(())
 }

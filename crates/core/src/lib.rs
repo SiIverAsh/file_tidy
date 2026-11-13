@@ -14,6 +14,8 @@ mod suggestions;
 pub use storage::{StoragePlan, StoragePreview};
 pub use suggestions::suggested_directories;
 mod content;
+mod copy;
+mod copy_recovery;
 mod model;
 pub mod policy;
 mod report;

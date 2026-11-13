@@ -47,6 +47,8 @@ pub enum PlanningError {
     UnsupportedSafetyGuarantee,
     #[error("this operation requires a consistent database or virtual-machine snapshot")]
     ConsistencyRequired,
+    #[error("destination does not have enough available space including reserve")]
+    InsufficientSpace,
     #[error("size or counter exceeds the supported integer range")]
     Overflow,
     #[error("operating-system randomness is unavailable")]

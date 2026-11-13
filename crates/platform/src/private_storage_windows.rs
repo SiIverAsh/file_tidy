@@ -110,12 +110,15 @@ impl User {
 }
 
 pub(super) fn create_directory(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, true)
+    create_object(parent, name, true, false)
 }
 pub(super) fn create_file(parent: &File, name: &OsStr) -> io::Result<File> {
-    create_object(parent, name, false)
+    create_object(parent, name, false, false)
 }
-fn create_object(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+pub(super) fn create_staged_file(parent: &File, name: &OsStr) -> io::Result<File> {
+    create_object(parent, name, false, true)
+}
+fn create_object(parent: &File, name: &OsStr, directory: bool, staged: bool) -> io::Result<File> {
     let user = User::current()?;
     let sid = user.sid_text()?;
     let inheritance = if directory { "OICI" } else { "" };
@@ -180,7 +183,10 @@ fn create_object(parent: &File, name: &OsStr, directory: bool) -> io::Result<Fil
                     | READ_CONTROL
                     | SYNCHRONIZE
             } else {
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL
+                FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | READ_CONTROL
+                    | if staged { DELETE } else { 0 }
             },
             &attributes,
             &mut status_block,

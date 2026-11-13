@@ -121,3 +121,8 @@ pub fn verify_private_file(file: &File, directory: bool) -> io::Result<()> {
 #[cfg(windows)]
 #[path = "private_storage_windows.rs"]
 mod windows;
+
+#[cfg(windows)]
+pub(crate) fn create_staged_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::create_staged_file(parent, name)
+}

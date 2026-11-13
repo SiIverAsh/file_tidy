@@ -196,13 +196,50 @@ impl Session {
                     return Err(E::ConsistencyRequired);
                 }
             }
-            if !matches!(operation.kind, OperationKind::Move | OperationKind::Rename)
+            if !matches!(
+                operation.kind,
+                OperationKind::Move | OperationKind::Rename | OperationKind::Copy
+            ) || (operation.kind == OperationKind::Copy
+                && (operation.manifest.len() != 1 || operation.manifest[0].kind != "Regular"))
                 || operation
                     .destination
                     .as_ref()
                     .is_none_or(|d| !d.create_directories.is_empty())
             {
                 return Err(E::UnsupportedSafetyGuarantee);
+            }
+        }
+        let mut volumes: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        for operation in plan
+            .preview
+            .operations
+            .iter()
+            .filter(|op| op.kind == OperationKind::Copy)
+        {
+            let destination = operation.destination.as_ref().ok_or(E::InvalidPlan)?;
+            let parent = destination.existing_parent.to_path()?;
+            let info = platform::inspect(&parent)?;
+            let pinned = platform::open_directory_pinned(&parent, &info)?;
+            let available = platform::available_bytes(&pinned)?;
+            let volume = info.identity.ok_or(E::UnsupportedSafetyGuarantee)?.volume;
+            let entry = volumes.entry(volume).or_insert((0, available));
+            entry.0 = entry
+                .0
+                .checked_add(
+                    operation.manifest[0]
+                        .size_bytes
+                        .parse::<u64>()
+                        .map_err(|_| E::Overflow)?,
+                )
+                .ok_or(E::Overflow)?;
+            entry.1 = entry.1.min(available);
+        }
+        for (bytes, available) in volumes.values() {
+            let required = bytes
+                .checked_add((64 * 1024 * 1024).max(bytes.div_ceil(20)))
+                .ok_or(E::Overflow)?;
+            if required > *available {
+                return Err(E::InsufficientSpace);
             }
         }
         Ok(())
@@ -229,10 +266,11 @@ impl Session {
                     id: op.id.clone(),
                     source: op.source.clone(),
                     destination: op.destination.as_ref().map(|d| d.path.clone()),
-                    temporary: op
-                        .destination
-                        .as_ref()
-                        .and_then(|d| d.spelling_temporary.clone()),
+                    temporary: op.destination.as_ref().and_then(|d| {
+                        d.spelling_temporary
+                            .clone()
+                            .or_else(|| d.copy_temporary.clone())
+                    }),
                     status: ExecutionStatus::NotStarted,
                     reason: None,
                 })
@@ -248,6 +286,42 @@ impl Session {
             if let Err(error) = self.validate_operation(plan, operation, &changed_parents) {
                 self.fail_operation(&mut report, index, operation, error, false);
                 break;
+            }
+            if operation.kind == OperationKind::Copy {
+                match self.copy_operation(&approved, operation, &mut changed_parents, cancellation)
+                {
+                    Ok(()) => report.operations[index].status = ExecutionStatus::Done,
+                    Err(failure) => {
+                        let result = &mut report.operations[index];
+                        result.status = if failure.created {
+                            ExecutionStatus::NeedsRecovery
+                        } else if cancellation.is_cancelled() {
+                            ExecutionStatus::Cancelled
+                        } else {
+                            ExecutionStatus::Failed
+                        };
+                        result.reason = Some(failure.error.to_string());
+                        if failure.journal {
+                            report.journal_error = Some(failure.error.to_string());
+                        } else {
+                            let state = if failure.created {
+                                OperationState::NeedsRecovery
+                            } else {
+                                OperationState::Failed
+                            };
+                            if let Err(error) = self
+                                .store
+                                .as_mut()
+                                .ok_or(E::StorageRequired)?
+                                .record_result(&operation.id, failure.step, result, state)
+                            {
+                                report.journal_error = Some(error.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+                continue;
             }
             if operation
                 .destination

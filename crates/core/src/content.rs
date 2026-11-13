@@ -164,3 +164,98 @@ pub fn load_rules(path: &Path) -> Result<Rules, Error> {
     let text = std::str::from_utf8(&data).map_err(|_| Error::ConfigurationEncoding)?;
     Rules::from_toml(text).map_err(Error::Rules)
 }
+
+/// A copy content permit is scoped to one live confirmed operation. It does not
+/// change the scan content policy and cannot be reconstructed from audit data.
+pub(crate) struct OperationContentPermit {
+    path: std::path::PathBuf,
+    expected: NodeInfo,
+    mount_root: std::path::PathBuf,
+    sensitive_acknowledged: bool,
+    expires_at: u64,
+}
+impl OperationContentPermit {
+    pub(crate) fn issue(
+        session: &crate::authorization::Session,
+        approved: &crate::approval::ApprovedPlan,
+        operation: &crate::plan::PlannedOperation,
+    ) -> crate::authorization::Result<Self> {
+        use crate::authorization::PlanningError as E;
+        session.validate_plan_context(&approved.plan)?;
+        if operation.kind != crate::plan::OperationKind::Copy
+            || operation.manifest.len() != 1
+            || !approved
+                .preview()
+                .operations
+                .iter()
+                .any(|op| op.id == operation.id)
+        {
+            return Err(E::InvalidPlan);
+        }
+        let path = operation.source.to_path()?;
+        let expected = file_tidy_platform::inspect(&path)?;
+        if expected.kind != NodeKind::Regular
+            || crate::plan::Stamp::capture(&expected)? != operation.manifest[0].stamp
+        {
+            return Err(E::ChangedSincePlan);
+        }
+        let key = format!(
+            "{}:{}:content",
+            operation.id,
+            blake3::hash(&serde_json::to_vec(&operation.source)?).to_hex()
+        );
+        let sensitive_acknowledged = approved.preview().sensitive_acknowledgements.contains(&key);
+        let location = file_tidy_platform::classify_location(&path)?;
+        if location.kind != file_tidy_platform::LocationKind::Local {
+            return Err(E::UnsupportedSafetyGuarantee);
+        }
+        Ok(Self {
+            path,
+            expected,
+            mount_root: location.mount_root,
+            sensitive_acknowledged,
+            expires_at: approved.preview().expires_at,
+        })
+    }
+    pub(crate) fn check_live(&self) -> crate::authorization::Result<()> {
+        if crate::plan::now()? >= self.expires_at {
+            return Err(crate::authorization::PlanningError::InvalidPlan);
+        }
+        Ok(())
+    }
+    pub(crate) fn open(&self) -> crate::authorization::Result<File> {
+        self.check_live()?;
+        use crate::authorization::PlanningError as E;
+        let current = file_tidy_platform::classify_location(&self.path)?;
+        let policy = crate::authorization::planning_policy()?;
+        if current.kind != file_tidy_platform::LocationKind::Local
+            || current.mount_root != self.mount_root
+            || (policy.sensitive_for_content(&self.path) && !self.sensitive_acknowledged)
+        {
+            return Err(E::ConfirmationRequired);
+        }
+        Ok(file_tidy_platform::open_verified(
+            &self.path,
+            &self.expected,
+        )?)
+    }
+    pub(crate) fn verify_after(&self, file: &File) -> crate::authorization::Result<()> {
+        self.check_live()?;
+        use crate::authorization::PlanningError as E;
+        let current = file_tidy_platform::classify_location(&self.path)?;
+        let policy = crate::authorization::planning_policy()?;
+        if (policy.sensitive_for_content(&self.path) && !self.sensitive_acknowledged)
+            || current.mount_root != self.mount_root
+            || current.kind != file_tidy_platform::LocationKind::Local
+            || !self
+                .expected
+                .matches(&file_tidy_platform::inspect_file(file)?)
+            || !self
+                .expected
+                .matches(&file_tidy_platform::inspect(&self.path)?)
+        {
+            return Err(E::ChangedSincePlan);
+        }
+        Ok(())
+    }
+}

@@ -118,7 +118,17 @@ pub struct Destination {
     pub renamed_for_conflict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spelling_temporary: Option<NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_temporary: Option<NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_metadata: Option<CopyMetadataPolicy>,
     pub(crate) parent_stamp: Stamp,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyMetadataPolicy {
+    PrivateDataStreamAndMtime,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -284,7 +294,11 @@ impl Session {
                     return Err(E::AtomicBoundary);
                 }
                 reserved.insert(path);
-                if let Some(temporary) = &destination.spelling_temporary {
+                for temporary in destination
+                    .spelling_temporary
+                    .iter()
+                    .chain(&destination.copy_temporary)
+                {
                     reserved.insert(temporary.to_path()?);
                 }
                 Some(grant.id().clone())
@@ -558,6 +572,15 @@ impl Session {
                 return Err(E::ChangedSincePlan);
             }
             let mut missing_paths = dest.create_directories.iter().collect::<Vec<_>>();
+            if let Some(temporary) = &dest.copy_temporary {
+                if operation.kind != OperationKind::Copy
+                    || temporary.to_path()?.parent() != dest.path.to_path()?.parent()
+                    || dest.copy_metadata != Some(CopyMetadataPolicy::PrivateDataStreamAndMtime)
+                {
+                    return Err(E::InvalidPlan);
+                }
+                missing_paths.push(temporary);
+            }
             if let Some(temporary) = &dest.spelling_temporary {
                 if operation.kind != OperationKind::Rename
                     || !dest.create_directories.is_empty()
@@ -759,6 +782,8 @@ fn resolve_destination(
             create_directories,
             renamed_for_conflict: false,
             spelling_temporary: Some(NativePath::new(&temporary)),
+            copy_temporary: None,
+            copy_metadata: None,
             parent_stamp,
         });
     }
@@ -772,6 +797,15 @@ fn resolve_destination(
                 return Ok(Destination {
                     renamed_for_conflict: candidate != original,
                     spelling_temporary: None,
+                    copy_temporary: if kind == OperationKind::Copy {
+                        Some(NativePath::new(
+                            &parent.join(format!(".file-tidy-{}.part", Id::new()?)),
+                        ))
+                    } else {
+                        None
+                    },
+                    copy_metadata: (kind == OperationKind::Copy)
+                        .then_some(CopyMetadataPolicy::PrivateDataStreamAndMtime),
                     path: NativePath::new(&candidate),
                     existing_parent,
                     create_directories,
@@ -943,6 +977,12 @@ impl Plan {
                     ));
                 }
                 output.push_str(&format!("\n   → {}", destination.path.display));
+                if let Some(temporary) = &destination.copy_temporary {
+                    output.push_str(&format!(
+                        "\n   校验暂存：{}\n   副本：主数据流、修改时间、当前用户私有权限",
+                        temporary.display
+                    ));
+                }
                 if destination.renamed_for_conflict {
                     output.push_str("（同名冲突，已预览新名称）");
                 }

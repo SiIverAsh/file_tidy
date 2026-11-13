@@ -118,6 +118,7 @@ jobs:
               "cargo", "test", "--workspace", "--locked",
               "--test", "authorization_plan", "--test", "plan_cli",
               "--test", "execution", "--test", "rename", "--test", "case_rename",
+              "--test", "copy", "--test", "staging",
               "--", "--include-ignored",
           ], env=environment, check=True)
           subprocess.run([

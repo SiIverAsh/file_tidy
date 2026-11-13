@@ -19,6 +19,12 @@ pub enum RecoveryDisposition {
     TemporaryObserved,
     /// A durable rename intent matches the relocated object; journal completion is pending.
     RenameObserved,
+    /// An identified partial copy remains at its reviewed staging name.
+    StagedCopyObserved,
+    /// A previously verified copy is present; content verification needs a new permit.
+    VerifiedCopyObserved,
+    /// Publication intent and recorded identity match the destination.
+    CopyPublishedObserved,
     /// The objects or intent do not establish one unambiguous outcome.
     NeedsAttention,
     /// Current authorization, policy, or media availability prevents inspection.
@@ -33,6 +39,7 @@ pub struct RecoveryItem {
     pub destination: Option<NativePath>,
     pub temporary: Option<NativePath>,
     pub journal_state: OperationState,
+    pub policy_changed: bool,
     pub disposition: RecoveryDisposition,
     pub reason: String,
 }
@@ -68,16 +75,16 @@ impl Session {
                 ) {
                     continue;
                 }
-                let (disposition, reason) = if preview.policy_digest != policy_digest() {
-                    (
-                        RecoveryDisposition::Unavailable,
-                        "policy_changed".to_owned(),
-                    )
-                } else if history.events_truncated {
+                // Diagnosis grants no execution capability. Recheck current
+                // policy below, including for records from an older binary.
+                let policy_changed = preview.policy_digest != policy_digest();
+                let (disposition, reason) = if history.events_truncated {
                     (
                         RecoveryDisposition::NeedsAttention,
                         "event_history_incomplete".to_owned(),
                     )
+                } else if operation.kind == OperationKind::Copy {
+                    self.inspect_interrupted_copy(operation, &history)
                 } else if !matches!(operation.kind, OperationKind::Move | OperationKind::Rename) {
                     (
                         RecoveryDisposition::NeedsAttention,
@@ -92,11 +99,13 @@ impl Session {
                     operation_id: recorded.id.clone(),
                     source: operation.source.clone(),
                     destination: operation.destination.as_ref().map(|d| d.path.clone()),
-                    temporary: operation
-                        .destination
-                        .as_ref()
-                        .and_then(|d| d.spelling_temporary.clone()),
+                    temporary: operation.destination.as_ref().and_then(|d| {
+                        d.spelling_temporary
+                            .clone()
+                            .or_else(|| d.copy_temporary.clone())
+                    }),
                     journal_state: recorded.state,
+                    policy_changed,
                     disposition,
                     reason,
                 });
@@ -879,6 +888,48 @@ mod tests {
         assert_eq!(
             session.batch_history(&approved.preview().id)?.operations[0].state,
             OperationState::Staged
+        );
+        Ok(())
+    }
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", windows),
+        ignore = "requires independent FILE_TIDY_TEST_ROOT"
+    )]
+    fn historical_policy_digest_does_not_recreate_permission_or_block_read_only_diagnosis()
+    -> TestResult {
+        let directory = fixture()?;
+        let (mut session, approved) = prepared(directory.path(), false)?;
+        let mut snapshot = serde_json::to_value(approved.preview())?;
+        snapshot["policy_digest"] = serde_json::json!("00".repeat(32));
+        let bytes = serde_json::to_vec(&snapshot)?;
+        let digest = blake3::hash(&bytes);
+        session
+            .store
+            .as_mut()
+            .ok_or("missing storage")?
+            .journal_write(|db| {
+                db.execute_batch("DROP TRIGGER immutable_batch_plan;")?;
+                db.execute(
+                    "UPDATE batches SET snapshot=?1,plan_digest=?2,policy_digest=?3",
+                    rusqlite::params![bytes, digest.as_bytes(), [0u8; 32]],
+                )?;
+                Ok(())
+            })?;
+        let report = session.recovery_report(None, 10)?;
+        assert_eq!(report.items.len(), 1);
+        assert!(report.items[0].policy_changed);
+        assert_eq!(
+            report.items[0].disposition,
+            RecoveryDisposition::NotCommitted
+        );
+        let grant = session.grants().next().ok_or("missing grant")?.id().clone();
+        session.revoke(&grant)?;
+        drop(session);
+        let session = Session::open(directory.path())?;
+        assert_eq!(
+            session.recovery_report(None, 10)?.items[0].disposition,
+            RecoveryDisposition::Unavailable
         );
         Ok(())
     }

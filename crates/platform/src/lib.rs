@@ -13,6 +13,8 @@ use std::time::SystemTime;
 mod mounts;
 mod mutation;
 pub use mutation::{RenameError, rename_noreplace};
+mod staged_file;
+pub use staged_file::{StagedFile, available_bytes};
 mod private_storage;
 pub use private_storage::{
     PinnedDirectory, create_private_directory, create_private_file, open_directory_pinned,

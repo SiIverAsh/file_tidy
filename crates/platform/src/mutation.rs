@@ -35,7 +35,7 @@ impl From<io::Error> for RenameError {
 }
 
 impl RenameError {
-    fn after_rename(error: io::Error) -> Self {
+    pub(crate) fn after_rename(error: io::Error) -> Self {
         Self {
             error,
             may_have_moved: true,
@@ -48,7 +48,7 @@ impl RenameError {
         self.cross_device
     }
 
-    fn from_rename(error: io::Error) -> Self {
+    pub(crate) fn from_rename(error: io::Error) -> Self {
         #[cfg(unix)]
         let code = rustix::io::Errno::XDEV.raw_os_error();
         #[cfg(windows)]
@@ -386,3 +386,12 @@ mod tests {
 #[cfg(windows)]
 #[path = "mutation_windows.rs"]
 mod windows;
+
+#[cfg(windows)]
+pub(crate) fn publish_open_file(
+    source: &std::fs::File,
+    parent: &std::fs::File,
+    name: &OsStr,
+) -> io::Result<()> {
+    windows::rename_open_file(source, parent, name)
+}
