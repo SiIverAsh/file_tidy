@@ -14,6 +14,13 @@ impl Session {
         op: &PlannedOperation,
         history: &BatchHistoryDetail,
     ) -> (D, String) {
+        if op
+            .manifest
+            .iter()
+            .any(|entry| entry.path == op.source && entry.kind == "Directory")
+        {
+            return self.inspect_tree_copy(op, history);
+        }
         let inspect = || -> Result<(D, &'static str)> {
             let dest = op.destination.as_ref().ok_or(E::StorageUnavailable)?;
             let temporary = dest.copy_temporary.as_ref().ok_or(E::StorageUnavailable)?;

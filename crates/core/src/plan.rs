@@ -106,6 +106,8 @@ pub struct ManifestEntry {
     pub hidden: bool,
     pub sensitive: bool,
     pub link_target: Option<NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_directory: Option<bool>,
     pub(crate) stamp: Stamp,
 }
 
@@ -197,6 +199,28 @@ impl Plan {
                 .path
                 .display
                 .clone()
+        } else if let Some(hash) = entry_id.strip_prefix("destination_") {
+            let source = operation.source.to_path()?;
+            let destination = operation
+                .destination
+                .as_ref()
+                .ok_or(E::InvalidPlan)?
+                .path
+                .to_path()?;
+            operation
+                .manifest
+                .iter()
+                .find_map(|entry| {
+                    let path = entry.path.to_path().ok()?;
+                    let relative = path.strip_prefix(&source).ok()?;
+                    let target = NativePath::new(&destination.join(relative));
+                    (blake3::hash(&serde_json::to_vec(&target).ok()?)
+                        .to_hex()
+                        .as_str()
+                        == hash)
+                        .then_some(target.display)
+                })
+                .ok_or(E::InvalidRequest)?
         } else {
             operation
                 .manifest
@@ -397,20 +421,15 @@ impl Session {
                     let cross_volume = operation.destination.as_ref().is_some_and(|d| {
                         d.parent_stamp.identity.volume != entry.stamp.identity.volume
                     });
-                    if operation.kind == OperationKind::Copy
-                        || (operation.kind == OperationKind::Move && cross_volume)
+                    if entry.kind == "Regular"
+                        && (operation.kind == OperationKind::Copy
+                            || (operation.kind == OperationKind::Move && cross_volume))
                     {
                         sensitive.insert(format!("{}:{path_digest}:content", operation.id));
                     }
                 }
             }
-            if let Some(dest) = &operation.destination {
-                let parent = dest.existing_parent.to_path()?;
-                if policy.labels(&parent).sensitive || destination_sensitive(&dest.path.to_path()?)
-                {
-                    sensitive.insert(format!("{}:destination:write", operation.id));
-                }
-            }
+            sensitive.extend(destination_acknowledgements(operation, &policy)?);
         }
         if bytes > i64::MAX as u64 {
             return Err(E::Overflow);
@@ -530,6 +549,7 @@ impl Session {
                 a.path != b.path
                     || a.stamp != b.stamp
                     || a.link_target != b.link_target
+                    || a.symlink_directory != b.symlink_directory
                     || a.hidden != b.hidden
                     || (a.sensitive && !b.sensitive)
             })
@@ -562,14 +582,11 @@ impl Session {
             {
                 return Err(E::InvalidPlan);
             }
-            // A newly sensitive destination needs a new per-item confirmation.
-            if (labels.sensitive || destination_sensitive(&dest.path.to_path()?))
-                && !plan
-                    .preview
-                    .sensitive_acknowledgements
-                    .contains(&format!("{}:destination:write", operation.id))
-            {
-                return Err(E::ChangedSincePlan);
+            // New sensitive destination entries require their own reviewed scope.
+            for key in destination_acknowledgements(operation, &policy)? {
+                if !plan.preview.sensitive_acknowledgements.contains(&key) {
+                    return Err(E::ChangedSincePlan);
+                }
             }
             let mut missing_paths = dest.create_directories.iter().collect::<Vec<_>>();
             if let Some(temporary) = &dest.copy_temporary {
@@ -651,6 +668,17 @@ impl Session {
         policy: &Policy,
         budget: &mut usize,
     ) -> Result<Vec<ManifestEntry>> {
+        self.manifest_staged(source, kind, options, policy, budget, None)
+    }
+    pub(crate) fn manifest_staged(
+        &self,
+        source: &Path,
+        kind: OperationKind,
+        options: &PlanOptions,
+        policy: &Policy,
+        budget: &mut usize,
+        staged: Option<&file_tidy_platform::StagedDirectory>,
+    ) -> Result<Vec<ManifestEntry>> {
         let mut stack = vec![source.to_path_buf()];
         let mut entries = Vec::new();
         while let Some(path) = stack.pop() {
@@ -691,7 +719,15 @@ impl Session {
             }
             let stamp = Stamp::capture(&node)?;
             if node.kind == NodeKind::Directory {
-                let listing = file_tidy_platform::read_directory_verified(&path, &node, *budget)?;
+                let listing = if let Some(tree) = staged {
+                    tree.read_directory(
+                        path.strip_prefix(source).map_err(|_| E::InvalidPath)?,
+                        &node,
+                        *budget,
+                    )?
+                } else {
+                    file_tidy_platform::read_directory_verified(&path, &node, *budget)?
+                };
                 if listing.truncated {
                     return Err(E::IncompleteManifest);
                 }
@@ -711,6 +747,11 @@ impl Session {
                 sensitive: labels.sensitive,
                 link_target: if node.kind == NodeKind::Symlink {
                     Some(NativePath::new(&std::fs::read_link(&path)?))
+                } else {
+                    None
+                },
+                symlink_directory: if node.kind == NodeKind::Symlink {
+                    Some(file_tidy_platform::symlink_directory(&path)?)
                 } else {
                     None
                 },
@@ -932,6 +973,36 @@ fn validate_name(name: &std::ffi::OsStr) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn destination_acknowledgements(
+    operation: &PlannedOperation,
+    policy: &Policy,
+) -> Result<Vec<String>> {
+    let Some(destination) = &operation.destination else {
+        return Ok(Vec::new());
+    };
+    let target = destination.path.to_path()?;
+    let source = operation.source.to_path()?;
+    let parent_sensitive = policy
+        .labels(&destination.existing_parent.to_path()?)
+        .sensitive;
+    let mut keys = Vec::new();
+    for entry in &operation.manifest {
+        let path = entry.path.to_path()?;
+        let relative = path.strip_prefix(&source).map_err(|_| E::InvalidPath)?;
+        let target_path = target.join(relative);
+        if parent_sensitive || destination_sensitive(&target_path) {
+            if relative.as_os_str().is_empty() {
+                keys.push(format!("{}:destination:write", operation.id));
+            } else {
+                let digest =
+                    blake3::hash(&serde_json::to_vec(&NativePath::new(&target_path))?).to_hex();
+                keys.push(format!("{}:destination_{digest}:write", operation.id));
+            }
+        }
+    }
+    Ok(keys)
 }
 
 pub(crate) fn destination_sensitive(path: &Path) -> bool {

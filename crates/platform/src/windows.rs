@@ -174,7 +174,17 @@ pub(crate) fn read_directory_verified_cancellable(
         ));
     }
     let (directory, _guards) = open_pinned(path, true)?;
-    if !expected.matches(&node_info_from_file(&directory)?) {
+    read_directory_using_pin(path, expected, &directory, limit, cancelled)
+}
+
+pub(crate) fn read_directory_using_pin(
+    path: &Path,
+    expected: &NodeInfo,
+    directory: &File,
+    limit: usize,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<DirectoryListing> {
+    if !expected.matches(&node_info_from_file(directory)?) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "directory changed before enumeration",
@@ -210,7 +220,7 @@ pub(crate) fn read_directory_verified_cancellable(
         }
         names.push(name);
     }
-    if !expected.matches(&node_info_from_file(&directory)?)
+    if !expected.matches(&node_info_from_file(directory)?)
         || !expected.matches(&crate::inspect(path)?)
     {
         return Err(io::Error::new(

@@ -200,7 +200,10 @@ impl Session {
                 operation.kind,
                 OperationKind::Move | OperationKind::Rename | OperationKind::Copy
             ) || (operation.kind == OperationKind::Copy
-                && (operation.manifest.len() != 1 || operation.manifest[0].kind != "Regular"))
+                && !operation.manifest.iter().any(|entry| {
+                    entry.path == operation.source
+                        && matches!(entry.kind.as_str(), "Regular" | "Directory")
+                }))
                 || operation
                     .destination
                     .as_ref()
@@ -223,15 +226,16 @@ impl Session {
             let available = platform::available_bytes(&pinned)?;
             let volume = info.identity.ok_or(E::UnsupportedSafetyGuarantee)?.volume;
             let entry = volumes.entry(volume).or_insert((0, available));
-            entry.0 = entry
-                .0
-                .checked_add(
-                    operation.manifest[0]
-                        .size_bytes
-                        .parse::<u64>()
-                        .map_err(|_| E::Overflow)?,
-                )
-                .ok_or(E::Overflow)?;
+            for item in operation
+                .manifest
+                .iter()
+                .filter(|entry| entry.kind == "Regular")
+            {
+                entry.0 = entry
+                    .0
+                    .checked_add(item.size_bytes.parse::<u64>().map_err(|_| E::Overflow)?)
+                    .ok_or(E::Overflow)?;
+            }
             entry.1 = entry.1.min(available);
         }
         for (bytes, available) in volumes.values() {
@@ -288,8 +292,16 @@ impl Session {
                 break;
             }
             if operation.kind == OperationKind::Copy {
-                match self.copy_operation(&approved, operation, &mut changed_parents, cancellation)
+                let result = if operation
+                    .manifest
+                    .iter()
+                    .any(|entry| entry.path == operation.source && entry.kind == "Directory")
                 {
+                    self.copy_tree(&approved, operation, &mut changed_parents, cancellation)
+                } else {
+                    self.copy_operation(&approved, operation, &mut changed_parents, cancellation)
+                };
+                match result {
                     Ok(()) => report.operations[index].status = ExecutionStatus::Done,
                     Err(failure) => {
                         let result = &mut report.operations[index];
@@ -813,6 +825,8 @@ impl Session {
                 .stamp
                 .matches_relocated(&entry.stamp, name_hidden_changed)
                 || before.link_target != entry.link_target
+                || (before.symlink_directory.is_some()
+                    && before.symlink_directory != entry.symlink_directory)
             {
                 return Err(E::ChangedSincePlan);
             }

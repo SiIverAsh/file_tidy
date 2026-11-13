@@ -48,3 +48,26 @@ fn staging_creation_is_exclusive_and_publication_preserves_occupied_names() -> T
     assert_eq!(std::fs::read(root.join("stage.part"))?, b"source");
     Ok(())
 }
+
+#[test]
+fn staged_tree_rejects_unowned_directories_and_publishes_owned_children() -> TestResult {
+    use file_tidy_platform::StagedDirectory;
+    let fixture = fixture()?;
+    let root = fixture.path().canonicalize()?;
+    let before = inspect(&root)?;
+    let mut tree = StagedDirectory::create(&root, &before, ".tree.part".as_ref())?;
+    tree.create_directory("nested".as_ref())?;
+    {
+        let mut file = tree.create_file("nested/data".as_ref())?;
+        file.file_mut().write_all(b"data")?;
+        file.file_mut().sync_all()?;
+        file.verify()?;
+    }
+    assert!(tree.create_file("../escape".as_ref()).is_err());
+    std::fs::create_dir(root.join(".tree.part/foreign"))?;
+    assert!(tree.create_file("foreign/data".as_ref()).is_err());
+    std::fs::remove_dir(root.join(".tree.part/foreign"))?;
+    tree.publish("complete".as_ref())?;
+    assert_eq!(std::fs::read(root.join("complete/nested/data"))?, b"data");
+    Ok(())
+}

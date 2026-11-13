@@ -20,6 +20,15 @@ impl StagedFile {
     pub fn create(parent_path: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
         component(name)?;
         let parent = crate::open_directory_pinned(parent_path, expected)?;
+        Self::create_pinned(parent_path, expected, parent, name)
+    }
+    pub(crate) fn create_pinned(
+        parent_path: &Path,
+        expected: &NodeInfo,
+        parent: PinnedDirectory,
+        name: &OsStr,
+    ) -> io::Result<Self> {
+        component(name)?;
         let directory = parent.try_clone_file()?;
         #[cfg(unix)]
         let file = {
@@ -63,9 +72,18 @@ impl StagedFile {
     }
     pub fn verify(&self) -> io::Result<()> {
         let opened = self.inspect()?;
+        #[cfg(unix)]
+        let named = {
+            if crate::classify_location(&self.path)?.kind != crate::LocationKind::Local {
+                return Err(io::Error::other("staging location changed"));
+            }
+            let file = crate::unix::open_nofollow(&self.path, false)?;
+            crate::inspect_file(&file)?
+        };
+        #[cfg(windows)]
+        let named = crate::inspect(&self.path)?;
         if opened.identity != Some(self.identity)
-            || !opened.matches(&crate::inspect(&self.path)?)
-            || crate::inspect(&self.parent_path)?.identity != self.parent_info.identity
+            || !opened.matches(&named)
             || crate::inspect_file(&self.parent.try_clone_file()?)?.identity
                 != self.parent_info.identity
         {
@@ -104,7 +122,7 @@ impl StagedFile {
         Ok(actual)
     }
 }
-fn component(name: &OsStr) -> io::Result<()> {
+pub(crate) fn component(name: &OsStr) -> io::Result<()> {
     let mut parts = Path::new(name).components();
     if !matches!(parts.next(), Some(Component::Normal(_)))
         || parts.next().is_some()

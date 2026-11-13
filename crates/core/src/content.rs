@@ -180,10 +180,21 @@ impl OperationContentPermit {
         approved: &crate::approval::ApprovedPlan,
         operation: &crate::plan::PlannedOperation,
     ) -> crate::authorization::Result<Self> {
+        if operation.manifest.len() != 1 {
+            return Err(crate::authorization::PlanningError::InvalidPlan);
+        }
+        Self::issue_entry(session, approved, operation, &operation.manifest[0])
+    }
+    pub(crate) fn issue_entry(
+        session: &crate::authorization::Session,
+        approved: &crate::approval::ApprovedPlan,
+        operation: &crate::plan::PlannedOperation,
+        entry: &crate::plan::ManifestEntry,
+    ) -> crate::authorization::Result<Self> {
         use crate::authorization::PlanningError as E;
         session.validate_plan_context(&approved.plan)?;
         if operation.kind != crate::plan::OperationKind::Copy
-            || operation.manifest.len() != 1
+            || !operation.manifest.iter().any(|item| item == entry)
             || !approved
                 .preview()
                 .operations
@@ -192,17 +203,17 @@ impl OperationContentPermit {
         {
             return Err(E::InvalidPlan);
         }
-        let path = operation.source.to_path()?;
+        let path = entry.path.to_path()?;
         let expected = file_tidy_platform::inspect(&path)?;
         if expected.kind != NodeKind::Regular
-            || crate::plan::Stamp::capture(&expected)? != operation.manifest[0].stamp
+            || crate::plan::Stamp::capture(&expected)? != entry.stamp
         {
             return Err(E::ChangedSincePlan);
         }
         let key = format!(
             "{}:{}:content",
             operation.id,
-            blake3::hash(&serde_json::to_vec(&operation.source)?).to_hex()
+            blake3::hash(&serde_json::to_vec(&entry.path)?).to_hex()
         );
         let sensitive_acknowledged = approved.preview().sensitive_acknowledgements.contains(&key);
         let location = file_tidy_platform::classify_location(&path)?;

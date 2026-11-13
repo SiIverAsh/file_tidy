@@ -20,6 +20,7 @@ mod model;
 pub mod policy;
 mod report;
 mod scan;
+mod tree_copy;
 
 pub use classify::{Category, Classification, RuleError, Rules, TypeEvidence};
 pub use content::load_rules;

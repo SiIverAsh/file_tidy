@@ -182,6 +182,7 @@ fn create_object(parent: &File, name: &OsStr, directory: bool, staged: bool) -> 
                     | FILE_WRITE_ATTRIBUTES
                     | READ_CONTROL
                     | SYNCHRONIZE
+                    | if staged { DELETE } else { 0 }
             } else {
                 FILE_GENERIC_READ
                     | FILE_GENERIC_WRITE
@@ -281,4 +282,78 @@ pub(super) fn verify(file: &File, directory: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn create_staged_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    create_object(parent, name, true, true)
+}
+pub(super) fn open_staged_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_staged_object(parent, name, true)
+}
+pub(super) fn open_staged_link(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_staged_object(parent, name, false)
+}
+fn open_staged_object(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    let mut units: Vec<u16> = name.encode_wide().collect();
+    if units.is_empty() || units.iter().any(|u| matches!(u, 0 | 58 | 47 | 92)) {
+        return Err(io::Error::other("invalid relative directory name"));
+    }
+    let bytes =
+        u16::try_from(units.len() * 2).map_err(|_| io::Error::other("directory name too long"))?;
+    let native = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attrs = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &native,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        ..Default::default()
+    };
+    let mut ios = IO_STATUS_BLOCK::default();
+    let mut handle = ptr::null_mut();
+    // SAFETY: buffers and parent handle remain live during the synchronous call.
+    // One validated component is opened relative to a held directory; reparse
+    // points are opened themselves and subsequently rejected by private checks.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            (if directory {
+                FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE
+            } else {
+                0
+            }) | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_ATTRIBUTES
+                | READ_CONTROL
+                | SYNCHRONIZE,
+            &attrs,
+            &mut ios,
+            ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            (if directory { FILE_DIRECTORY_FILE } else { 0 })
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: scalar NTSTATUS conversion retains no buffers.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    // SAFETY: successful NtCreateFile transfers ownership of the returned handle.
+    let file = unsafe { File::from_raw_handle(handle) };
+    if directory {
+        super::verify_private_file(&file, true)?;
+    } else if crate::inspect_file(&file)?.kind != crate::NodeKind::Symlink {
+        return Err(io::Error::other("symbolic link changed"));
+    }
+    Ok(file)
 }

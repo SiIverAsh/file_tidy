@@ -152,7 +152,7 @@ mod unix {
     use std::fs::File;
 
     #[allow(clippy::unnecessary_cast)] // Native stat field widths vary by platform.
-    fn leaf(parent: &File, name: &OsStr) -> io::Result<NodeInfo> {
+    pub(super) fn leaf(parent: &File, name: &OsStr) -> io::Result<NodeInfo> {
         use std::os::unix::ffi::OsStrExt;
         use std::time::{Duration, UNIX_EPOCH};
         let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -366,6 +366,11 @@ mod unix {
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn inspect_relative(parent: &std::fs::File, name: &OsStr) -> io::Result<NodeInfo> {
+    unix::leaf(parent, name)
 }
 
 #[cfg(test)]

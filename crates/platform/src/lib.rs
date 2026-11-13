@@ -13,6 +13,8 @@ use std::time::SystemTime;
 mod mounts;
 mod mutation;
 pub use mutation::{RenameError, rename_noreplace};
+mod staged_directory;
+pub use staged_directory::StagedDirectory;
 mod staged_file;
 pub use staged_file::{StagedFile, available_bytes};
 mod private_storage;
@@ -186,5 +188,24 @@ pub fn protected_system_roots() -> io::Result<Vec<PathBuf>> {
     #[cfg(unix)]
     {
         Ok(Vec::new())
+    }
+}
+
+/// Native link type, obtained without querying the link target.
+pub fn symlink_directory(path: &Path) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(io::Error::other("symbolic link required"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+            != 0)
+    }
+    #[cfg(unix)]
+    {
+        Ok(false)
     }
 }

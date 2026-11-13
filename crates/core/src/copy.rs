@@ -43,7 +43,6 @@ impl Session {
             let parent_before = platform::inspect(parent)?;
             let permit = OperationContentPermit::issue(self, approved, operation)?;
             let mut source = permit.open()?;
-            let source_info = platform::inspect_file(&source)?;
             let intent = json!({"source": operation.source, "destination": destination.path,
                 "temporary": destination.copy_temporary, "manifest": operation.manifest});
             checkpoint(cancellation)?;
@@ -84,68 +83,11 @@ impl Session {
                 .inspect_err(|_| {
                     journal_error = true;
                 })?;
-            let mut buffer = [0; 65_536];
-            let mut length = 0u64;
-            let mut source_hash = blake3::Hasher::new();
-            loop {
-                checkpoint(cancellation)?;
-                permit.check_live()?;
-                let read = source.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                permit.check_live()?;
-                length = length.checked_add(read as u64).ok_or(E::Overflow)?;
-                if length > source_info.len {
-                    return Err(E::ChangedSincePlan);
-                }
-                source_hash.update(&buffer[..read]);
-                staged.file_mut().write_all(&buffer[..read])?;
-                #[cfg(test)]
-                faults::run()?;
-            }
-            if length != source_info.len {
-                return Err(E::ChangedSincePlan);
-            }
-            staged.file_mut().flush()?;
-            staged.file_mut().sync_all()?;
-            staged.verify()?;
-            permit.verify_after(&source)?;
-            let before_verification = Stamp::capture(&staged.inspect()?)?;
-            staged.file_mut().seek(SeekFrom::Start(0))?;
-            let mut target_hash = blake3::Hasher::new();
-            let mut verified = 0u64;
-            loop {
-                checkpoint(cancellation)?;
-                permit.check_live()?;
-                let read = staged.file_mut().read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                verified = verified.checked_add(read as u64).ok_or(E::Overflow)?;
-                if verified > length {
-                    return Err(E::ChangedSincePlan);
-                }
-                target_hash.update(&buffer[..read]);
-            }
-            let hash = source_hash.finalize();
-            if verified != length || target_hash.finalize() != hash {
-                return Err(E::ChangedSincePlan);
-            }
-            if Stamp::capture(&staged.inspect()?)? != before_verification {
-                return Err(E::ChangedSincePlan);
-            }
-            let modified = source_info.modified.ok_or(E::UnsupportedSafetyGuarantee)?;
-            staged
-                .file_mut()
-                .set_times(std::fs::FileTimes::new().set_modified(modified))?;
-            staged.file_mut().sync_all()?;
-            staged.verify()?;
-            permit.verify_after(&source)?;
-            if staged.inspect()?.modified != source_info.modified {
-                return Err(E::UnsupportedSafetyGuarantee);
-            }
-            let verified_stamp = Stamp::capture(&staged.inspect()?)?;
+            let FileVerification {
+                length,
+                hash,
+                stamp: verified_stamp,
+            } = verified_transfer(&permit, &mut source, &mut staged, cancellation)?;
             let verified_result = json!({"temporary": destination.copy_temporary, "stamp": verified_stamp,
                 "length": length.to_string(), "blake3": hash.to_hex().to_string(), "metadata": destination.copy_metadata});
             self.store
@@ -224,7 +166,88 @@ impl Session {
         })
     }
 }
-fn checkpoint(cancellation: &CancellationToken) -> Result<()> {
+pub(crate) struct FileVerification {
+    pub length: u64,
+    pub hash: blake3::Hash,
+    pub stamp: Stamp,
+}
+pub(crate) fn verified_transfer(
+    permit: &OperationContentPermit,
+    source: &mut std::fs::File,
+    staged: &mut platform::StagedFile,
+    cancellation: &CancellationToken,
+) -> Result<FileVerification> {
+    let source_info = platform::inspect_file(source)?;
+    permit.verify_after(source)?;
+    let mut buffer = [0; 65_536];
+    let mut length = 0u64;
+    let mut source_hash = blake3::Hasher::new();
+    loop {
+        checkpoint(cancellation)?;
+        permit.check_live()?;
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        permit.check_live()?;
+        length = length.checked_add(read as u64).ok_or(E::Overflow)?;
+        if length > source_info.len {
+            return Err(E::ChangedSincePlan);
+        }
+        source_hash.update(&buffer[..read]);
+        staged.file_mut().write_all(&buffer[..read])?;
+        #[cfg(test)]
+        faults::run()?;
+    }
+    if length != source_info.len {
+        return Err(E::ChangedSincePlan);
+    }
+    staged.file_mut().flush()?;
+    staged.file_mut().sync_all()?;
+    staged.verify()?;
+    permit.verify_after(source)?;
+    let before_verification = Stamp::capture(&staged.inspect()?)?;
+    staged.file_mut().seek(SeekFrom::Start(0))?;
+    let mut target_hash = blake3::Hasher::new();
+    let mut verified = 0u64;
+    loop {
+        checkpoint(cancellation)?;
+        permit.check_live()?;
+        let read = staged.file_mut().read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        verified = verified.checked_add(read as u64).ok_or(E::Overflow)?;
+        if verified > length {
+            return Err(E::ChangedSincePlan);
+        }
+        target_hash.update(&buffer[..read]);
+    }
+    let hash = source_hash.finalize();
+    if verified != length || target_hash.finalize() != hash {
+        return Err(E::ChangedSincePlan);
+    }
+    if Stamp::capture(&staged.inspect()?)? != before_verification {
+        return Err(E::ChangedSincePlan);
+    }
+    let modified = source_info.modified.ok_or(E::UnsupportedSafetyGuarantee)?;
+    staged
+        .file_mut()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    staged.file_mut().sync_all()?;
+    staged.verify()?;
+    permit.verify_after(source)?;
+    if staged.inspect()?.modified != source_info.modified {
+        return Err(E::UnsupportedSafetyGuarantee);
+    }
+    let verified_stamp = Stamp::capture(&staged.inspect()?)?;
+    Ok(FileVerification {
+        length,
+        hash,
+        stamp: verified_stamp,
+    })
+}
+pub(crate) fn checkpoint(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_cancelled() {
         return Err(E::Io(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -233,7 +256,7 @@ fn checkpoint(cancellation: &CancellationToken) -> Result<()> {
     }
     Ok(())
 }
-fn update_parent(
+pub(crate) fn update_parent(
     path: &Path,
     before: &platform::NodeInfo,
     parents: &mut BTreeMap<PathBuf, Stamp>,
@@ -246,10 +269,10 @@ fn update_parent(
     Ok(())
 }
 #[cfg(test)]
-mod faults {
+pub(crate) mod faults {
     use std::cell::RefCell;
     type Hook = RefCell<Option<Box<dyn FnOnce() -> std::io::Result<()>>>>;
-    thread_local! { pub(super) static AFTER_WRITE: Hook = RefCell::new(None); }
+    thread_local! { pub(crate) static AFTER_WRITE: Hook = RefCell::new(None); }
     pub(super) fn run() -> std::io::Result<()> {
         match AFTER_WRITE.with(|hook| hook.borrow_mut().take()) {
             Some(hook) => hook(),

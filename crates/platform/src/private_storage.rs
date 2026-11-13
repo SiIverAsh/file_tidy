@@ -11,6 +11,13 @@ pub struct PinnedDirectory {
     _ancestors: Vec<File>,
 }
 impl PinnedDirectory {
+    pub(crate) fn from_staged(file: File, ancestors: Vec<File>) -> io::Result<Self> {
+        verify_private_file(&file, true)?;
+        Ok(Self {
+            file,
+            _ancestors: ancestors,
+        })
+    }
     pub fn try_clone_file(&self) -> io::Result<File> {
         self.file.try_clone()
     }
@@ -125,4 +132,17 @@ mod windows;
 #[cfg(windows)]
 pub(crate) fn create_staged_handle(parent: &File, name: &OsStr) -> io::Result<File> {
     windows::create_staged_file(parent, name)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_staged_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::create_staged_directory(parent, name)
+}
+#[cfg(windows)]
+pub(crate) fn open_staged_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::open_staged_directory(parent, name)
+}
+#[cfg(windows)]
+pub(crate) fn open_staged_link_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::open_staged_link(parent, name)
 }
