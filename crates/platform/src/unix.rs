@@ -143,6 +143,25 @@ fn ancestor_flags() -> OFlags {
 }
 
 pub(crate) fn open_nofollow(path: &Path, directory: bool) -> io::Result<File> {
+    open_with_leaf_flags(
+        path,
+        directory,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+    )
+}
+pub(crate) fn open_metadata_nofollow(path: &Path, directory: bool) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    let flags = OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    #[cfg(target_os = "macos")]
+    let flags = OFlags::from_bits_retain(libc::O_EVTONLY as u32)
+        | OFlags::CLOEXEC
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    open_with_leaf_flags(path, directory, flags)
+}
+fn open_with_leaf_flags(path: &Path, directory: bool, leaf_flags: OFlags) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -156,7 +175,7 @@ pub(crate) fn open_nofollow(path: &Path, directory: bool) -> io::Result<File> {
     // A root selected for enumeration is the leaf, so unlike intermediate
     // ancestors it must be opened for directory reading.
     let root_flags = if directory && root_only {
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        leaf_flags | OFlags::DIRECTORY
     } else {
         ancestor_flags()
     };
@@ -170,8 +189,7 @@ pub(crate) fn open_nofollow(path: &Path, directory: bool) -> io::Result<File> {
                 } else {
                     // NONBLOCK prevents a concurrent regular-file -> FIFO swap
                     // from hanging before fstat detects the replacement.
-                    let mut flags =
-                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+                    let mut flags = leaf_flags;
                     if directory {
                         flags |= OFlags::DIRECTORY;
                     }
