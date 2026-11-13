@@ -198,16 +198,19 @@ impl Session {
             }
             if !matches!(
                 operation.kind,
-                OperationKind::Move | OperationKind::Rename | OperationKind::Copy
+                OperationKind::Move
+                    | OperationKind::Rename
+                    | OperationKind::Copy
+                    | OperationKind::Quarantine
+                    | OperationKind::Restore
             ) || (operation.kind == OperationKind::Copy
                 && !operation.manifest.iter().any(|entry| {
                     entry.path == operation.source
                         && matches!(entry.kind.as_str(), "Regular" | "Directory")
                 }))
-                || operation
-                    .destination
-                    .as_ref()
-                    .is_none_or(|d| !d.create_directories.is_empty())
+                || operation.destination.as_ref().is_none_or(|d| {
+                    !d.create_directories.is_empty() && operation.kind != OperationKind::Quarantine
+                })
             {
                 return Err(E::UnsupportedSafetyGuarantee);
             }
@@ -291,8 +294,10 @@ impl Session {
                 self.fail_operation(&mut report, index, operation, error, false);
                 break;
             }
-            if operation.kind == OperationKind::Copy {
-                let result = if operation
+            if operation.kind == OperationKind::Copy || operation.managed.is_some() {
+                let result = if operation.managed.is_some() {
+                    self.execute_managed(plan, operation, &mut changed_parents, cancellation)
+                } else if operation
                     .manifest
                     .iter()
                     .any(|entry| entry.path == operation.source && entry.kind == "Directory")

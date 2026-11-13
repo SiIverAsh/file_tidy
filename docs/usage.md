@@ -1,6 +1,6 @@
 # 使用说明
 
-工具提供 Rust core、平台只读适配层和 clap CLI。扫描选定目录或本地卷，显示文件元数据、类型分类、空间占用、陈旧文件、重复组与跳过原因。
+工具提供 Rust core、平台适配层和 clap CLI。扫描选定目录或本地卷，显示文件元数据、类型分类、空间占用、陈旧文件、重复组与跳过原因。
 
 ## 构建与运行
 
@@ -211,6 +211,37 @@ cargo run --locked -p file-tidy-cli -- plan copy /absolute/source/file \
 预览列出目标旁的暂存位置。执行时检查目标卷可用空间与预留量，流式计算源 BLAKE3，写入并同步暂存文件，再完整复读暂存副本核对哈希和长度，最后无覆盖发布。源变化、校验不一致、目标被占用或取消会停止发布。保留的暂存对象及其身份记录可通过 `recover` 查看。
 
 目录复制先在私有暂存目录中构建整棵树，逐文件验证内容，保留空目录、隐藏项及修改时间，按原始目标文本重建符号链接。确认包含隐藏项使用 `--include-hidden`。所有子项验证完成后，目标目录整体发布；目录中出现新增、替换或无法核验的子项时停止发布。目标路径下的敏感子项分别确认写入范围，读取敏感源文件时分别确认内容许可。
+
+## 隔离与恢复
+
+审阅并将对象移入来源授权根内的隔离区：
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan quarantine /absolute/local/workspace/source \
+  --state /absolute/local/workspace --retain-days 30 --execute
+```
+
+隔离支持普通文件、完整目录和符号链接。计划展示 `<授权根>/.file-tidy/quarantine/<批次>/<操作>/payload`、需要创建的私有目录、完整清单与保留天数。确认后使用同卷重命名，保留原对象身份、权限、扩展属性和链接关系。隐藏项使用 `--include-hidden`，敏感项逐项确认写入范围。
+
+查看隔离项及到期提醒：
+
+```sh
+cargo run --locked -p file-tidy-cli -- quarantine list --state /absolute/local/workspace
+cargo run --locked -p file-tidy-cli -- quarantine list --state /absolute/local/workspace --due
+```
+
+保留期默认为 30 天，`--retain-days` 可设为 1 至 36500 天。到期项列入提醒，载荷继续保留供恢复。列表包含隔离项 ID、所属批次、原位置、隔离位置和状态。
+
+按列表中的 ID 预览并恢复：
+
+```sh
+cargo run --locked -p file-tidy-cli -- quarantine restore ITEM_ID \
+  --state /absolute/local/workspace --execute
+```
+
+可同时传入多个 ID；使用 `quarantine restore --batch BATCH_ID` 恢复该批次中仍保留的全部隔离项，`quarantine list --batch BATCH_ID` 按批次查看。默认恢复到原位置，同名目标存在时预览 `name (1).ext`；`--to PATH` 指定单项的完整目标路径，多项时指定目标目录。恢复目标父目录须已存在、位于同卷当前授权内。恢复重新检查隔离目录身份、完整清单、敏感项许可和授权；撤销原授权后可重新授权同一目录，再生成恢复计划。`--include-hidden` 显式包含原对象中的隐藏项。
+
+恢复完成会追加独立批次，并记录与原隔离操作的关联。`recover` 可核对隔离或恢复中断后的实际位置与未完成日志。
 
 ## 执行历史与恢复诊断
 

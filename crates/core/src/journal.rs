@@ -110,6 +110,7 @@ pub struct OperationHistory {
     pub id: String,
     pub ordinal: u64,
     pub kind: String,
+    pub inverse_of: Option<String>,
     pub source: NativePath,
     pub destination: Option<NativePath>,
     pub state: OperationState,
@@ -177,7 +178,7 @@ impl Session {
                 return Err(E::StorageUnavailable);
             }
             let snapshot: serde_json::Value = serde_json::from_slice(&snapshot)?;
-            let mut query = connection.prepare("SELECT hex(op_id), ordinal, kind, path_encoding, source_path, destination_path, state, reason_code, before_fingerprint, after_fingerprint, manifest, CASE WHEN source_grant_id IS NULL THEN NULL ELSE hex(source_grant_id) END, CASE WHEN destination_grant_id IS NULL THEN NULL ELSE hex(destination_grant_id) END FROM operations WHERE batch_id=?1 ORDER BY ordinal LIMIT 10001")?;
+            let mut query = connection.prepare("SELECT hex(op_id), ordinal, kind, path_encoding, source_path, destination_path, state, reason_code, before_fingerprint, after_fingerprint, manifest, CASE WHEN source_grant_id IS NULL THEN NULL ELSE hex(source_grant_id) END, CASE WHEN destination_grant_id IS NULL THEN NULL ELSE hex(destination_grant_id) END, CASE WHEN inverse_of IS NULL THEN NULL ELSE hex(inverse_of) END FROM operations WHERE batch_id=?1 ORDER BY ordinal LIMIT 10001")?;
             let mut rows = query.query([&id])?;
             let mut operations = Vec::new();
             while let Some(row) = rows.next()? {
@@ -194,6 +195,7 @@ impl Session {
                     id: row.get::<_,String>(0)?.to_ascii_lowercase(),
                     ordinal: nonnegative(row.get(1)?)?,
                     kind: row.get(2)?,
+                    inverse_of: row.get::<_,Option<String>>(13)?.map(|v|v.to_ascii_lowercase()),
                     source: native_path(&encoding, &source)?,
                     destination: destination.map(|p| native_path(&encoding,&p)).transpose()?,
                     state: parse_state(&row.get::<_,String>(6)?)?,
@@ -272,11 +274,11 @@ impl StateStore {
             }
             transaction.execute("INSERT INTO batches(batch_id,schema_version,plan_digest,policy_digest,snapshot,grant_epoch,item_count,total_bytes,state,created_at_s) VALUES(?1,1,?2,?3,?4,?5,?6,?7,'running',?8)", params![batch,digest,policy_digest,snapshot,epoch,integer(preview.confirmation_count)?,total,integer(preview.created_at)?])?;
             for (ordinal,operation) in preview.operations.iter().enumerate() {
-                let kind = match operation.kind { OperationKind::Move=>"move",OperationKind::Rename=>"rename",OperationKind::Copy=>"copy",OperationKind::Quarantine=>"quarantine",OperationKind::PermanentDelete=>"permanent_delete" };
+                let kind = match operation.kind { OperationKind::Move=>"move",OperationKind::Rename=>"rename",OperationKind::Copy=>"copy",OperationKind::Quarantine=>"quarantine",OperationKind::Restore=>"restore",OperationKind::PermanentDelete=>"permanent_delete" };
                 let (encoding,source) = path_bytes(&operation.source)?;
                 let destination = operation.destination.as_ref().map(|d| path_bytes(&d.path).map(|(_,b)|b)).transpose()?;
                 let root = operation.manifest.iter().find(|e| e.path==operation.source).ok_or(E::InvalidPlan)?;
-                transaction.execute("INSERT INTO operations(op_id,batch_id,ordinal,kind,path_encoding,source_path,destination_path,before_fingerprint,manifest,source_grant_id,destination_grant_id,irreversible,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'planned')",params![id_bytes(&operation.id)?,batch,ordinal as i64,kind,encoding,source,destination,serde_json::to_vec(&root.stamp)?,serde_json::to_vec(&operation.manifest)?,operation.source_grant.as_ref().map(id_bytes).transpose()?,operation.destination_grant.as_ref().map(id_bytes).transpose()?,operation.kind==OperationKind::PermanentDelete])?;
+                transaction.execute("INSERT INTO operations(op_id,batch_id,ordinal,kind,path_encoding,source_path,destination_path,before_fingerprint,manifest,source_grant_id,destination_grant_id,irreversible,inverse_of,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'planned')",params![id_bytes(&operation.id)?,batch,ordinal as i64,kind,encoding,source,destination,serde_json::to_vec(&root.stamp)?,serde_json::to_vec(&operation.manifest)?,operation.source_grant.as_ref().map(id_bytes).transpose()?,operation.destination_grant.as_ref().map(id_bytes).transpose()?,operation.kind==OperationKind::PermanentDelete,operation.managed.as_ref().and_then(|m|match m { crate::quarantine::ManagedOperation::Restore {item,..} => Some(item), _ => None }).map(id_bytes).transpose()?])?;
             }
             let nonce = blake3::hash(approved.receipt_id().as_str().as_bytes());
             transaction.execute("INSERT INTO approval_audit(approval_id,batch_id,plan_digest,scope,grant_epoch,nonce_digest,issued_at_s,expires_at_s,consumed_at_s) VALUES(?1,?2,?3,'ordinary',?4,?5,?6,?7,?8)",params![id_bytes(approved.receipt_id())?,batch,digest,epoch,nonce.as_bytes(),confirmed_at,integer(preview.expires_at)?,created])?;
@@ -308,7 +310,7 @@ impl StateStore {
         step: &str,
         payload: &impl Serialize,
     ) -> Result<()> {
-        self.record_event(operation, step, "intent", payload, None)
+        self.record_event(operation, step, "intent", payload, None, |_| Ok(()))
     }
 
     /// Results follow native durability checks; uncertain outcomes retain recovery status.
@@ -319,9 +321,21 @@ impl StateStore {
         payload: &impl Serialize,
         state: OperationState,
     ) -> Result<()> {
-        self.record_event(operation, step, "result", payload, Some(state))
+        self.record_event(operation, step, "result", payload, Some(state), |_| Ok(()))
     }
 
+    pub(crate) fn record_managed_result(
+        &mut self,
+        operation: &Id,
+        step: &str,
+        payload: &impl Serialize,
+        state: OperationState,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.record_event(operation, step, "result", payload, Some(state), write)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_event(
         &mut self,
         operation: &Id,
@@ -329,6 +343,7 @@ impl StateStore {
         phase: &str,
         payload: &impl Serialize,
         state: Option<OperationState>,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<()> {
         if step.is_empty()
             || step.len() > 64
@@ -361,6 +376,7 @@ impl StateStore {
             transaction.execute("INSERT INTO operation_events(op_id,step,phase,payload,created_at_s) VALUES(?1,?2,?3,?4,?5)",params![operation,step,phase,payload,integer(now()?)?])?;
             let after = matches!(next, OperationState::Done | OperationState::Published).then_some(&payload);
             transaction.execute("UPDATE operations SET state=?2, after_fingerprint=COALESCE(?3,after_fingerprint),reason_code=COALESCE(?4,reason_code) WHERE op_id=?1",params![operation,next.name(),after,reason])?;
+            write(transaction)?;
             Ok(())
         })
     }
@@ -415,6 +431,18 @@ fn validate_operation_records(
             .and_then(|d| d.get("path"))
             .map(|p| serde_json::from_value(p.clone()))
             .transpose()?;
+        let managed: Option<crate::quarantine::ManagedOperation> = operation
+            .get("managed")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        let inverse = managed.as_ref().and_then(|m| match m {
+            crate::quarantine::ManagedOperation::Restore { item, .. } => Some(item.as_str()),
+            _ => None,
+        });
+        if inverse != record.inverse_of.as_deref() {
+            return Err(E::StorageUnavailable);
+        }
         let manifest = operation.get("manifest").ok_or(E::StorageUnavailable)?;
         let before = manifest
             .as_array()
@@ -476,7 +504,7 @@ fn integer(value: u64) -> Result<i64> {
 fn nonnegative(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| E::StorageUnavailable)
 }
-fn id_bytes(id: &Id) -> Result<[u8; 16]> {
+pub(crate) fn id_bytes(id: &Id) -> Result<[u8; 16]> {
     hex_bytes(id.as_str())
 }
 fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N]> {
@@ -489,7 +517,7 @@ fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N]> {
     }
     Ok(result)
 }
-fn path_bytes(path: &NativePath) -> Result<(&'static str, Vec<u8>)> {
+pub(crate) fn path_bytes(path: &NativePath) -> Result<(&'static str, Vec<u8>)> {
     let path = path.to_path()?;
     #[cfg(unix)]
     {
@@ -508,7 +536,7 @@ fn path_bytes(path: &NativePath) -> Result<(&'static str, Vec<u8>)> {
         ))
     }
 }
-fn native_path(encoding: &str, bytes: &[u8]) -> Result<NativePath> {
+pub(crate) fn native_path(encoding: &str, bytes: &[u8]) -> Result<NativePath> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;

@@ -5,7 +5,89 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use file_tidy_core::approval::Confirmation;
 use file_tidy_core::authorization::{Id, Session};
-use file_tidy_core::plan::{OperationKind, OperationRequest, PlanOptions};
+use file_tidy_core::plan::{OperationKind, OperationRequest, Plan, PlanOptions};
+
+#[derive(Args, Debug)]
+pub(crate) struct QuarantineArgs {
+    #[command(subcommand)]
+    command: QuarantineCommand,
+}
+#[derive(Subcommand, Debug)]
+enum QuarantineCommand {
+    /// 列出隔离项、原位置及保留期限
+    List {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        due: bool,
+        #[arg(long)]
+        batch: Option<Id>,
+    },
+    /// 生成恢复计划，确认后恢复到原位置或指定目标
+    Restore {
+        #[arg(required_unless_present = "batch", num_args = 1..)]
+        items: Vec<Id>,
+        #[arg(long, conflicts_with = "items")]
+        batch: Option<Id>,
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        to: Option<PathBuf>,
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long, conflicts_with = "execute")]
+        approve: bool,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, value_enum, default_value_t = PlanFormat::Text)]
+        format: PlanFormat,
+    },
+}
+pub(crate) fn run_quarantine(args: QuarantineArgs) -> Result<u8> {
+    match args.command {
+        QuarantineCommand::List {
+            state,
+            limit,
+            due,
+            batch,
+        } => {
+            let session = Session::open(&state)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&session.quarantine_items_in_batch(
+                    batch.as_ref(),
+                    limit,
+                    due
+                )?)?
+            );
+            Ok(0)
+        }
+        QuarantineCommand::Restore {
+            items,
+            batch,
+            state,
+            to,
+            include_hidden,
+            approve,
+            execute,
+            format,
+        } => {
+            let mut session = Session::open(&state)?;
+            let options = PlanOptions {
+                include_hidden,
+                ..Default::default()
+            };
+            let plan = if let Some(batch) = batch {
+                session.build_batch_restore_plan(&batch, to.as_deref(), options)?
+            } else {
+                session.build_restore_plan(&items, to.as_deref(), options)?
+            };
+            review_plan(&mut session, plan, format, approve, execute)
+        }
+    }
+}
 
 #[derive(Args, Debug)]
 pub(crate) struct StateArgs {
@@ -144,13 +226,16 @@ pub(crate) struct PlanArgs {
     include_hidden: bool,
     #[arg(long, default_value_t=100_000, value_parser=clap::value_parser!(usize))]
     max_entries: usize,
+    /// 隔离项保留天数，到期后列入提醒
+    #[arg(long, default_value_t = 30)]
+    retain_days: u64,
     /// 选择要保留的操作序号，例如 1,3
     #[arg(long, value_delimiter = ',')]
     select: Vec<usize>,
     /// 审阅后交互确认并保存计划快照
     #[arg(long, requires = "state")]
     approve: bool,
-    /// 审阅并确认后执行复制、移动或重命名
+    /// 审阅并确认后执行文件操作
     #[arg(long, requires = "state", conflicts_with = "approve")]
     execute: bool,
 }
@@ -263,6 +348,7 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<u8> {
         PlanOptions {
             include_hidden: args.include_hidden,
             max_entries: args.max_entries,
+            quarantine_retention_days: args.retain_days,
             ..PlanOptions::default()
         },
     )?;
@@ -280,19 +366,29 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<u8> {
             .collect::<Result<Vec<_>>>()?;
         plan = session.select_operations(&plan, &ids)?;
     }
-    match args.format {
+    review_plan(&mut session, plan, args.format, args.approve, args.execute)
+}
+
+fn review_plan(
+    session: &mut Session,
+    plan: Plan,
+    format: PlanFormat,
+    approve: bool,
+    execute: bool,
+) -> Result<u8> {
+    match format {
         PlanFormat::Text => print!("{}", plan.review_text()?),
         PlanFormat::Json => println!("{}", plan.review_json()?),
     }
-    if !args.approve && !args.execute {
+    if !approve && !execute {
         return Ok(0);
     }
-    if args.execute {
+    if execute {
         session.validate_executable(&plan)?;
     }
     require_phrase(
         &format!("CONFIRM {}", plan.digest()),
-        if args.execute {
+        if execute {
             "确认并执行上述文件操作"
         } else {
             "确认此计划并保存审阅快照"
@@ -331,7 +427,7 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<u8> {
     };
     session.enable_persistence()?;
     let approved = session.confirm(plan, confirmation)?;
-    if args.execute {
+    if execute {
         let cancellation = file_tidy_core::CancellationToken::new();
         let signal_token = cancellation.clone();
         ctrlc::set_handler(move || signal_token.cancel()).context("无法安装 Ctrl-C 取消处理器")?;

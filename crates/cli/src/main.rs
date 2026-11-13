@@ -40,6 +40,8 @@ enum Command {
     History(planning::HistoryArgs),
     /// 只读核对未完成操作与文件现状
     Recover(planning::RecoveryArgs),
+    /// 查看隔离项与恢复文件
+    Quarantine(planning::QuarantineArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -158,6 +160,7 @@ fn run(command: Command) -> Result<u8> {
         Command::Plan(args) => planning::run_plan(args),
         Command::History(args) => planning::run_history(args),
         Command::Recover(args) => planning::run_recovery(args),
+        Command::Quarantine(args) => planning::run_quarantine(args),
     }
 }
 

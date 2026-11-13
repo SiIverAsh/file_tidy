@@ -31,18 +31,19 @@ cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo test --workspace --locked --offline
 ```
 
-工作区与独立夹具测试合计 162 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
+工作区与独立夹具测试合计 174 项通过，3 项因 APFS 文件名限制跳过。依赖授权根的用例在独立夹具中显式运行。
 
 | 测试组 | 通过 | 跳过 |
 | --- | --- | --- |
 | CLI 单元 | 4 | 0 |
-| CLI 计划集成 | 4 | 0 |
+| CLI 计划集成 | 5 | 0 |
 | CLI 进程集成 | 7 | 1 |
-| core 单元 | 49 | 0 |
+| core 单元 | 52 | 0 |
 | core 授权与计划 | 14 | 0 |
 | core 文件执行 | 9 | 0 |
 | core 校验复制 | 7 | 0 |
 | core 目录复制 | 8 | 0 |
+| core 隔离与恢复 | 8 | 0 |
 | core 名称拼写调整 | 4 | 0 |
 | core 只读集成 | 20 | 1 |
 | platform 单元 | 13 | 0 |
@@ -87,7 +88,7 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 | Linux | 已运行 mountinfo 解析与 bind 边界数据测试；原生构建、真实挂载与特殊文件系统场景列入原生平台验证 |
 | 资源规模 | 默认 250000 条目，上限 1000000；达到上限输出不完整报告，百万条目性能与内存压测待执行 |
 | 内容策略 | 扫描已确认的本地文件系统，敏感识别覆盖常见名字、目录和本次清单内的已知身份；`--metadata-only` 适用于全局零内容读取 |
-| 授权与文件操作 | 授权、计划、同卷移动与重命名、普通文件校验复制、journal 和只读恢复已覆盖；跨卷迁移、隔离和撤销继续按矩阵实现 |
+| 授权与文件操作 | 授权、计划、同卷移动与重命名、文件与目录校验复制、同卷隔离与恢复、journal 和只读恢复已覆盖；跨卷迁移和撤销继续按矩阵实现 |
 | GUI 与依赖审计 | CLI 三平台 CI、发布和依赖检查已配置；GUI 与其原生验证继续按矩阵实现 |
 
 ## 授权与计划检查
@@ -96,7 +97,7 @@ cargo run --locked -p file-tidy-cli -- scan config docs \
 
 ```sh
 FILE_TIDY_TEST_ROOT=/absolute/isolated/fixtures cargo test --workspace --locked \
-  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename --test copy --test staging --test tree_copy \
+  --lib --test authorization_plan --test plan_cli --test execution --test rename --test case_rename --test copy --test staging --test tree_copy --test quarantine \
   -- --include-ignored
 ```
 
@@ -121,3 +122,10 @@ Windows 原生状态目录通过相对父句柄创建，采用当前用户专用
 
 
 目录复制检查覆盖完整树、空目录、多操作共享父目录、隐藏和敏感项、相对与悬空链接、目录链接、目录及链接修改时间、源新增子项、目标被抢占、未知暂存项、取消和暂存祖先替换。创建结果、发布意图及发布结果的日志故障分别验证未知归属、已校验及已发布目录的只读诊断。Windows CI 另以不同卷验证完整目录复制。
+
+
+## 隔离与恢复检查
+
+隔离测试覆盖每授权根私有目录的零写入预览、逐项选择、保留期、完整目录、空目录、隐藏与敏感项、符号链接、硬链接、对象身份和权限保留。恢复测试覆盖当前授权、撤销后重新授权、原位置冲突改名、敏感范围重新确认、载荷变化、未知目录与已登记目录被替换。
+
+故障注入分别在目录创建后、隔离移动后、恢复移动后和隔离条目事务中停止，验证源或载荷保留、后续项停止、完成事件与条目登记的事务一致性，以及只读诊断。恢复批次通过 `inverse_of` 关联原隔离操作。CLI 检查覆盖隔离列表、恢复预览与非交互执行拒绝。

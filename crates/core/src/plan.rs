@@ -12,6 +12,12 @@ use crate::authorization::{
 };
 use crate::policy::Policy;
 
+pub(crate) enum ManifestAccess<'a> {
+    Ordinary,
+    Staged(&'a file_tidy_platform::StagedDirectory),
+    Managed(&'a crate::quarantine::ManagedPayloadPermit),
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
@@ -19,6 +25,7 @@ pub enum OperationKind {
     Move,
     Rename,
     Quarantine,
+    Restore,
     PermanentDelete,
 }
 impl OperationKind {
@@ -47,6 +54,11 @@ pub struct PlanOptions {
     pub large_byte_count: u64,
     pub permanent_item_count: u64,
     pub permanent_byte_count: u64,
+    #[serde(default = "default_retention")]
+    pub quarantine_retention_days: u64,
+}
+fn default_retention() -> u64 {
+    30
 }
 impl Default for PlanOptions {
     fn default() -> Self {
@@ -58,6 +70,7 @@ impl Default for PlanOptions {
             large_byte_count: 10 * 1024 * 1024 * 1024,
             permanent_item_count: 10,
             permanent_byte_count: 1024 * 1024 * 1024,
+            quarantine_retention_days: default_retention(),
         }
     }
 }
@@ -143,6 +156,8 @@ pub struct PlannedOperation {
     pub manifest: Vec<ManifestEntry>,
     pub source_grant: Option<Id>,
     pub destination_grant: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) managed: Option<crate::quarantine::ManagedOperation>,
     pub(crate) source_parent_stamp: Stamp,
 }
 
@@ -270,6 +285,7 @@ impl Session {
             || options.large_byte_count > 10 * 1024 * 1024 * 1024
             || options.permanent_item_count > 10
             || options.permanent_byte_count > 1024 * 1024 * 1024
+            || !(1..=36500).contains(&options.quarantine_retention_days)
         {
             return Err(E::InvalidRequest);
         }
@@ -278,7 +294,12 @@ impl Session {
         let mut resolved = Vec::new();
         let mut reserved = HashSet::new();
         let mut budget = options.max_entries;
+        let batch_id = Id::new()?;
         for request in requests {
+            if request.kind == OperationKind::Restore {
+                return Err(E::InvalidRequest);
+            }
+            let operation_id = Id::new()?;
             if request.kind.needs_destination() != request.destination.is_some() {
                 return Err(E::InvalidRequest);
             }
@@ -290,13 +311,21 @@ impl Session {
             } else {
                 None
             };
-            let destination = request
+            let mut destination = request
                 .destination
                 .as_deref()
                 .map(|path| {
                     resolve_destination(path, &reserved, &source, request.kind, options.max_entries)
                 })
                 .transpose()?;
+            let managed = if request.kind == OperationKind::Quarantine {
+                let (target, scope) =
+                    self.plan_quarantine(&source, &batch_id, &operation_id, &options)?;
+                destination = Some(target);
+                Some(crate::quarantine::ManagedOperation::Quarantine(scope))
+            } else {
+                None
+            };
             let destination_grant = if let Some(destination) = &destination {
                 let parent = destination.existing_parent.to_path()?;
                 if policy.labels(&parent).protected {
@@ -307,9 +336,10 @@ impl Session {
                 if source.starts_with(&path) || path.starts_with(&source) {
                     return Err(E::OverlappingOperations);
                 }
-                if path
-                    .components()
-                    .any(|c| crate::authorization::managed_component(c.as_os_str()))
+                if managed.is_none()
+                    && path
+                        .components()
+                        .any(|c| crate::authorization::managed_component(c.as_os_str()))
                 {
                     return Err(E::ProtectedRoot);
                 }
@@ -335,13 +365,14 @@ impl Session {
                 destination: destination.as_ref().map(|d| d.path.to_path()).transpose()?,
             });
             operations.push(PlannedOperation {
-                id: Id::new()?,
+                id: operation_id,
                 kind: request.kind,
                 source: NativePath::new(&source),
                 destination,
                 manifest,
                 source_grant,
                 destination_grant,
+                managed,
                 source_parent_stamp: Stamp::capture(&file_tidy_platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
                 )?)?,
@@ -370,6 +401,17 @@ impl Session {
                 }
             }
         }
+        self.seal_plan(operations, resolved, options, batch_id)
+    }
+
+    pub(crate) fn seal_plan(
+        &self,
+        mut operations: Vec<PlannedOperation>,
+        resolved: Vec<OperationRequest>,
+        options: PlanOptions,
+        batch_id: Id,
+    ) -> Result<Plan> {
+        let policy = planning_policy()?;
         // Sensitive names propagate across known hardlink aliases in this plan.
         let sensitive_ids: BTreeSet<_> = operations
             .iter()
@@ -437,7 +479,7 @@ impl Session {
         let confirmation_count = files.checked_add(empty_directories).ok_or(E::Overflow)?;
         let created_at = now()?;
         let preview = PlanPreview {
-            id: Id::new()?,
+            id: batch_id,
             created_at,
             expires_at: created_at
                 .checked_add(options.expires_after_seconds)
@@ -487,13 +529,27 @@ impl Session {
         {
             return Err(E::InvalidRequest);
         }
+        if plan
+            .preview
+            .operations
+            .iter()
+            .any(|op| op.kind == OperationKind::Restore)
+        {
+            return self.select_restores(plan, &wanted);
+        }
         let requests = plan
             .preview
             .operations
             .iter()
             .zip(&plan.requests)
             .filter(|(op, _)| wanted.contains(&op.id))
-            .map(|(_, req)| req.clone())
+            .map(|(op, req)| {
+                let mut request = req.clone();
+                if op.kind == OperationKind::Quarantine {
+                    request.destination = None;
+                }
+                request
+            })
             .collect();
         self.build_plan(requests, plan.preview.options.clone())
     }
@@ -526,6 +582,9 @@ impl Session {
     ) -> Result<()> {
         self.validate_plan_context(plan)?;
         let policy = planning_policy()?;
+        if operation.managed.is_some() {
+            return self.validate_managed_operation(plan, operation, changed_parents);
+        }
         let source = operation.source.to_path()?;
         self.check_source(&source, operation.kind, &policy)?;
         let source_parent = checked_existing(source.parent().ok_or(E::InvalidPath)?, false)?;
@@ -624,7 +683,12 @@ impl Session {
         Ok(())
     }
 
-    fn check_source(&self, source: &Path, kind: OperationKind, policy: &Policy) -> Result<()> {
+    pub(crate) fn check_source(
+        &self,
+        source: &Path,
+        kind: OperationKind,
+        policy: &Policy,
+    ) -> Result<()> {
         let labels = if file_tidy_platform::inspect(source)?.kind == NodeKind::Symlink {
             policy.labels(source.parent().ok_or(E::InvalidPath)?)
         } else {
@@ -679,6 +743,24 @@ impl Session {
         budget: &mut usize,
         staged: Option<&file_tidy_platform::StagedDirectory>,
     ) -> Result<Vec<ManifestEntry>> {
+        self.manifest_with_access(
+            source,
+            kind,
+            options,
+            policy,
+            budget,
+            staged.map_or(ManifestAccess::Ordinary, ManifestAccess::Staged),
+        )
+    }
+    pub(crate) fn manifest_with_access(
+        &self,
+        source: &Path,
+        kind: OperationKind,
+        options: &PlanOptions,
+        policy: &Policy,
+        budget: &mut usize,
+        access: ManifestAccess<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
         let mut stack = vec![source.to_path_buf()];
         let mut entries = Vec::new();
         while let Some(path) = stack.pop() {
@@ -700,7 +782,12 @@ impl Session {
             if node.hidden && !options.include_hidden {
                 return Err(E::HiddenEntry);
             }
-            if path
+            let managed_relative = match &access {
+                ManifestAccess::Managed(permit) => Some(permit.relative(source, &path)?),
+                _ => None,
+            };
+            if managed_relative
+                .unwrap_or(&path)
                 .components()
                 .any(|p| crate::authorization::managed_component(p.as_os_str()))
             {
@@ -719,7 +806,7 @@ impl Session {
             }
             let stamp = Stamp::capture(&node)?;
             if node.kind == NodeKind::Directory {
-                let listing = if let Some(tree) = staged {
+                let listing = if let ManifestAccess::Staged(tree) = &access {
                     tree.read_directory(
                         path.strip_prefix(source).map_err(|_| E::InvalidPath)?,
                         &node,
@@ -763,7 +850,7 @@ impl Session {
     }
 }
 
-fn resolve_destination(
+pub(crate) fn resolve_destination(
     path: &Path,
     reserved: &HashSet<PathBuf>,
     source: &Path,
@@ -975,7 +1062,7 @@ fn validate_name(name: &std::ffi::OsStr) -> Result<()> {
     Ok(())
 }
 
-fn destination_acknowledgements(
+pub(crate) fn destination_acknowledgements(
     operation: &PlannedOperation,
     policy: &Policy,
 ) -> Result<Vec<String>> {
@@ -1033,6 +1120,7 @@ impl Plan {
                 OperationKind::Move => "移动",
                 OperationKind::Rename => "重命名",
                 OperationKind::Quarantine => "移入隔离区",
+                OperationKind::Restore => "从隔离区恢复",
                 OperationKind::PermanentDelete => "永久删除（不可撤销）",
             };
             output.push_str(&format!(
@@ -1040,6 +1128,12 @@ impl Plan {
                 index + 1,
                 operation.source.display
             ));
+            if operation.kind == OperationKind::Quarantine {
+                output.push_str(&format!(
+                    "\n   保留 {} 天，到期后列入提醒",
+                    self.preview.options.quarantine_retention_days
+                ));
+            }
             if let Some(destination) = &operation.destination {
                 if let Some(temporary) = &destination.spelling_temporary {
                     output.push_str(&format!(

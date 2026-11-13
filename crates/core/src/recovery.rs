@@ -85,6 +85,11 @@ impl Session {
                     )
                 } else if operation.kind == OperationKind::Copy {
                     self.inspect_interrupted_copy(operation, &history)
+                } else if operation.managed.is_some() {
+                    match self.inspect_interrupted_managed(operation, &history) {
+                        Ok(observation) => observation,
+                        Err(error) => (RecoveryDisposition::Unavailable, error.to_string()),
+                    }
                 } else if !matches!(operation.kind, OperationKind::Move | OperationKind::Rename) {
                     (
                         RecoveryDisposition::NeedsAttention,

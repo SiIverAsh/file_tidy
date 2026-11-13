@@ -130,3 +130,99 @@ fn state_initialization_rejects_noninteractive_confirmation_without_writing() ->
     assert!(!dir.path().join(".file-tidy").exists());
     Ok(())
 }
+
+#[test]
+#[cfg_attr(
+    any(target_os = "macos", windows),
+    ignore = "requires independent FILE_TIDY_TEST_ROOT"
+)]
+fn quarantine_commands_preview_restore_and_reject_noninteractive_execution() -> TestResult {
+    use file_tidy_core::{
+        CancellationToken,
+        approval::Confirmation,
+        authorization::Session,
+        plan::{OperationKind, OperationRequest, PlanOptions},
+    };
+    let dir = fixture()?;
+    let root = dir.path();
+    let mut session = Session::new()?;
+    let grant = session.grant(root, false)?;
+    let storage = session.storage_plan(&grant)?;
+    let digest = storage.digest().to_owned();
+    session.initialize_storage(storage, &digest)?;
+    std::fs::write(root.join("source"), b"fixture")?;
+    drop(session);
+    let output = executable()
+        .args(["plan", "quarantine"])
+        .arg(root.join("source"))
+        .arg("--state")
+        .arg(root)
+        .arg("--format")
+        .arg("json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(preview["plan"]["operations"][0]["kind"], "quarantine");
+    assert!(!root.join(".file-tidy/quarantine").exists());
+    let mut session = Session::open_writable(root)?;
+    let plan = session.build_plan(
+        vec![OperationRequest {
+            kind: OperationKind::Quarantine,
+            source: root.join("source"),
+            destination: None,
+        }],
+        PlanOptions::default(),
+    )?;
+    let confirmation = Confirmation {
+        digest: plan.digest().into(),
+        ..Default::default()
+    };
+    let approved = session.confirm(plan, confirmation)?;
+    assert!(
+        session
+            .execute_approved(approved, &CancellationToken::new())?
+            .completed()
+    );
+    let id = session.quarantine_items(10, false)?.remove(0).id;
+    drop(session);
+    let output = executable()
+        .args(["quarantine", "list", "--state"])
+        .arg(root)
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)?[0]["id"],
+        id.to_string()
+    );
+    let output = executable()
+        .args(["quarantine", "restore", id.as_str(), "--state"])
+        .arg(root)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)?["plan"]["operations"][0]["kind"],
+        "restore"
+    );
+    let output = executable()
+        .args(["quarantine", "restore", id.as_str(), "--state"])
+        .arg(root)
+        .arg("--execute")
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("交互终端"));
+    assert!(!root.join("source").exists());
+    let session = Session::open(root)?;
+    assert_eq!(session.quarantine_items(10, false)?[0].state, "stored");
+    assert_eq!(session.history(10)?.len(), 1);
+    Ok(())
+}

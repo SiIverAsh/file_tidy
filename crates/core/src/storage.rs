@@ -187,6 +187,15 @@ impl Session {
 }
 
 impl StateStore {
+    pub(crate) fn managed_anchor(
+        &self,
+        root: &Path,
+        identity: &Identity,
+    ) -> Result<Option<Identity>> {
+        self.validate_anchor()?;
+        Ok((self.root == root && self.root_identity == *identity)
+            .then(|| self.storage_identity.clone()))
+    }
     pub(crate) fn journal_read<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         self.validate_anchor()?;
         let result = read(&self.connection)?;

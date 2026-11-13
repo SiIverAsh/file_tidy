@@ -8,6 +8,7 @@ pub mod classify;
 pub mod execution;
 pub mod journal;
 pub mod plan;
+pub mod quarantine;
 pub mod recovery;
 mod storage;
 mod suggestions;
