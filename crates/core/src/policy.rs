@@ -803,7 +803,16 @@ mod tests {
 
     #[test]
     fn inventory_sensitive_evidence_invalidates_public_alias_cache() -> io::Result<()> {
-        let temp = tempfile::tempdir()?;
+        // This scenario starts with a public path. Windows' default temp path
+        // contains AppData, whose name remains sensitive after synthetic roots
+        // are cleared, so use the same independent fixture as cache admission.
+        let base = std::env::var_os("FILE_TIDY_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-test-fixtures")
+            });
+        std::fs::create_dir_all(&base)?;
+        let temp = tempfile::tempdir_in(base)?;
         let fixture = temp.path().canonicalize()?;
         let directory = fixture.join("plain-name");
         std::fs::create_dir(&directory)?;
@@ -816,7 +825,11 @@ mod tests {
         policy.sensitivity_context_known = true;
         policy.sensitive_roots.clear();
         policy.sensitive_directory_ids.clear();
-        assert!(!policy.labels(&file).sensitive);
+        assert!(
+            !policy.labels(&file).sensitive,
+            "cache fixture must start with a public path: {}",
+            file.display()
+        );
         assert!(policy.register_sensitive_directory(identity));
         assert!(policy.labels(&file).sensitive);
         assert!(policy.sensitive_for_content(&file));
