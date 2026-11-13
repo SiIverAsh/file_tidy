@@ -1,4 +1,4 @@
-//! Read-only platform primitives. No operation in this crate creates or changes files.
+//! Native primitives for verified reads and private application state.
 //!
 //! Native FFI is confined to this crate. Content opens never follow symbolic links,
 //! and the opened object's identity and metadata must match the inspected object.
@@ -11,6 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod mounts;
+mod mutation;
+pub use mutation::{RenameError, rename_noreplace};
+mod private_storage;
+pub use private_storage::{
+    PinnedDirectory, create_private_directory, create_private_file, open_directory_pinned,
+    verify_private_file,
+};
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -58,6 +65,21 @@ pub fn read_directory_verified(
     expected: &NodeInfo,
     limit: usize,
 ) -> io::Result<DirectoryListing> {
+    read_directory_verified_cancellable(path, expected, limit, &|| false)
+}
+
+/// Like [`read_directory_verified`], with a cancellation checkpoint before each
+/// directory entry. An in-flight OS call must return before cancellation can be
+/// observed. Names remain in filesystem order; the inventory owns final ordering.
+pub fn read_directory_verified_cancellable(
+    path: &Path,
+    expected: &NodeInfo,
+    limit: usize,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<DirectoryListing> {
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
     if expected.kind != NodeKind::Directory || expected.identity.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -72,11 +94,11 @@ pub fn read_directory_verified(
     }
     #[cfg(unix)]
     {
-        unix::read_directory_verified(path, expected, limit)
+        unix::read_directory_verified_cancellable(path, expected, limit, cancelled)
     }
     #[cfg(windows)]
     {
-        windows::read_directory_verified(path, expected, limit)
+        windows::read_directory_verified_cancellable(path, expected, limit, cancelled)
     }
 }
 

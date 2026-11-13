@@ -13,7 +13,7 @@
 
 加载 [journal.sql](journal.sql) 后，检查结果如下：
 
-- 7 个 STRICT 表创建成功，schema `user_version = 1`。
+- 9 个 STRICT 表创建成功，schema `user_version = 1`。
 - 合法的 copy 与 permanent_delete 记录可插入；永久删除记录要求显式标记 irreversible。
 - 17 个非法变更被拒绝：错误 ID 长度、copy 缺少目的地、永久删除未标不可逆、永久删除带目的地、失效外键、未知路径编码、以 TEXT 代替原生路径 BLOB、批内序号重复、负总大小、改写已封存快照、改写操作源路径、替换授权根、更新事件、删除事件、无效确认到期时间、敏感确认缺少子项 ID、隔离保留期倒置。
 - 包含 `0xff` 字节的 Unix 路径 BLOB 无损往返。

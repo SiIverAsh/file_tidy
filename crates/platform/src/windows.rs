@@ -9,6 +9,8 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 
+#[cfg(test)]
+use crate::MountTable;
 use crate::{DirectoryListing, FileIdentity, LocationInfo, LocationKind, NodeInfo, NodeKind};
 
 const DRIVE_REMOVABLE: u32 = 2;
@@ -24,6 +26,36 @@ fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
     }
     units.push(0);
     Ok(units)
+}
+
+// Accept only the documented volume GUID namespace, never an arbitrary
+// Verbatim device name (GLOBALROOT, PhysicalDrive, named pipe, and so on).
+fn is_volume_guid_prefix(value: &OsStr) -> bool {
+    let units: Vec<_> = value.encode_wide().collect();
+    if units.len() != 44
+        || !units[..7]
+            .iter()
+            .zip(b"Volume{")
+            .all(|(a, b)| u8::try_from(*a).is_ok_and(|a| a.eq_ignore_ascii_case(b)))
+        || units[43] != u16::from(b'}')
+    {
+        return false;
+    }
+    (7..43).all(|index| {
+        if matches!(index, 15 | 20 | 25 | 30) {
+            units[index] == u16::from(b'-')
+        } else {
+            u8::try_from(units[index]).is_ok_and(|byte| byte.is_ascii_hexdigit())
+        }
+    })
+}
+
+pub(crate) fn is_volume_guid_root(path: &Path) -> bool {
+    let mut parts = path.components();
+    matches!(parts.next(), Some(Component::Prefix(prefix))
+        if matches!(prefix.kind(), Prefix::Verbatim(value) if is_volume_guid_prefix(value)))
+        && matches!(parts.next(), Some(Component::RootDir))
+        && parts.next().is_none()
 }
 
 fn metadata_kind(metadata: &Metadata) -> NodeKind {
@@ -66,10 +98,11 @@ fn base_info(metadata: &Metadata) -> NodeInfo {
 
 pub(crate) fn inspect_with_metadata(path: &Path, metadata: &Metadata) -> io::Result<NodeInfo> {
     let mut info = base_info(metadata);
-    if matches!(
-        info.kind,
-        NodeKind::Symlink | NodeKind::Reparse | NodeKind::Special
-    ) {
+    // Dot files are hidden by product policy even without the Windows hidden bit.
+    info.hidden |= path
+        .file_name()
+        .is_some_and(|name| name.encode_wide().next() == Some(u16::from(b'.')));
+    if matches!(info.kind, NodeKind::Reparse | NodeKind::Special) {
         return Ok(info);
     }
     // A metadata-only handle does not request file content or hydrate cloud
@@ -128,11 +161,18 @@ pub(crate) fn open_verified(path: &Path, expected: &NodeInfo) -> io::Result<File
     Ok(file)
 }
 
-pub(crate) fn read_directory_verified(
+pub(crate) fn read_directory_verified_cancellable(
     path: &Path,
     expected: &NodeInfo,
     limit: usize,
+    cancelled: &impl Fn() -> bool,
 ) -> io::Result<DirectoryListing> {
+    if cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory enumeration cancelled",
+        ));
+    }
     let (directory, _guards) = open_pinned(path, true)?;
     if !expected.matches(&node_info_from_file(&directory)?) {
         return Err(io::Error::new(
@@ -145,7 +185,17 @@ pub(crate) fn read_directory_verified(
     // The directory and every ancestor remain pinned against delete/rename and
     // incompatible write handles throughout this path-based enumeration. Reparse
     // points were rejected while acquiring those handles, before read_dir opens.
-    for entry in std::fs::read_dir(path)? {
+    let mut entries = std::fs::read_dir(path)?;
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "directory enumeration cancelled",
+            ));
+        }
+        let Some(entry) = entries.next() else {
+            break;
+        };
         let name = entry?.file_name();
         let mut parts = Path::new(&name).components();
         if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
@@ -168,18 +218,33 @@ pub(crate) fn read_directory_verified(
             "directory changed during enumeration",
         ));
     }
-    names.sort();
+    if cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory enumeration cancelled",
+        ));
+    }
     Ok(DirectoryListing { names, truncated })
 }
 
-fn open_pinned(path: &Path, directory: bool) -> io::Result<(File, Vec<File>)> {
+pub(crate) fn open_pinned(path: &Path, directory: bool) -> io::Result<(File, Vec<File>)> {
+    open_pinned_impl(path, directory, false)
+}
+
+pub(crate) fn open_state_directory(path: &Path) -> io::Result<(File, Vec<File>)> {
+    open_pinned_impl(path, true, true)
+}
+
+fn open_pinned_impl(path: &Path, directory: bool, state: bool) -> io::Result<(File, Vec<File>)> {
     let mut prefix = PathBuf::new();
     let mut guards = Vec::<File>::new();
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         match component {
             Component::Prefix(value) => {
-                if !matches!(value.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+                if !matches!(value.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+                    && !matches!(value.kind(), Prefix::Verbatim(value) if is_volume_guid_prefix(value))
+                {
                     return Err(io::Error::other(
                         "UNC and device paths are not accepted for content reads",
                     ));
@@ -205,12 +270,25 @@ fn open_pinned(path: &Path, directory: bool) -> io::Result<(File, Vec<File>)> {
         let last = components.peek().is_none();
         let access = if last && !directory {
             FILE_GENERIC_READ
+        } else if last && state {
+            FILE_LIST_DIRECTORY
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_TRAVERSE
+                | FILE_READ_ATTRIBUTES
+                | FILE_WRITE_ATTRIBUTES
+                | READ_CONTROL
+                | SYNCHRONIZE
         } else {
             FILE_READ_ATTRIBUTES
         };
         let file = OpenOptions::new()
             .access_mode(access)
-            .share_mode(FILE_SHARE_READ)
+            .share_mode(if state {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ
+            })
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(&prefix)?;
         let actual = node_info_from_file(&file)?;
@@ -268,6 +346,21 @@ pub(crate) fn mounts() -> io::Result<Vec<LocationInfo>> {
             .position(|u| *u == 0)
             .ok_or_else(|| io::Error::other("unterminated volume name"))?;
         let volume = &buffer[..=length];
+        let guid_root = PathBuf::from(OsString::from_wide(&buffer[..length]));
+        if !is_volume_guid_root(&guid_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid native volume GUID root",
+            ));
+        }
+        // FindFirstVolume enumerates local volume GUIDs, including volumes with
+        // no drive letter or mounted-folder alias. Keep this root even if an
+        // optional alias query fails; later per-root metadata errors are reported.
+        result.push(LocationInfo {
+            kind: LocationKind::Local,
+            mount_root: guid_root,
+            filesystem: "windows-volume-guid".into(),
+        });
         let mut paths = vec![0u16; 1024];
         let mut required = 0;
         // SAFETY: volume is NUL terminated; paths/required are writable buffers.
@@ -292,10 +385,8 @@ pub(crate) fn mounts() -> io::Result<Vec<LocationInfo>> {
                 )
             };
         }
-        if success == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for path in paths.split(|u| *u == 0).take_while(|p| !p.is_empty()) {
+        let aliases = if success != 0 { paths.as_slice() } else { &[] };
+        for path in aliases.split(|u| *u == 0).take_while(|p| !p.is_empty()) {
             let root = PathBuf::from(OsString::from_wide(path));
             let terminated = wide(root.as_os_str())?;
             // SAFETY: terminated is a valid NUL-terminated UTF-16 string.
@@ -396,4 +487,47 @@ pub(crate) fn protected_system_roots() -> io::Result<Vec<PathBuf>> {
         }
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guid_roots_are_strict_and_device_names_are_rejected() {
+        assert!(is_volume_guid_root(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"
+        )));
+        assert!(is_volume_guid_prefix(OsStr::new(
+            "Volume{01234567-89ab-cdef-0123-456789abcdef}"
+        )));
+        for invalid in [
+            "Volume{bad}",
+            "GLOBALROOT",
+            "PhysicalDrive0",
+            "Volume{01234567-89ab-cdef-0123-456789abcdeg}",
+        ] {
+            assert!(!is_volume_guid_prefix(OsStr::new(invalid)));
+        }
+        assert!(!is_volume_guid_root(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\directory"
+        )));
+        assert!(!is_volume_guid_root(Path::new(r"\\?\GLOBALROOT\")));
+    }
+
+    #[test]
+    fn all_scan_prefers_guids_and_preserves_drive_lookup() -> io::Result<()> {
+        let table = MountTable::read()?;
+        let roots = table.roots();
+        assert!(!roots.is_empty());
+        assert!(roots.iter().all(|root| is_volume_guid_root(root)));
+        for entry in table
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == LocationKind::Local)
+        {
+            assert_eq!(table.classify(&entry.mount_root).kind, LocationKind::Local);
+        }
+        Ok(())
+    }
 }

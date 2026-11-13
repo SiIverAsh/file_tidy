@@ -56,6 +56,10 @@ cargo run --locked -p file-tidy-cli -- scan --all --metadata-only
 
 JSON 的路径结构包含展示文本、平台编码和原始整数单元，支持非 UTF-8 文件名。展示文本用于阅读，不能反向构造执行路径。大小等可能超过 JavaScript 安全整数范围的量使用十进制字符串；例如 `summary.content_bytes_read` 为 `"0"` 时表示没有读取扫描内容。
 
+同一目录经不同大小写或命名空间再次出现时，按原生目录身份识别已枚举别名；单链接文件也按身份避免重复计数。跳过记录中的 `path_alias` 表示相同对象已经由另一个路径发现，不是读取失败。真正的硬链接目录项仍可分别显示，空间另有按文件身份去重的统计。Windows 全盘任务优先使用卷 GUID 根，因此报告路径可能是 `\\?\Volume{...}\...`。
+
+魔数与后缀的一致性按具体格式判断；例如 PNG 内容使用 `.jpg` 后缀会显示 Conflict。通用 ZIP 签名只能证明容器格式，APK、Office 等具体类别可依据已配置后缀保留，但证据只标 Extension，不表示验证过完整应用格式。
+
 ## 参数与资源上限
 
 | 参数 | 默认或范围 | 行为 |
@@ -133,3 +137,74 @@ cargo test -p file-tidy-cli --test scan_cli non_utf8 -- --ignored
 ```
 
 各测试组结果见[测试说明](testing.md)。Windows/Linux 原生运行、平台权限、挂载和打包 GUI 场景按[安全验收矩阵](security-test-matrix.md)执行。
+
+## 目录授权
+
+选择一个已有的本地数据目录初始化状态存储：
+
+```sh
+cargo run --locked -p file-tidy-cli -- state init /absolute/local/workspace
+```
+
+命令先展示位置和用途，交互确认后在所选目录内创建 `.file-tidy`，保存持久授权与计划快照。该目录采用当前用户私有权限，并通过单写者锁协调授权变更和确认记录。
+
+查看授权、添加目录或按 ID 撤销：
+
+```sh
+cargo run --locked -p file-tidy-cli -- grant list --state /absolute/local/workspace
+cargo run --locked -p file-tidy-cli -- grant add /absolute/other/data --state /absolute/local/workspace
+cargo run --locked -p file-tidy-cli -- grant revoke GRANT_ID --state /absolute/local/workspace
+```
+
+授权绑定目录的原生身份。目录被删除重建、卷发生变化或授权被撤销后，需要重新审阅相关操作计划。会话授权通过计划命令的 `--grant ROOT` 传入，进程结束时失效。
+
+系统建议目录可通过 `grant suggest` 查看。Linux 的 `grant suggest --read-user-dirs` 会读取系统用户目录配置，此选项明确允许该配置读取。
+
+## 操作计划
+
+预览移动计划：
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan move /absolute/local/workspace/source \
+  --to /absolute/local/workspace/destination --state /absolute/local/workspace
+```
+
+使用会话授权预览复制计划并输出 JSON：
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan copy /absolute/source/file \
+  --to /absolute/local/data/copy --grant /absolute/local/data --format json
+```
+
+操作类型支持 `copy`、`move`、`rename`、`quarantine`、`permanent-delete`。单个源的 `--to` 表示完整目标路径；多个源时表示目标目录。`--select 1,3` 按从 1 开始的序号保留指定操作，`--include-hidden` 显式包含隐藏项，`--max-entries` 设置完整清单的条目预算。
+
+文本预览列出每个源与目标、完整目录清单、需要创建的目录、冲突改名、隐藏项与敏感项。默认确认阈值为 100 个文件/链接或 10 GiB；空目录作为独立确认项计数。永久删除的额外阈值为 10 项或 1 GiB。
+
+添加 `--approve` 后，命令在交互终端依次核对计划摘要、所需数量、逐项敏感许可和永久删除确认词，再保存确认快照。确认有效期为 15 分钟。确认时会重新检查授权、文件与目录身份、清单和目标冲突。
+
+预览只读取文件系统；`--approve` 保存审阅快照。
+
+## 移动与重命名
+
+使用 `--execute` 在同一次交互中审阅、确认并执行：
+
+```sh
+cargo run --locked -p file-tidy-cli -- plan move /absolute/local/workspace/source \
+  --to /absolute/local/workspace/destination --state /absolute/local/workspace --execute
+```
+
+执行入口支持目标父目录已存在的同卷 `move` 和 `rename`，包括普通文件、完整目录及符号链接。目录按已审阅的完整清单检查，符号链接移动链接本身。目标在执行前被占用时，该项停止并保留现存目标。数据库及虚拟机对象需先建立一致快照。
+
+在名称大小写不敏感的文件系统上，仅修改名称拼写时，预览会展示同目录内的中间位置。两步重命名分别记录日志，中途停止时，执行报告与恢复诊断会列出保留的临时路径。
+
+每次文件操作先保存意图，完成后核验原生身份与清单并记录结果。批内某项失败、日志不可写或收到 Ctrl-C 时停止后续项，报告保留已完成、未开始和待恢复的操作。执行成功返回 0，部分完成或失败返回 2，取消返回 130。`--execute` 与仅保存快照的 `--approve` 分别使用。
+
+## 执行历史与恢复诊断
+
+```sh
+cargo run --locked -p file-tidy-cli -- history --state /absolute/local/workspace
+cargo run --locked -p file-tidy-cli -- history --state /absolute/local/workspace --batch BATCH_ID
+cargo run --locked -p file-tidy-cli -- recover --state /absolute/local/workspace
+```
+
+历史按批次展示操作、确认快照、步骤意图与结果。恢复诊断只读核验未完成记录，区分尚未提交、已观察到移动结果、需检查的对象变化，以及授权或介质不可用。已取消批次中仍有未完成意图的操作也会列出。诊断结果以 JSON 输出，`--batch` 指定批次，`--limit` 设置批次数量上限。

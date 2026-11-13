@@ -1,8 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! Read-only file inventory, classification, and duplicate detection.
+//! Local file inventory, directory grants, and reviewed operation plans.
 
+pub mod approval;
+pub mod authorization;
 pub mod classify;
+pub mod execution;
+pub mod journal;
+pub mod plan;
+pub mod recovery;
+mod storage;
+mod suggestions;
+pub use storage::{StoragePlan, StoragePreview};
+pub use suggestions::suggested_directories;
 mod content;
 mod model;
 pub mod policy;

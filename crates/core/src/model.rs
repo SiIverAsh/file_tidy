@@ -151,6 +151,7 @@ pub enum SkipReason {
     ChangedDuringRead,
     IdentityUnavailable,
     InvalidRoot,
+    PathAlias,
 }
 
 #[derive(Clone, Debug, Serialize)]

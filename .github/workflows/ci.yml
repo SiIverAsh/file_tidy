@@ -67,8 +67,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      FILE_TIDY_TEST_ROOT: ${{ github.workspace }}/target/ci-test-fixtures
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -81,6 +79,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+      - name: Prepare filesystem fixtures
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parent / "file-tidy-fixtures"
+          root.mkdir(exist_ok=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"FILE_TIDY_TEST_ROOT={root.resolve()}\n")
+          PY
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run workspace tests
@@ -91,6 +100,29 @@ jobs:
             export RUST_TEST_THREADS=1
           fi
           cargo test --workspace --locked
+      - name: Run authorized filesystem tests
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parent / "file-tidy-fixtures"
+          root.mkdir(exist_ok=True)
+          environment = dict(os.environ, FILE_TIDY_TEST_ROOT=str(root.resolve()))
+          if environment.get("RUNNER_OS") == "Windows":
+              environment["RUST_TEST_THREADS"] = "1"
+          subprocess.run([
+              "cargo", "test", "--workspace", "--locked",
+              "--test", "authorization_plan", "--test", "plan_cli",
+              "--test", "execution", "--test", "rename", "--test", "case_rename",
+              "--", "--include-ignored",
+          ], env=environment, check=True)
+          subprocess.run([
+              "cargo", "test", "--workspace", "--locked", "--lib",
+              "--", "--include-ignored",
+          ], env=environment, check=True)
+          PY
       - name: Build release CLI
         run: cargo build --release --locked -p file-tidy-cli
       - name: Smoke test CLI

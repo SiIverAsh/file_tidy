@@ -203,25 +203,53 @@ impl Rules {
             .and_then(|extension| self.extensions.get(extension))
             .copied();
         let normalized_mime = mime.map(str::to_ascii_lowercase);
-        let magic_category = normalized_mime.as_deref().map(|mime| {
-            self.mime_types
-                .get(mime)
-                .copied()
-                .or_else(|| {
-                    self.mime_prefixes.iter().find_map(|(prefix, category)| {
-                        mime.starts_with(prefix).then_some(*category)
-                    })
-                })
-                .unwrap_or(Category::Other)
+        let magic_category = normalized_mime.as_deref().and_then(|mime| {
+            self.mime_types.get(mime).copied().or_else(|| {
+                self.mime_prefixes
+                    .iter()
+                    .find_map(|(prefix, category)| mime.starts_with(prefix).then_some(*category))
+            })
         });
-        let (category, evidence) = match (extension_category, magic_category) {
-            (Some(extension), Some(magic)) if extension == magic => {
-                (magic, TypeEvidence::Agreement)
+        // An unmapped MIME has no rule-defined category. It must not turn a
+        // known extension into Other merely because content recognition worked.
+        let compatible_container = normalized_mime.as_deref() == Some("application/zip")
+            && extension.as_deref().is_some_and(zip_application_suffix);
+        // A ZIP header proves the outer container, not whether its contents are
+        // an APK, Office document or another application package. Preserve an
+        // explicit suffix rule and mark it as extension evidence in that case.
+        let category = if compatible_container {
+            extension_category.or(magic_category)
+        } else {
+            magic_category.or(extension_category)
+        }
+        .unwrap_or(Category::Other);
+        let suffix_agrees = extension.as_deref().and_then(|extension| {
+            let outer = extension.rsplit('.').next()?;
+            let aliases = known_mime_suffixes(normalized_mime.as_deref()?)?;
+            Some(aliases.contains(&outer))
+        });
+        let evidence = if compatible_container {
+            if extension_category.is_some() {
+                TypeEvidence::Extension
+            } else {
+                TypeEvidence::Magic
             }
-            (Some(_), Some(magic)) => (magic, TypeEvidence::Conflict),
-            (Some(extension), None) => (extension, TypeEvidence::Extension),
-            (None, Some(magic)) => (magic, TypeEvidence::Magic),
-            (None, None) => (Category::Other, TypeEvidence::Unknown),
+        } else if (suffix_agrees == Some(false) && extension_category.is_some())
+            || matches!((extension_category, magic_category), (Some(left), Some(right)) if left != right)
+        {
+            TypeEvidence::Conflict
+        } else if suffix_agrees == Some(true) {
+            TypeEvidence::Agreement
+        } else if magic_category.is_some() {
+            // Category agreement alone does not prove that two file formats
+            // match (a JPEG and a PNG are both images).
+            TypeEvidence::Magic
+        } else if extension_category.is_some() {
+            TypeEvidence::Extension
+        } else if normalized_mime.is_some() {
+            TypeEvidence::Magic
+        } else {
+            TypeEvidence::Unknown
         };
         Classification {
             category,
@@ -248,6 +276,103 @@ impl Rules {
             }
         }
         path.extension()?.to_str().map(str::to_ascii_lowercase)
+    }
+}
+
+fn zip_application_suffix(extension: &str) -> bool {
+    extension.rsplit('.').next().is_some_and(|outer| {
+        matches!(
+            outer,
+            "docx"
+                | "xlsx"
+                | "pptx"
+                | "docm"
+                | "xlsm"
+                | "pptm"
+                | "odt"
+                | "ods"
+                | "odp"
+                | "epub"
+                | "apk"
+                | "appx"
+                | "msix"
+                | "jar"
+        )
+    })
+}
+
+/// MIME-only evidence can identify these suffixes without opening content again.
+/// Deliberately omit broad containers such as plain text or OLE storage: they do
+/// not prove a particular application format. Compound suffixes compare only
+/// the outer format, e.g. gzip validates .gz, not the inner tar archive.
+fn known_mime_suffixes(mime: &str) -> Option<&'static [&'static str]> {
+    match mime {
+        "image/jpeg" => Some(&["jpg", "jpeg", "jpe"]),
+        "image/tiff" => Some(&["tif", "tiff"]),
+        "image/png" => Some(&["png"]),
+        "image/gif" => Some(&["gif"]),
+        "image/webp" => Some(&["webp"]),
+        "image/bmp" | "image/x-ms-bmp" => Some(&["bmp"]),
+        "image/avif" => Some(&["avif"]),
+        "image/heic" => Some(&["heic", "heif"]),
+        "image/heif" => Some(&["heif", "heic"]),
+        "image/svg+xml" => Some(&["svg"]),
+        "image/x-icon" | "image/vnd.microsoft.icon" => Some(&["ico"]),
+        "video/mp4" => Some(&["mp4"]),
+        "video/x-m4v" => Some(&["m4v"]),
+        "video/x-matroska" => Some(&["mkv"]),
+        "video/webm" => Some(&["webm"]),
+        "video/quicktime" => Some(&["mov", "qt"]),
+        "video/x-msvideo" => Some(&["avi"]),
+        "video/x-ms-wmv" => Some(&["wmv"]),
+        "video/mpeg" => Some(&["mpeg", "mpg"]),
+        "audio/mpeg" => Some(&["mp3"]),
+        "audio/m4a" | "audio/x-m4a" => Some(&["m4a"]),
+        "audio/ogg" => Some(&["ogg", "oga"]),
+        "audio/opus" => Some(&["opus", "ogg"]),
+        "audio/x-flac" | "audio/flac" => Some(&["flac"]),
+        "audio/x-wav" | "audio/wav" | "audio/wave" => Some(&["wav", "wave"]),
+        "audio/aac" | "audio/x-aac" => Some(&["aac"]),
+        "audio/x-aiff" | "audio/aiff" => Some(&["aif", "aiff"]),
+        "audio/x-ms-wma" => Some(&["wma"]),
+        "application/pdf" => Some(&["pdf"]),
+        "application/rtf" | "text/rtf" => Some(&["rtf"]),
+        "application/msword" => Some(&["doc"]),
+        "application/vnd.ms-excel" => Some(&["xls"]),
+        "application/vnd.ms-powerpoint" => Some(&["ppt"]),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some(&["docx"])
+        }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some(&["xlsx"]),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            Some(&["pptx"])
+        }
+        "application/vnd.oasis.opendocument.text" => Some(&["odt"]),
+        "application/vnd.oasis.opendocument.spreadsheet" => Some(&["ods"]),
+        "application/vnd.oasis.opendocument.presentation" => Some(&["odp"]),
+        "application/epub+zip" => Some(&["epub"]),
+        "application/zip" => Some(&["zip"]),
+        "application/x-tar" => Some(&["tar"]),
+        "application/gzip" => Some(&["gz", "gzip"]),
+        "application/x-bzip2" => Some(&["bz2", "bzip2"]),
+        "application/x-xz" => Some(&["xz"]),
+        "application/zstd" => Some(&["zst", "zstd"]),
+        "application/x-7z-compressed" => Some(&["7z"]),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some(&["rar"]),
+        "application/vnd.microsoft.portable-executable" | "application/x-msdownload" => {
+            Some(&["exe", "dll", "sys"])
+        }
+        "application/x-msi" => Some(&["msi"]),
+        "application/vnd.debian.binary-package" => Some(&["deb"]),
+        "application/x-rpm" => Some(&["rpm"]),
+        "application/vnd.android.package-archive" => Some(&["apk"]),
+        "application/x-apple-diskimage" => Some(&["dmg"]),
+        "application/json" => Some(&["json"]),
+        "application/xml" => Some(&["xml"]),
+        "text/html" => Some(&["html", "htm"]),
+        "text/css" => Some(&["css"]),
+        "text/javascript" | "application/javascript" => Some(&["js", "mjs", "cjs"]),
+        _ => None,
     }
 }
 
@@ -313,9 +438,14 @@ const DEFAULT_RULES: &[DefaultRule] = &[
             "application/rtf",
             "application/epub+zip",
             "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.oasis.opendocument.text",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "application/vnd.oasis.opendocument.presentation",
             "text/plain",
         ],
         &[],
@@ -420,6 +550,139 @@ mod tests {
         let result = Rules::default().classify(Path::new("photo.txt"), Some("image/png"), None);
         assert_eq!(result.category, Category::Image);
         assert_eq!(result.evidence, TypeEvidence::Conflict);
+    }
+
+    #[test]
+    fn open_document_and_legacy_office_mimes_keep_document_category() {
+        let rules = Rules::default();
+        for (suffix, mime) in [
+            ("odt", "application/vnd.oasis.opendocument.text"),
+            ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
+            ("odp", "application/vnd.oasis.opendocument.presentation"),
+            ("xls", "application/vnd.ms-excel"),
+            ("ppt", "application/vnd.ms-powerpoint"),
+        ] {
+            let result = rules.classify(Path::new(&format!("document.{suffix}")), Some(mime), None);
+            assert_eq!(result.category, Category::Document, "{suffix}");
+            assert_eq!(result.evidence, TypeEvidence::Agreement, "{suffix}");
+        }
+    }
+
+    #[test]
+    fn unmapped_mime_does_not_erase_an_explicit_extension_rule() -> Result<(), RuleError> {
+        let rules = Rules::from_toml(
+            "schema_version=1\n[[rules]]\ncategory='document'\nextensions=['odt','pdf']",
+        )?;
+        let document = rules.classify(
+            Path::new("document.odt"),
+            Some("application/vnd.oasis.opendocument.text"),
+            None,
+        );
+        assert_eq!(document.category, Category::Document);
+        assert_eq!(document.evidence, TypeEvidence::Agreement);
+        let unsupported = rules.classify(
+            Path::new("document.pdf"),
+            Some("application/x-unmapped-container"),
+            None,
+        );
+        assert_eq!(unsupported.category, Category::Document);
+        assert_eq!(unsupported.evidence, TypeEvidence::Extension);
+        assert_eq!(
+            unsupported.mime.as_deref(),
+            Some("application/x-unmapped-container")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_category_formats_still_report_suffix_conflicts() {
+        let rules = Rules::default();
+        for (path, mime, category) in [
+            ("renamed.jpg", "image/png", Category::Image),
+            ("renamed.mp3", "audio/x-wav", Category::Audio),
+            ("renamed.txt", "application/pdf", Category::Document),
+            ("renamed.gz", "application/x-bzip2", Category::Archive),
+            ("renamed.gz", "application/zip", Category::Archive),
+        ] {
+            let result = rules.classify(Path::new(path), Some(mime), None);
+            assert_eq!(result.category, category, "{path}");
+            assert_eq!(result.evidence, TypeEvidence::Conflict, "{path}");
+        }
+    }
+
+    #[test]
+    fn legitimate_image_suffix_aliases_are_not_conflicts() {
+        let rules = Rules::default();
+        for (suffix, mime) in [
+            ("jpg", "image/jpeg"),
+            ("JPEG", "image/jpeg"),
+            ("tif", "image/tiff"),
+            ("TIFF", "image/tiff"),
+        ] {
+            let result = rules.classify(Path::new(&format!("picture.{suffix}")), Some(mime), None);
+            assert_eq!(result.category, Category::Image);
+            assert_eq!(result.evidence, TypeEvidence::Agreement, "{suffix}");
+        }
+    }
+
+    #[test]
+    fn category_only_magic_does_not_claim_format_agreement() {
+        let result = Rules::default().classify(
+            Path::new("picture.png"),
+            Some("image/x-unknown-format"),
+            None,
+        );
+        assert_eq!(result.category, Category::Image);
+        assert_eq!(result.evidence, TypeEvidence::Magic);
+    }
+
+    #[test]
+    fn compressed_compound_suffix_compares_the_outer_format() {
+        let result =
+            Rules::default().classify(Path::new("archive.TAR.GZ"), Some("application/gzip"), None);
+        assert_eq!(result.extension.as_deref(), Some("tar.gz"));
+        assert_eq!(result.category, Category::Archive);
+        assert_eq!(result.evidence, TypeEvidence::Agreement);
+    }
+
+    #[test]
+    fn generic_zip_keeps_known_application_suffix_without_claiming_magic_agreement() {
+        let rules = Rules::default();
+        for (suffix, category) in [
+            ("apk", Category::Installer),
+            ("appx", Category::Installer),
+            ("msix", Category::Installer),
+            ("docx", Category::Document),
+            ("xlsx", Category::Document),
+            ("pptx", Category::Document),
+            ("odt", Category::Document),
+            ("ods", Category::Document),
+            ("odp", Category::Document),
+            ("epub", Category::Document),
+        ] {
+            let result = rules.classify(
+                Path::new(&format!("file.{suffix}")),
+                Some("application/zip"),
+                None,
+            );
+            assert_eq!(result.category, category, "{suffix}");
+            assert_eq!(result.evidence, TypeEvidence::Extension, "{suffix}");
+            assert_eq!(result.mime.as_deref(), Some("application/zip"));
+        }
+        let jar = rules.classify(Path::new("file.jar"), Some("application/zip"), None);
+        assert_eq!(jar.category, Category::Archive);
+        assert_eq!(jar.evidence, TypeEvidence::Magic);
+    }
+
+    #[test]
+    fn generic_zip_does_not_confirm_unrelated_image_suffixes() {
+        let result =
+            Rules::default().classify(Path::new("image.jpg"), Some("application/zip"), None);
+        assert_eq!(result.category, Category::Archive);
+        assert_eq!(result.evidence, TypeEvidence::Conflict);
+        let png = Rules::default().classify(Path::new("file.odt"), Some("image/png"), None);
+        assert_eq!(png.category, Category::Image);
+        assert_eq!(png.evidence, TypeEvidence::Conflict);
     }
 
     #[test]

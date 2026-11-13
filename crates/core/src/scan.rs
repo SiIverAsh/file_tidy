@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -259,33 +259,30 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
         }))
     }
 
-    fn process_batch(
+    fn inspect_batch(
         &self,
         paths: &[(PathBuf, Option<u64>)],
         pool: &rayon::ThreadPool,
         report: &mut ScanReport,
-    ) -> Vec<(PathBuf, file_tidy_platform::NodeInfo)> {
+    ) -> Vec<FileEntry> {
         let outcomes: Vec<_> = pool.install(|| {
             paths
                 .par_iter()
                 .map(|(p, volume)| self.entry(p, *volume))
                 .collect()
         });
-        let mut directories = Vec::new();
+        let mut entries = Vec::new();
         for outcome in outcomes {
             match outcome {
                 Ok(Some(entry)) => {
-                    if entry.kind == EntryKind::Directory {
-                        directories.push((entry.path.clone(), entry.snapshot.clone()));
-                    }
-                    report.entries.push(entry);
+                    entries.push(entry);
                 }
                 Ok(None) => {}
                 Err(skip) => report.skipped.push(skip),
             }
         }
         self.notify(ScanPhase::Discover);
-        directories
+        entries
     }
 
     fn enrich_contents(&self, report: &mut ScanReport, pool: &rayon::ThreadPool) {
@@ -510,7 +507,7 @@ pub fn scan(
         options.roots.clone()
     };
     let now = SystemTime::now();
-    let scanner = Scanner {
+    let mut scanner = Scanner {
         options: &options,
         cancel,
         progress: &progress,
@@ -565,6 +562,11 @@ pub fn scan(
         );
     }
     let mut seen = HashSet::new();
+    let mut enumerated_directories: HashMap<file_tidy_platform::FileIdentity, PathBuf> =
+        HashMap::new();
+    let mut single_link_files = HashSet::new();
+    let mut sensitive_evidence = HashSet::new();
+    let mut sensitivity_changed = false;
     'roots: for requested in &roots {
         if cancel.is_cancelled() {
             break;
@@ -626,25 +628,82 @@ pub fn scan(
                 scanner.discovered.fetch_add(1, Ordering::Relaxed);
                 batch.push((path, root_volume));
             }
-            let directories = scanner.process_batch(&batch, &pool, &mut report);
-            for (path, expected) in directories {
+            let entries = scanner.inspect_batch(&batch, &pool, &mut report);
+            for entry in entries {
                 if cancel.is_cancelled() {
                     break 'roots;
+                }
+                if entry.policy.sensitive
+                    && let Some(identity) = entry.snapshot.identity
+                {
+                    sensitive_evidence.insert(identity);
+                }
+                if entry.kind == EntryKind::File {
+                    if entry.snapshot.links == 1
+                        && entry
+                            .snapshot
+                            .identity
+                            .is_some_and(|identity| !single_link_files.insert(identity))
+                    {
+                        report.skipped.push(skipped(
+                            entry.path,
+                            SkipReason::PathAlias,
+                            "同一单链接文件已通过另一个路径发现，不重复计数",
+                            false,
+                        ));
+                    } else {
+                        report.entries.push(entry);
+                    }
+                    continue;
+                }
+                let path = entry.path.clone();
+                let expected = &entry.snapshot;
+                if entry.policy.sensitive
+                    && let Some(identity) = expected.identity
+                {
+                    sensitivity_changed |= scanner.policy.register_sensitive_directory(identity);
+                }
+                if let Some(original) = expected
+                    .identity
+                    .and_then(|identity| enumerated_directories.get(&identity))
+                {
+                    report.skipped.push(skipped(
+                        path,
+                        SkipReason::PathAlias,
+                        &format!("同一目录已通过 {} 枚举，不重复计数", display_path(original)),
+                        false,
+                    ));
+                    continue;
                 }
                 let remaining = options.max_entries.saturating_sub(
                     scanner.discovered.load(Ordering::Relaxed) as usize + frontier.len(),
                 );
                 // Unlike walkdir, no directory is opened before policy, mount,
                 // node type and volume checks. The platform opens by no-follow handles.
-                match file_tidy_platform::read_directory_verified(&path, &expected, remaining) {
+                match file_tidy_platform::read_directory_verified_cancellable(
+                    &path,
+                    expected,
+                    remaining,
+                    &|| cancel.is_cancelled(),
+                ) {
                     Ok(listing) => {
+                        if let Some(identity) = expected.identity {
+                            enumerated_directories.insert(identity, path.clone());
+                        }
                         if listing.truncated {
                             report.summary.limit_reached = true;
                         }
                         frontier.extend(listing.names.into_iter().map(|name| path.join(name)));
                     }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() =>
+                    {
+                        report.entries.push(entry);
+                        break 'roots;
+                    }
                     Err(error) => report.skipped.push(io_skip(path, &error)),
                 }
+                report.entries.push(entry);
             }
             if frontier.is_empty() && report.summary.limit_reached {
                 break 'roots;
@@ -654,6 +713,22 @@ pub fn scan(
     report.entries.sort_by(|a, b| a.path.cmp(&b.path));
     for (index, entry) in report.entries.iter_mut().enumerate() {
         entry.id = index as u64 + 1;
+    }
+    if sensitivity_changed {
+        // A later sensitive alias can change earlier public-path labels. Refresh
+        // before the first content open, then propagate file identities below.
+        for entry in &mut report.entries {
+            entry.policy.sensitive |= scanner.policy.labels(&entry.path).sensitive;
+        }
+    }
+    for entry in &mut report.entries {
+        if entry
+            .snapshot
+            .identity
+            .is_some_and(|identity| sensitive_evidence.contains(&identity))
+        {
+            entry.policy.sensitive = true;
+        }
     }
     scanner.enrich_contents(&mut report, &pool);
     if options.detect_duplicates && !options.metadata_only && !cancel.is_cancelled() {

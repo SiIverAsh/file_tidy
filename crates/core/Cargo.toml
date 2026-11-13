@@ -16,6 +16,9 @@ serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 time = "0.3.55"
+getrandom.workspace = true
+cap-std.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

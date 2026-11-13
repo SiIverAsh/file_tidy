@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod planning;
+
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,9 +16,9 @@ use file_tidy_core::{CancellationToken, Progress, Rules, ScanOptions, render_tex
 #[command(
     name = "file-tidy",
     version,
-    about = "本地文件整理工具：只读扫描、分类和报告",
-    long_about = "本地文件整理工具：只读扫描、分类和报告。\n\
-不移动、重命名、复制或删除文件，不创建缓存、journal 或文件日志。\n\
+    about = "本地文件整理工具：扫描、授权、计划与文件操作",
+    long_about = "本地文件整理工具：扫描、授权、计划与文件操作。\n\
+默认只预览计划，不移动文件；使用 plan --execute 交互确认后执行。\n\
 敏感区域默认只读取元数据，重复结果仅供审阅。"
 )]
 struct Cli {
@@ -28,6 +30,16 @@ struct Cli {
 enum Command {
     /// 只读扫描选定目录，或分别扫描所有可识别的本地卷
     Scan(ScanArgs),
+    /// 审阅与初始化私有状态存储
+    State(planning::StateArgs),
+    /// 查看、授予或撤销目录授权
+    Grant(planning::GrantArgs),
+    /// 生成完整清单与 before/after 计划预览
+    Plan(planning::PlanArgs),
+    /// 查看执行批次、结果与步骤日志
+    History(planning::HistoryArgs),
+    /// 只读核对未完成操作与文件现状
+    Recover(planning::RecoveryArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -141,6 +153,11 @@ fn main() -> ExitCode {
 fn run(command: Command) -> Result<u8> {
     match command {
         Command::Scan(args) => run_scan(args),
+        Command::State(args) => planning::run_state(args),
+        Command::Grant(args) => planning::run_grant(args),
+        Command::Plan(args) => planning::run_plan(args),
+        Command::History(args) => planning::run_history(args),
+        Command::Recover(args) => planning::run_recovery(args),
     }
 }
 
@@ -266,7 +283,15 @@ mod tests {
             "--metadata-only",
             "--quiet",
         ])?;
-        let Command::Scan(args) = cli.command;
+        let args = match cli.command {
+            Command::Scan(args) => args,
+            _ => {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::InvalidSubcommand,
+                    "expected scan command",
+                ));
+            }
+        };
         assert_eq!(args.roots.len(), 2);
         assert!(args.metadata_only);
         assert!(args.quiet);

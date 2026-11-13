@@ -5,6 +5,18 @@
 -- DDL 使用内存数据库检查；持久化参数在状态库初始化时检查。
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE authorization_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    payload BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE confirmation_snapshots (
+    receipt TEXT PRIMARY KEY,
+    digest TEXT NOT NULL,
+    confirmed_at INTEGER NOT NULL,
+    snapshot BLOB NOT NULL
+) STRICT;
+
 CREATE TABLE store_metadata (
     key TEXT PRIMARY KEY,
     value BLOB NOT NULL

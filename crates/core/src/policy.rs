@@ -28,6 +28,7 @@ pub struct PolicyLabels {
 #[derive(Clone, Debug)]
 pub struct Policy {
     protected_roots: Vec<PathBuf>,
+    protected_directory_ids: HashSet<FileIdentity>,
     sensitive_roots: Vec<PathBuf>,
     sensitive_directory_ids: HashSet<FileIdentity>,
     sensitivity_context_known: bool,
@@ -61,6 +62,18 @@ impl Policy {
             )),
         }
         include_existing_canonical_aliases(&mut protected_roots, mounts.as_ref());
+        let protected_directory_ids = mounts
+            .as_ref()
+            .map(|mounts| {
+                protected_roots
+                    .iter()
+                    .filter_map(|path| canonicalize_local(path, mounts).ok())
+                    .filter_map(|path| file_tidy_platform::inspect(&path).ok())
+                    .filter(|node| node.kind == NodeKind::Directory)
+                    .filter_map(|node| node.identity)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut sensitive_roots = Vec::new();
         // UserDirs parses user-dirs.dirs on Linux. That is private configuration
@@ -111,6 +124,7 @@ impl Policy {
         }
         Self {
             protected_roots,
+            protected_directory_ids,
             sensitive_roots,
             sensitive_directory_ids,
             sensitivity_context_known,
@@ -126,6 +140,18 @@ impl Policy {
         &self.warnings
     }
 
+    /// Record sensitive directory objects discovered in the inventory, including
+    /// aliases whose sensitive names were not among the startup roots.
+    pub(crate) fn register_sensitive_directory(&mut self, identity: FileIdentity) -> bool {
+        if !self.sensitive_directory_ids.insert(identity) {
+            return false;
+        }
+        if let Ok(mut cache) = self.sensitivity_cache.write() {
+            cache.clear();
+        }
+        true
+    }
+
     /// Label a path without reading file contents.
     ///
     /// The lexical and canonical paths are both checked, so resolving an alias
@@ -137,6 +163,7 @@ impl Policy {
         let canonical = self.canonicalize(&lexical);
         let protected = self.in_roots(&lexical, &self.protected_roots)
             || protected_volume_directory(&lexical)
+            || self.protected_ancestor_identity(&lexical)
             || canonical.as_deref().is_some_and(|real| {
                 self.in_roots(real, &self.protected_roots) || protected_volume_directory(real)
             });
@@ -224,7 +251,26 @@ impl Policy {
     }
 
     fn in_roots(&self, path: &Path, roots: &[PathBuf]) -> bool {
-        roots.iter().any(|root| component_prefix(path, root))
+        roots.iter().any(|root| {
+            component_prefix(path, root)
+                || self
+                    .mounts
+                    .as_ref()
+                    .is_some_and(|mounts| mounts.is_alias_beneath(path, root))
+        })
+    }
+
+    fn protected_ancestor_identity(&self, path: &Path) -> bool {
+        path.ancestors().any(|ancestor| {
+            self.mounts
+                .as_ref()
+                .is_some_and(|mounts| mounts.classify(ancestor).kind == LocationKind::Local)
+                && file_tidy_platform::inspect(ancestor)
+                    .ok()
+                    .filter(|node| node.kind == NodeKind::Directory)
+                    .and_then(|node| node.identity)
+                    .is_some_and(|identity| self.protected_directory_ids.contains(&identity))
+        })
     }
 
     fn sensitive_path(&self, path: &Path) -> bool {
@@ -232,6 +278,15 @@ impl Policy {
             || path
                 .components()
                 .any(|part| sensitive_name(part.as_os_str()))
+            || self
+                .mounts
+                .as_ref()
+                .and_then(|mounts| mounts.filesystem_relative_path(path))
+                .is_some_and(|physical| {
+                    physical
+                        .components()
+                        .any(|part| sensitive_name(part.as_os_str()))
+                })
     }
 
     fn atomic_root(&self, path: &Path) -> Option<PathBuf> {
@@ -474,7 +529,7 @@ fn protected_volume_directory(path: &Path) -> bool {
     }
 }
 
-fn sensitive_name(name: &OsStr) -> bool {
+pub(crate) fn sensitive_name(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     let lower: Vec<_> = bytes.iter().map(u8::to_ascii_lowercase).collect();
     let whole = [
@@ -721,6 +776,51 @@ mod tests {
         std::fs::rename(&public, &displaced)?;
         std::fs::rename(&private, &public)?;
         assert!(policy.sensitive_for_content(&public));
+        Ok(())
+    }
+
+    #[test]
+    fn protected_directory_identity_survives_namespace_changes() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fixture = temp.path().canonicalize()?;
+        let original = fixture.join("system-anchor");
+        let alias = fixture.join("other-namespace");
+        std::fs::create_dir(&original)?;
+        std::fs::write(original.join("ordinary.txt"), b"fixture")?;
+        let identity = file_tidy_platform::inspect(&original)?
+            .identity
+            .ok_or_else(|| io::Error::other("fixture identity unavailable"))?;
+        let mut policy = Policy::new();
+        // Synthetic anchors exercise alias detection without modifying any real
+        // protected object or exposing configurable production protection roots.
+        policy.protected_roots.clear();
+        policy.protected_directory_ids.clear();
+        policy.protected_directory_ids.insert(identity);
+        std::fs::rename(&original, &alias)?;
+        assert!(policy.labels(&alias.join("ordinary.txt")).protected);
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_sensitive_evidence_invalidates_public_alias_cache() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fixture = temp.path().canonicalize()?;
+        let directory = fixture.join("plain-name");
+        std::fs::create_dir(&directory)?;
+        let file = directory.join("ordinary.txt");
+        std::fs::write(&file, b"fixture")?;
+        let identity = file_tidy_platform::inspect(&directory)?
+            .identity
+            .ok_or_else(|| io::Error::other("fixture identity unavailable"))?;
+        let mut policy = Policy::new();
+        policy.sensitivity_context_known = true;
+        policy.sensitive_roots.clear();
+        policy.sensitive_directory_ids.clear();
+        assert!(!policy.labels(&file).sensitive);
+        assert!(policy.register_sensitive_directory(identity));
+        assert!(policy.labels(&file).sensitive);
+        assert!(policy.sensitive_for_content(&file));
+        assert!(!policy.register_sensitive_directory(identity));
         Ok(())
     }
 

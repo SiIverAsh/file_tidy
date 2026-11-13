@@ -3,6 +3,7 @@ use std::io::{self, Read};
 
 use file_tidy_platform::{
     MountTable, NodeKind, inspect, inspect_file, open_verified, read_directory_verified,
+    read_directory_verified_cancellable,
 };
 
 #[test]
@@ -16,12 +17,42 @@ fn directory_listing_is_bounded_and_excludes_dot_entries() -> io::Result<()> {
     let bounded = read_directory_verified(&root, &before, 2)?;
     assert_eq!(bounded.names.len(), 2);
     assert!(bounded.truncated);
-    let exact = read_directory_verified(&root, &before, 3)?;
+    let mut exact = read_directory_verified(&root, &before, 3)?;
+    exact.names.sort();
     assert_eq!(exact.names, ["a", "b", "nested"]);
     assert!(!exact.truncated);
     let zero = read_directory_verified(&root, &before, 0)?;
     assert!(zero.names.is_empty());
     assert!(zero.truncated);
+    Ok(())
+}
+
+#[test]
+fn directory_listing_checks_cancellation_between_entries() -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir()?;
+    let root = fs::canonicalize(temp.path())?;
+    for index in 0..64 {
+        fs::write(root.join(format!("entry-{index}")), b"fixture")?;
+    }
+    let before = inspect(&root)?;
+    let checks = AtomicUsize::new(0);
+    let result = read_directory_verified_cancellable(&root, &before, 64, &|| {
+        checks.fetch_add(1, Ordering::Relaxed) >= 8
+    });
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert!(checks.load(Ordering::Relaxed) < 64);
+
+    // An already-cancelled request must not even try to open an absent path.
+    let result = read_directory_verified_cancellable(&root.join("missing"), &before, 64, &|| true);
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
     Ok(())
 }
 
@@ -89,8 +120,56 @@ mod unix {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::time::Duration;
+
+    struct RestorePermissions {
+        path: std::path::PathBuf,
+        permissions: fs::Permissions,
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, self.permissions.clone());
+        }
+    }
+
+    #[test]
+    fn reads_files_and_lists_leaf_directory_below_search_only_parent() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = fs::canonicalize(temp.path())?;
+        let parent = root.join("search-only");
+        fs::create_dir(&parent)?;
+        let file_path = parent.join("plain.txt");
+        fs::write(&file_path, b"searchable file")?;
+        let child = parent.join("readable-child");
+        fs::create_dir(&child)?;
+        fs::write(child.join("entry"), b"child")?;
+        let restore = RestorePermissions {
+            path: parent.clone(),
+            permissions: fs::metadata(&parent)?.permissions(),
+        };
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o111))?;
+        assert_eq!(fs::read(&file_path)?, b"searchable file");
+        let mut content = Vec::new();
+        open_verified(&file_path, &inspect(&file_path)?)?.read_to_end(&mut content)?;
+        assert_eq!(content, b"searchable file");
+        let listing = read_directory_verified(&child, &inspect(&child)?, 10)?;
+        assert_eq!(listing.names, ["entry"]);
+        assert!(!listing.truncated);
+        fs::set_permissions(&parent, restore.permissions.clone())?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_root_directory_remains_readable() -> io::Result<()> {
+        let root = std::path::Path::new("/");
+        let listing = read_directory_verified(root, &inspect(root)?, 0)?;
+        assert!(listing.names.is_empty());
+        assert!(listing.truncated);
+        Ok(())
+    }
 
     #[test]
     fn refuses_link_leaf_and_link_parent() -> io::Result<()> {

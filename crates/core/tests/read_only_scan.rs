@@ -27,6 +27,204 @@ fn options(root: &Path) -> ScanOptions {
     }
 }
 
+#[cfg(unix)]
+struct RestoreDirectoryPermissions {
+    path: PathBuf,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreDirectoryPermissions {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, self.permissions.clone());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_file_root_below_search_only_parent_is_readable() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture()?;
+    let parent = dir.path().join("search-only");
+    fs::create_dir(&parent)?;
+    let file = parent.join("document.txt");
+    let bytes = b"an ordinary reachable document";
+    fs::write(&file, bytes)?;
+    let restore = RestoreDirectoryPermissions {
+        path: parent.clone(),
+        permissions: fs::metadata(&parent)?.permissions(),
+    };
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o111))?;
+    assert_eq!(fs::read(&file)?, bytes);
+
+    let report = scan(options(&file), &CancellationToken::default(), |_| {})?;
+    assert!(report.summary.complete);
+    assert_eq!(report.summary.files, 1);
+    assert_eq!(report.summary.logical_bytes, bytes.len() as u64);
+    assert_eq!(report.summary.content_open_operations, 1);
+    assert!(
+        report
+            .entries
+            .iter()
+            .any(|entry| entry.path == file && entry.content_inspected)
+    );
+    assert!(!report.skipped.iter().any(|entry| entry.incomplete));
+    fs::set_permissions(&parent, restore.permissions.clone())?;
+    Ok(())
+}
+
+#[test]
+fn cancellation_at_directory_boundary_does_not_report_io_failure() -> TestResult {
+    let dir = fixture()?;
+    fs::create_dir(dir.path().join("child"))?;
+    fs::write(dir.path().join("child/file.txt"), b"unread fixture")?;
+    let token = CancellationToken::default();
+    let reached_directory = AtomicBool::new(false);
+    let report = scan(options(dir.path()), &token, |event| {
+        // This is the public scanner boundary; per-entry interruption inside
+        // the native enumerator is covered directly by the platform tests.
+        if matches!(event.phase, ScanPhase::Discover) && event.processed > 0 {
+            reached_directory.store(true, Ordering::Relaxed);
+            token.cancel();
+        }
+    })?;
+    assert!(reached_directory.load(Ordering::Relaxed));
+    assert!(report.summary.cancelled);
+    assert!(!report.summary.complete);
+    assert_eq!(report.summary.content_open_operations, 0);
+    assert!(!report.skipped.iter().any(|entry| matches!(
+        entry.reason,
+        SkipReason::Io | SkipReason::PermissionDenied | SkipReason::ChangedDuringRead
+    )));
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn case_alias_directory_roots_follow_native_identity_without_double_counting() -> TestResult {
+    let dir = fixture()?;
+    let lower = dir.path().join("sample");
+    let upper = dir.path().join("SAMPLE");
+    let lower_bytes = b"lower directory document";
+    let upper_bytes = b"independent upper directory document";
+    fs::create_dir(&lower)?;
+    fs::write(lower.join("document.txt"), lower_bytes)?;
+    match file_tidy_platform::inspect(&upper) {
+        Ok(info) => assert_eq!(info.kind, file_tidy_platform::NodeKind::Directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&upper)?;
+            fs::write(upper.join("document.txt"), upper_bytes)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let lower_info = file_tidy_platform::inspect(&lower)?;
+    let upper_info = file_tidy_platform::inspect(&upper)?;
+    assert!(lower_info.identity.is_some());
+    assert!(upper_info.identity.is_some());
+    let aliases = lower_info.identity == upper_info.identity;
+    let mut opts = options(&lower);
+    opts.roots.push(upper.clone());
+    let report = scan(opts, &CancellationToken::default(), |_| {})?;
+    assert!(report.summary.complete);
+    assert!(report.duplicates.is_empty());
+    if aliases {
+        assert_eq!(report.summary.files, 1);
+        assert_eq!(report.summary.directories, 1);
+        assert_eq!(report.summary.logical_bytes, lower_bytes.len() as u64);
+        assert!(report.skipped.iter().any(|entry| {
+            entry.path == upper && entry.reason == SkipReason::PathAlias && !entry.incomplete
+        }));
+    } else {
+        assert_eq!(report.summary.files, 2);
+        assert_eq!(report.summary.directories, 2);
+        assert_eq!(
+            report.summary.logical_bytes,
+            (lower_bytes.len() + upper_bytes.len()) as u64
+        );
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|entry| entry.reason == SkipReason::PathAlias)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn case_alias_single_link_file_roots_follow_native_identity() -> TestResult {
+    let dir = fixture()?;
+    let lower = dir.path().join("sample.txt");
+    let upper = dir.path().join("SAMPLE.TXT");
+    let bytes = b"same bytes in two independent files when case-sensitive";
+    fs::write(&lower, bytes)?;
+    match file_tidy_platform::inspect(&upper) {
+        Ok(info) => assert_eq!(info.kind, file_tidy_platform::NodeKind::Regular),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::write(&upper, bytes)?,
+        Err(error) => return Err(error.into()),
+    }
+    let lower_info = file_tidy_platform::inspect(&lower)?;
+    let upper_info = file_tidy_platform::inspect(&upper)?;
+    assert_eq!(lower_info.links, 1);
+    assert_eq!(upper_info.links, 1);
+    assert!(lower_info.identity.is_some());
+    assert!(upper_info.identity.is_some());
+    let aliases = lower_info.identity == upper_info.identity;
+    let mut opts = options(&lower);
+    opts.roots.push(upper.clone());
+    let report = scan(opts, &CancellationToken::default(), |_| {})?;
+    assert!(report.summary.complete);
+    assert_eq!(report.summary.directories, 0);
+    if aliases {
+        assert_eq!(report.summary.files, 1);
+        assert_eq!(report.summary.logical_bytes, bytes.len() as u64);
+        assert!(report.duplicates.is_empty());
+        assert!(report.skipped.iter().any(|entry| {
+            entry.path == upper && entry.reason == SkipReason::PathAlias && !entry.incomplete
+        }));
+    } else {
+        assert_eq!(report.summary.files, 2);
+        assert_eq!(report.summary.logical_bytes, bytes.len() as u64 * 2);
+        assert_eq!(report.duplicates.len(), 1);
+        assert_eq!(report.duplicates[0].entry_ids.len(), 2);
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|entry| entry.reason == SkipReason::PathAlias)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_true_hardlink_roots_keep_each_directory_entry() -> TestResult {
+    let dir = fixture()?;
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    let bytes = b"one inode, two real directory entries";
+    fs::write(&first, bytes)?;
+    fs::hard_link(&first, &second)?;
+    assert!(file_tidy_platform::inspect(&first)?.links > 1);
+    let mut opts = options(&first);
+    opts.roots.push(second);
+    let report = scan(opts, &CancellationToken::default(), |_| {})?;
+    assert!(report.summary.complete);
+    assert_eq!(report.summary.files, 2);
+    assert_eq!(report.summary.logical_bytes, bytes.len() as u64 * 2);
+    assert_eq!(report.summary.unique_file_logical_bytes, bytes.len() as u64);
+    assert!(report.duplicates.is_empty());
+    assert!(
+        !report
+            .skipped
+            .iter()
+            .any(|entry| entry.reason == SkipReason::PathAlias)
+    );
+    Ok(())
+}
+
 #[test]
 fn sensitive_files_never_open_content_and_keep_metadata() -> TestResult {
     let dir = fixture()?;

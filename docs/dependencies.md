@@ -1,6 +1,6 @@
 # 依赖选型与来源
 
-记录日期：2026-11-12。表中版本来自各项目的 docs.rs 文档，当前构建使用的版本由 Cargo.toml 与 Cargo.lock 确定。
+记录日期：2026-11-13。表中版本来自各项目的 docs.rs 文档，当前构建使用的版本由 Cargo.toml 与 Cargo.lock 确定。
 
 目录扫描使用 platform 的无跟随目录句柄枚举替代 walkdir，以便在枚举前检查节点和挂载。tracing、dunce、unicode-normalization 保留为后续候选。time 0.3.55 用于 UTC 修改月份，macOS libc 0.2.191 用于线程安全的挂载表查询。
 
@@ -26,11 +26,11 @@
 | [clap](https://docs.rs/clap/latest/clap/) | 4.6.7 | CLI 参数、PathBuf 与清晰帮助信息 | 已使用 |
 | [ctrlc](https://docs.rs/ctrlc/latest/ctrlc/) | 3.5.2 | CLI 取消信号转为核心取消标记；不在信号回调做文件操作 | 已使用 |
 | [tempfile](https://docs.rs/tempfile/latest/tempfile/) | 3.27.0 | 测试夹具；生产暂存必须创建于已授权目标目录并登记 journal，不能只依赖 Drop | 测试依赖 |
-| [cap-std](https://docs.rs/cap-std/latest/cap_std/) | 4.0.3 | 目录句柄相对的能力式访问，叠加业务策略与平台安全原语 | 授权与写入候选 |
+| [cap-std](https://docs.rs/cap-std/latest/cap_std/) | 4.0.3 | 目录句柄相对的能力式访问，叠加业务策略与平台安全原语 | 已用于私有状态目录 |
 | [rustix](https://docs.rs/rustix/latest/rustix/) | 1.1.6 | Unix 安全 fd 包装、文件系统身份/空间与原子操作，按平台和 feature 引入 | 已用于平台读取 |
 | [windows-sys](https://docs.rs/windows-sys/latest/windows_sys/) | 0.61.2 | Windows 常量与必要句柄 API；FFI 只在 platform crate，按需启用 Win32 模块 | 已用于平台读取 |
-| [getrandom](https://docs.rs/getrandom/latest/getrandom/) | 0.4.3 | 计划/操作随机 ID、确认挑战和临时对象随机名；失败则拒绝生成能力 | 授权与计划候选 |
-| [rusqlite](https://docs.rs/rusqlite/latest/rusqlite/) | 0.42.0 | SQLite journal；拟使用 bundled 统一 SQLite，最终 feature 与底层版本须实际构建核实 | 状态与 journal 候选 |
+| [getrandom](https://docs.rs/getrandom/latest/getrandom/) | 0.4.3 | 计划/操作随机 ID、确认挑战和临时对象随机名；失败则拒绝生成能力 | 已用于授权、计划与确认 ID |
+| [rusqlite](https://docs.rs/rusqlite/latest/rusqlite/) | 0.42.0 | SQLite journal；拟使用 bundled 统一 SQLite，最终 feature 与底层版本须实际构建核实 | 已用于授权与确认快照 |
 | [tauri](https://docs.rs/tauri/latest/tauri/) | 2.12.5 | 本地 IPC GUI，不需要产品运行时 HTTP 服务 | GUI 候选 |
 | [tauri-build](https://docs.rs/tauri-build/latest/tauri_build/) | 2.7.4 | GUI 构建及应用命令权限清单；与 tauri 的实际组合待构建 | GUI 候选 |
 
