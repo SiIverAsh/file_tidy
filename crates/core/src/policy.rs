@@ -677,7 +677,15 @@ mod tests {
 
     #[test]
     fn content_admission_does_not_trust_stale_inventory_cache() -> io::Result<()> {
-        let temp = tempfile::tempdir()?;
+        // Windows' system temp directory is under AppData, which must remain
+        // sensitive by name even when the synthetic policy roots are cleared.
+        let base = std::env::var_os("FILE_TIDY_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-test-fixtures")
+            });
+        std::fs::create_dir_all(&base)?;
+        let temp = tempfile::tempdir_in(base)?;
         let fixture = temp.path().canonicalize()?;
         let private = fixture.join("private-object");
         let public = fixture.join("public-location");
