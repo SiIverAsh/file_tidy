@@ -311,8 +311,9 @@ fn canonicalize_local(path: &Path, mounts: &MountTable) -> io::Result<PathBuf> {
                 }
                 other => cursor.push(other.as_os_str()),
             }
-            // A drive prefix is not absolute until its RootDir component.
-            if !cursor.is_absolute() {
+            // Verbatim drive prefixes can report is_absolute before RootDir.
+            // Wait for the complete root before classifying or inspecting it.
+            if matches!(part, Component::Prefix(_)) || !cursor.is_absolute() {
                 continue;
             }
             if mounts.classify(&cursor).kind != LocationKind::Local {
@@ -672,6 +673,20 @@ mod tests {
         let file = repo.join("node_modules/library.txt");
         std::fs::write(&file, b"library")?;
         assert_eq!(Policy::new().atomic_root(&file), Some(repo));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalization_accepts_complete_verbatim_drive_roots() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let canonical = temp.path().canonicalize()?;
+        let mounts = MountTable::read()?;
+        assert_eq!(canonicalize_local(&canonical, &mounts)?, canonical);
+        assert_eq!(
+            canonicalize_local(&strip_verbatim_disk_prefix(&canonical), &mounts)?,
+            canonical
+        );
         Ok(())
     }
 

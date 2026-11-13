@@ -92,7 +92,7 @@ fn staged_duplicates_compare_entire_file_and_do_not_count_hardlinks() -> TestRes
     fs::write(dir.path().join("c.bin"), &a)?;
     fs::hard_link(dir.path().join("a.bin"), dir.path().join("hardlink.bin"))?;
     let result = scan(options(dir.path()), &CancellationToken::default(), |_| {})?;
-    assert!(result.summary.complete);
+    assert!(result.summary.complete, "{:?}", result.skipped);
     assert_eq!(result.summary.files, 4);
     assert_eq!(result.summary.logical_bytes, a.len() as u64 * 4);
     assert_eq!(result.summary.unique_file_logical_bytes, a.len() as u64 * 3);
@@ -235,7 +235,7 @@ fn top_usage_and_directory_totals_are_consistent() -> TestResult {
     let mut opts = options(dir.path());
     opts.top_n = 1;
     let result = scan(opts, &CancellationToken::default(), |_| {})?;
-    assert_eq!(result.summary.logical_bytes, 10);
+    assert_eq!(result.summary.logical_bytes, 10, "{:?}", result.skipped);
     assert_eq!(result.top_entry_ids.len(), 1);
     assert!(
         result.entries[(result.top_entry_ids[0] - 1) as usize]
@@ -305,7 +305,10 @@ fn magic_conflict_and_old_mtime_remain_reporting_only() -> TestResult {
     let dir = fixture()?;
     let file = dir.path().join("image.txt");
     fs::write(&file, b"\x89PNG\r\n\x1a\nmore bytes")?;
-    fs::File::open(&file)?.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&file)?
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))?;
     let report = scan(options(dir.path()), &CancellationToken::default(), |_| {})?;
     let entry = report
         .entries

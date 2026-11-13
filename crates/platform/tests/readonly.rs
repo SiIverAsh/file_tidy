@@ -189,7 +189,7 @@ mod unix {
 
 #[cfg(windows)]
 #[test]
-fn junction_is_explicitly_a_reparse_node() -> io::Result<()> {
+fn junction_is_never_followed() -> io::Result<()> {
     let temp = tempfile::tempdir()?;
     let root = fs::canonicalize(temp.path())?;
     let actual = root.join("actual");
@@ -207,7 +207,9 @@ fn junction_is_explicitly_a_reparse_node() -> io::Result<()> {
         ));
     }
     let node = inspect(&junction)?;
-    assert_eq!(node.kind, NodeKind::Reparse);
+    // Rust may expose a junction as a directory symlink. Both kinds must
+    // still be rejected before content reads, including through descendants.
+    assert!(matches!(node.kind, NodeKind::Symlink | NodeKind::Reparse));
     assert!(open_verified(&junction, &node).is_err());
     assert!(open_verified(&junction.join("secret"), &inspect(&actual.join("secret"))?).is_err());
     assert_eq!(fs::read(actual.join("secret"))?, b"unchanged");

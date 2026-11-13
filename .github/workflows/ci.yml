@@ -84,7 +84,13 @@ jobs:
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: |
+          # Windows fixtures share ancestors whose metadata is revalidated.
+          # Keep fixture mutations separate; scanner worker threads stay enabled.
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo test --workspace --locked
       - name: Build release CLI
         run: cargo build --release --locked -p file-tidy-cli
       - name: Smoke test CLI
