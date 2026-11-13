@@ -38,9 +38,7 @@ jobs:
         with:
           toolchain: 1.99.0
           components: rustfmt
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
-        with:
-          tool: cargo-dist@0.33.0
+      - uses: ./.github/actions/setup-dist
       - name: Install actionlint
         env:
           GH_TOKEN: ${{ github.token }}

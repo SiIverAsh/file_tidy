@@ -1,0 +1,60 @@
+name: Set up cargo-dist
+description: Install cargo-dist 0.33.0 from verified official release archives.
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-dist 0.33.0
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)
+            target=x86_64-unknown-linux-gnu
+            checksum=4b3f0a5f0ebbdb798f6db649d01b32ba1518376b6f7a0502b7d92b75cc2c8293
+            ;;
+          macOS-ARM64)
+            target=aarch64-apple-darwin
+            checksum=7b3cbe25511de01d74c0f5fcb7909edabd379bea9cfa284d93af5a3cdfa3247c
+            ;;
+          macOS-X64)
+            target=x86_64-apple-darwin
+            checksum=6a49bfb61bd86770d79c27f3d2b40c6b2e71cde940d3d31a6ccaaffc124d7a29
+            ;;
+          Windows-X64)
+            target=x86_64-pc-windows-msvc
+            checksum=9a36d70795e14326a5ec4bf17aee085df00ab85a322739291ea5d4b1b5f693cd
+            ;;
+          *)
+            echo "Unsupported cargo-dist host: $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+
+        extension=tar.xz
+        exe_suffix=''
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          extension=zip
+          exe_suffix=.exe
+        fi
+        archive="cargo-dist-$target.$extension"
+        install_dir="$RUNNER_TEMP/cargo-dist-0.33.0"
+        mkdir -p "$install_dir"
+        gh release download v0.33.0 --repo axodotdev/cargo-dist \
+          --pattern "$archive" --dir "$install_dir" --clobber
+        if command -v sha256sum > /dev/null; then
+          printf '%s  %s\n' "$checksum" "$install_dir/$archive" | sha256sum --check -
+        else
+          printf '%s  %s\n' "$checksum" "$install_dir/$archive" | shasum -a 256 --check -
+        fi
+
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          unzip -o "$install_dir/$archive" dist.exe -d "$install_dir"
+        else
+          tar -xJf "$install_dir/$archive" -C "$install_dir" \
+            --strip-components=1 "cargo-dist-$target/dist"
+        fi
+        "$install_dir/dist$exe_suffix" --version
+        echo "$install_dir" >> "$GITHUB_PATH"

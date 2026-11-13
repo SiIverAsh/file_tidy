@@ -43,7 +43,7 @@ Release 提供 `.tar.xz` / `.zip` 压缩包、SHA-256 校验文件、源码包�
 
 工作流由仓库维护，dist 负责规划和打包。配置中的 `allow-dirty = ["ci"]` 用于禁止 dist 在构建检查时要求其默认生成模板，不应使用 `dist generate` 覆盖本仓库的发布门禁。
 
-Actions 固定到提交 SHA，由 Dependabot 更新。dist 当前固定为 0.33.0；升级时同步更新 `dist-workspace.toml` 与 CI / Release 中的工具版本。cargo-audit 与 actionlint 也固定版本；actionlint 的下载归档按 SHA-256 校验，升级时需同步更新版本和校验值。
+第三方 Actions 固定到提交 SHA，由 Dependabot 更新。dist 当前固定为 0.33.0，CI / Release 共用 `.github/actions/setup-dist`，直接下载官方 GitHub Release 中的预编译归档并核对固定的 SHA-256，不依赖 crates.io 上的 cargo-dist 版本。升级时同步更新 `dist-workspace.toml` 与该本地 action 的版本、各平台归档校验值。cargo-audit 与 actionlint 也固定版本；actionlint 的下载归档按 SHA-256 校验，升级时需同步更新版本和校验值。
 
 `deny.toml` 对所有平台依赖检查许可证与来源，默认仅允许 crates.io，拒绝未知 Git 来源。`option-ext` 的 MPL-2.0 使用 crate 级例外；新增许可证应审阅后单独修改规则，不通过忽略漏洞绕过安全检查。
 

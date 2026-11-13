@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use file_tidy_core::{
-    CancellationToken, EntryKind, ScanOptions, ScanPhase, SkipReason, load_rules, render_text, scan,
+    CancellationToken, EntryKind, ScanOptions, ScanPhase, SkipReason, load_rules, scan,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -378,6 +378,8 @@ fn non_utf8_names_and_atomic_roots_serialize_losslessly() -> TestResult {
 #[cfg(unix)]
 #[test]
 fn text_report_escapes_control_and_bidi_characters() -> TestResult {
+    use file_tidy_core::render_text;
+
     let dir = fixture()?;
     fs::write(dir.path().join("name\n\u{1b}[31m\u{202e}.txt"), b"content")?;
     let report = scan(options(dir.path()), &CancellationToken::default(), |_| {})?;
