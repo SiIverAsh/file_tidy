@@ -274,11 +274,11 @@ impl StateStore {
             }
             transaction.execute("INSERT INTO batches(batch_id,schema_version,plan_digest,policy_digest,snapshot,grant_epoch,item_count,total_bytes,state,created_at_s) VALUES(?1,1,?2,?3,?4,?5,?6,?7,'running',?8)", params![batch,digest,policy_digest,snapshot,epoch,integer(preview.confirmation_count)?,total,integer(preview.created_at)?])?;
             for (ordinal,operation) in preview.operations.iter().enumerate() {
-                let kind = match operation.kind { OperationKind::Move=>"move",OperationKind::Rename=>"rename",OperationKind::Copy=>"copy",OperationKind::Quarantine=>"quarantine",OperationKind::Restore=>"restore",OperationKind::PermanentDelete=>"permanent_delete" };
+                let kind = match operation.kind { OperationKind::Move=>"move",OperationKind::Rename=>"rename",OperationKind::Copy=>"copy",OperationKind::Quarantine=>"quarantine",OperationKind::Restore=>"restore",OperationKind::UndoCopy=>"undo_copy",OperationKind::PermanentDelete=>"permanent_delete" };
                 let (encoding,source) = path_bytes(&operation.source)?;
                 let destination = operation.destination.as_ref().map(|d| path_bytes(&d.path).map(|(_,b)|b)).transpose()?;
                 let root = operation.manifest.iter().find(|e| e.path==operation.source).ok_or(E::InvalidPlan)?;
-                transaction.execute("INSERT INTO operations(op_id,batch_id,ordinal,kind,path_encoding,source_path,destination_path,before_fingerprint,manifest,source_grant_id,destination_grant_id,irreversible,inverse_of,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'planned')",params![id_bytes(&operation.id)?,batch,ordinal as i64,kind,encoding,source,destination,serde_json::to_vec(&root.stamp)?,serde_json::to_vec(&operation.manifest)?,operation.source_grant.as_ref().map(id_bytes).transpose()?,operation.destination_grant.as_ref().map(id_bytes).transpose()?,operation.kind==OperationKind::PermanentDelete,operation.managed.as_ref().and_then(|m|match m { crate::quarantine::ManagedOperation::Restore {item,..} => Some(item), _ => None }).map(id_bytes).transpose()?])?;
+                transaction.execute("INSERT INTO operations(op_id,batch_id,ordinal,kind,path_encoding,source_path,destination_path,before_fingerprint,manifest,source_grant_id,destination_grant_id,irreversible,inverse_of,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'planned')",params![id_bytes(&operation.id)?,batch,ordinal as i64,kind,encoding,source,destination,serde_json::to_vec(&root.stamp)?,serde_json::to_vec(&operation.manifest)?,operation.source_grant.as_ref().map(id_bytes).transpose()?,operation.destination_grant.as_ref().map(id_bytes).transpose()?,operation.kind==OperationKind::PermanentDelete,operation.inverse_operation().map(id_bytes).transpose()?])?;
             }
             let nonce = blake3::hash(approved.receipt_id().as_str().as_bytes());
             transaction.execute("INSERT INTO approval_audit(approval_id,batch_id,plan_digest,scope,grant_epoch,nonce_digest,issued_at_s,expires_at_s,consumed_at_s) VALUES(?1,?2,?3,'ordinary',?4,?5,?6,?7,?8)",params![id_bytes(approved.receipt_id())?,batch,digest,epoch,nonce.as_bytes(),confirmed_at,integer(preview.expires_at)?,created])?;
@@ -436,10 +436,22 @@ fn validate_operation_records(
             .cloned()
             .map(serde_json::from_value)
             .transpose()?;
-        let inverse = managed.as_ref().and_then(|m| match m {
-            crate::quarantine::ManagedOperation::Restore { item, .. } => Some(item.as_str()),
-            _ => None,
-        });
+        let reference: Option<crate::undo::InverseReference> = operation
+            .get("inverse")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        let inverse = reference
+            .as_ref()
+            .map(|r| r.operation.as_str())
+            .or_else(|| {
+                managed.as_ref().and_then(|m| match m {
+                    crate::quarantine::ManagedOperation::Restore { item, .. } => {
+                        Some(item.as_str())
+                    }
+                    _ => None,
+                })
+            });
         if inverse != record.inverse_of.as_deref() {
             return Err(E::StorageUnavailable);
         }

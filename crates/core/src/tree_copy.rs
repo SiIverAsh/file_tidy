@@ -496,7 +496,7 @@ impl Session {
         }
     }
 }
-fn tree_seal(
+pub(crate) fn tree_seal(
     dest: &crate::plan::Destination,
     proof: &[TreeEntryProof],
 ) -> Result<serde_json::Value> {
@@ -504,7 +504,7 @@ fn tree_seal(
         "proof_digest":blake3::hash(&serde_json::to_vec(proof)?).to_hex().to_string(),"metadata":dest.copy_metadata}))
 }
 
-fn validate_proof_shape(op: &PlannedOperation, proof: &[TreeEntryProof]) -> Result<()> {
+pub(crate) fn validate_proof_shape(op: &PlannedOperation, proof: &[TreeEntryProof]) -> Result<()> {
     if proof.len() != op.manifest.len() {
         return Err(E::StorageUnavailable);
     }

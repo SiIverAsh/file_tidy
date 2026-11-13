@@ -8,6 +8,42 @@ use file_tidy_core::authorization::{Id, Session};
 use file_tidy_core::plan::{OperationKind, OperationRequest, Plan, PlanOptions};
 
 #[derive(Args, Debug)]
+pub(crate) struct UndoArgs {
+    batch: Id,
+    /// 仅撤销指定操作，可重复传入
+    #[arg(long = "operation")]
+    operations: Vec<Id>,
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    include_hidden: bool,
+    #[arg(long, default_value_t = 30)]
+    retain_days: u64,
+    #[arg(long, default_value_t = 100_000)]
+    max_entries: usize,
+    #[arg(long, conflicts_with = "execute")]
+    approve: bool,
+    #[arg(long)]
+    execute: bool,
+    #[arg(long, value_enum, default_value_t = PlanFormat::Text)]
+    format: PlanFormat,
+}
+pub(crate) fn run_undo(args: UndoArgs) -> Result<u8> {
+    let mut session = Session::open(&args.state)?;
+    let plan = session.build_undo_plan(
+        &args.batch,
+        &args.operations,
+        PlanOptions {
+            include_hidden: args.include_hidden,
+            quarantine_retention_days: args.retain_days,
+            max_entries: args.max_entries,
+            ..Default::default()
+        },
+    )?;
+    review_plan(&mut session, plan, args.format, args.approve, args.execute)
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct QuarantineArgs {
     #[command(subcommand)]
     command: QuarantineCommand,

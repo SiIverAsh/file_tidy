@@ -193,8 +193,10 @@ impl OperationContentPermit {
     ) -> crate::authorization::Result<Self> {
         use crate::authorization::PlanningError as E;
         session.validate_plan_context(&approved.plan)?;
-        if operation.kind != crate::plan::OperationKind::Copy
-            || !operation.manifest.iter().any(|item| item == entry)
+        if !matches!(
+            operation.kind,
+            crate::plan::OperationKind::Copy | crate::plan::OperationKind::UndoCopy
+        ) || !operation.manifest.iter().any(|item| item == entry)
             || !approved
                 .preview()
                 .operations

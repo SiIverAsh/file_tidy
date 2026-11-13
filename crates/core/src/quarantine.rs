@@ -315,6 +315,7 @@ impl Session {
         parents: &BTreeMap<PathBuf, Stamp>,
     ) -> Result<()> {
         self.validate_plan_context(plan)?;
+        self.validate_inverse_operation(plan, op)?;
         let policy = planning_policy()?;
         let managed = op.managed.as_ref().ok_or(E::InvalidPlan)?;
         let scope = managed.scope();
@@ -323,7 +324,9 @@ impl Session {
         let destination = op.destination.as_ref().ok_or(E::InvalidPlan)?;
         let target = destination.path.to_path()?;
         let actual = match managed {
-            ManagedOperation::Quarantine(_) if op.kind == OperationKind::Quarantine => {
+            ManagedOperation::Quarantine(_)
+                if matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy) =>
+            {
                 if target != scope.payload.to_path()? || !source.starts_with(scope.root.to_path()?)
                 {
                     return Err(E::InvalidPlan);
@@ -439,7 +442,10 @@ impl Session {
         let op = preview
             .operations
             .into_iter()
-            .find(|op| &op.id == item && op.kind == OperationKind::Quarantine)
+            .find(|op| {
+                &op.id == item
+                    && matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy)
+            })
             .ok_or(E::StorageUnavailable)?;
         let scope: QuarantineScope =
             metadata(self, &item_key(item))?.ok_or(E::StorageUnavailable)?;
@@ -585,6 +591,7 @@ impl Session {
                 destination_grant: Some(self.grant_for(&parent, &policy)?.id().clone()),
                 source_grant: Some(self.grant_for(&source, &policy)?.id().clone()),
                 destination: Some(target),
+                inverse: None,
                 manifest,
                 source_parent_stamp: Stamp::capture(&platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
@@ -596,6 +603,32 @@ impl Session {
             });
         }
         self.seal_plan(operations, requests, options, Id::new()?)
+    }
+
+    pub(crate) fn rebind_quarantine(&self, op: &mut PlannedOperation, batch: &Id) -> Result<()> {
+        if let Some(ManagedOperation::Quarantine(scope)) = &mut op.managed {
+            let base = scope.root.to_path()?.join(".file-tidy/quarantine");
+            let batch_dir = base.join(batch.as_str());
+            let op_dir = batch_dir.join(op.id.as_str());
+            scope.directories[2] = ManagedDirectory {
+                path: NativePath::new(&batch_dir),
+                identity: None,
+            };
+            scope.directories[3] = ManagedDirectory {
+                path: NativePath::new(&op_dir),
+                identity: None,
+            };
+            scope.payload = NativePath::new(&op_dir.join("payload"));
+            let destination = op.destination.as_mut().ok_or(E::InvalidPlan)?;
+            destination.path = scope.payload.clone();
+            destination.create_directories = scope
+                .directories
+                .iter()
+                .filter(|d| d.identity.is_none())
+                .map(|d| d.path.clone())
+                .collect();
+        }
+        Ok(())
     }
 
     pub(crate) fn select_restores(&self, plan: &Plan, wanted: &BTreeSet<&Id>) -> Result<Plan> {
@@ -626,7 +659,7 @@ impl Session {
             .ok_or(E::StorageUnavailable)?
             .path
             .to_path()?;
-        let step = if op.kind == OperationKind::Quarantine {
+        let step = if matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy) {
             "quarantine_move"
         } else {
             "restore_move"
@@ -702,7 +735,7 @@ impl Session {
             && target_exists
             && let Some(scope) = current_scope
         {
-            let actual = if op.kind == OperationKind::Quarantine {
+            let actual = if matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy) {
                 if target != scope.payload.to_path()? {
                     return Err(E::StorageUnavailable);
                 }
@@ -733,13 +766,14 @@ impl Session {
 
     pub(crate) fn execute_managed(
         &mut self,
-        plan: &Plan,
+        approved: &crate::approval::ApprovedPlan,
         op: &PlannedOperation,
         parents: &mut BTreeMap<PathBuf, Stamp>,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), CopyFailure> {
         let mut created = false;
         let mut journal = false;
+        let plan = &approved.plan;
         let mut step = "quarantine_directory";
         let mut run = || -> Result<()> {
             let managed = op.managed.as_ref().ok_or(E::InvalidPlan)?;
@@ -796,9 +830,28 @@ impl Session {
                 self.store.as_mut().ok_or(E::StorageRequired)?.record_managed_result(&op.id, step, &json!({"directory": NativePath::new(&path), "stamp": Stamp::capture(&node)?}), OperationState::Prepared,
                     |tx| save_metadata(tx, &key, &record)).inspect_err(|_| journal = true)?;
             }
+            if op.kind == OperationKind::UndoCopy {
+                step = "undo_verify";
+                self.store
+                    .as_mut()
+                    .ok_or(E::StorageRequired)?
+                    .record_intent(&op.id, step, &json!({"inverse":op.inverse}))
+                    .inspect_err(|_| journal = true)?;
+                self.verify_undo_copy(approved, op, cancel)?;
+                self.store
+                    .as_mut()
+                    .ok_or(E::StorageRequired)?
+                    .record_result(
+                        &op.id,
+                        step,
+                        &json!({"inverse":op.inverse,"verified":true}),
+                        OperationState::Prepared,
+                    )
+                    .inspect_err(|_| journal = true)?;
+            }
             #[cfg(test)]
             faults::after_directories()?;
-            step = if op.kind == OperationKind::Quarantine {
+            step = if matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy) {
                 "quarantine_move"
             } else {
                 "restore_move"
@@ -842,7 +895,7 @@ impl Session {
                     max_entries: op.manifest.len(),
                     ..Default::default()
                 };
-                if op.kind == OperationKind::Quarantine {
+                if matches!(op.kind, OperationKind::Quarantine | OperationKind::UndoCopy) {
                     self.payload_manifest(&scope, &options)
                 } else {
                     let mut budget = op.manifest.len();

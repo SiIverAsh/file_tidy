@@ -42,6 +42,8 @@ enum Command {
     Recover(planning::RecoveryArgs),
     /// 查看隔离项与恢复文件
     Quarantine(planning::QuarantineArgs),
+    /// 审阅并撤销已完成的批次或指定操作
+    Undo(planning::UndoArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -161,6 +163,7 @@ fn run(command: Command) -> Result<u8> {
         Command::History(args) => planning::run_history(args),
         Command::Recover(args) => planning::run_recovery(args),
         Command::Quarantine(args) => planning::run_quarantine(args),
+        Command::Undo(args) => planning::run_undo(args),
     }
 }
 

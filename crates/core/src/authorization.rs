@@ -47,6 +47,12 @@ pub enum PlanningError {
     UnsupportedSafetyGuarantee,
     #[error("this operation requires a consistent database or virtual-machine snapshot")]
     ConsistencyRequired,
+    #[error("a later operation depends on this object; undo that operation first")]
+    DependentOperation,
+    #[error("this operation has already been undone")]
+    AlreadyUndone,
+    #[error("permanent deletion cannot be undone")]
+    IrreversibleOperation,
     #[error("destination does not have enough available space including reserve")]
     InsufficientSpace,
     #[error("size or counter exceeds the supported integer range")]

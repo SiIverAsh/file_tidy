@@ -12,6 +12,7 @@ pub mod quarantine;
 pub mod recovery;
 mod storage;
 mod suggestions;
+pub mod undo;
 pub use storage::{StoragePlan, StoragePreview};
 pub use suggestions::suggested_directories;
 mod content;

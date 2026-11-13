@@ -119,7 +119,7 @@ jobs:
               "--test", "authorization_plan", "--test", "plan_cli",
               "--test", "execution", "--test", "rename", "--test", "case_rename",
               "--test", "copy", "--test", "staging", "--test", "tree_copy",
-              "--test", "quarantine",
+              "--test", "quarantine", "--test", "undo",
               "--", "--include-ignored",
           ], env=environment, check=True)
           subprocess.run([

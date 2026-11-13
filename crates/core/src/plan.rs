@@ -26,6 +26,7 @@ pub enum OperationKind {
     Rename,
     Quarantine,
     Restore,
+    UndoCopy,
     PermanentDelete,
 }
 impl OperationKind {
@@ -96,6 +97,12 @@ impl Stamp {
             links: node.links,
         })
     }
+    pub(crate) fn object_key(&self) -> (&str, &str, &str) {
+        (&self.identity.volume, &self.identity.file, &self.kind)
+    }
+    pub(crate) fn same_recorded_object(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.kind == other.kind
+    }
     pub(crate) fn same_identity(&self, node: &NodeInfo) -> bool {
         node.identity.map(Identity::from).as_ref() == Some(&self.identity)
             && self.kind == format!("{:?}", node.kind)
@@ -156,6 +163,8 @@ pub struct PlannedOperation {
     pub manifest: Vec<ManifestEntry>,
     pub source_grant: Option<Id>,
     pub destination_grant: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse: Option<crate::undo::InverseReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) managed: Option<crate::quarantine::ManagedOperation>,
     pub(crate) source_parent_stamp: Stamp,
@@ -296,7 +305,10 @@ impl Session {
         let mut budget = options.max_entries;
         let batch_id = Id::new()?;
         for request in requests {
-            if request.kind == OperationKind::Restore {
+            if matches!(
+                request.kind,
+                OperationKind::Restore | OperationKind::UndoCopy
+            ) {
                 return Err(E::InvalidRequest);
             }
             let operation_id = Id::new()?;
@@ -372,11 +384,25 @@ impl Session {
                 manifest,
                 source_grant,
                 destination_grant,
+                inverse: None,
                 managed,
                 source_parent_stamp: Stamp::capture(&file_tidy_platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
                 )?)?,
             });
+        }
+        self.seal_plan(operations, resolved, options, batch_id)
+    }
+
+    pub(crate) fn seal_plan(
+        &self,
+        mut operations: Vec<PlannedOperation>,
+        resolved: Vec<OperationRequest>,
+        options: PlanOptions,
+        batch_id: Id,
+    ) -> Result<Plan> {
+        if operations.is_empty() || operations.len() > 10000 || operations.len() != resolved.len() {
+            return Err(E::InvalidRequest);
         }
         for (index, request) in resolved.iter().enumerate() {
             for other in resolved.iter().skip(index + 1) {
@@ -401,16 +427,6 @@ impl Session {
                 }
             }
         }
-        self.seal_plan(operations, resolved, options, batch_id)
-    }
-
-    pub(crate) fn seal_plan(
-        &self,
-        mut operations: Vec<PlannedOperation>,
-        resolved: Vec<OperationRequest>,
-        options: PlanOptions,
-        batch_id: Id,
-    ) -> Result<Plan> {
         let policy = planning_policy()?;
         // Sensitive names propagate across known hardlink aliases in this plan.
         let sensitive_ids: BTreeSet<_> = operations
@@ -464,8 +480,10 @@ impl Session {
                         d.parent_stamp.identity.volume != entry.stamp.identity.volume
                     });
                     if entry.kind == "Regular"
-                        && (operation.kind == OperationKind::Copy
-                            || (operation.kind == OperationKind::Move && cross_volume))
+                        && (matches!(
+                            operation.kind,
+                            OperationKind::Copy | OperationKind::UndoCopy
+                        ) || (operation.kind == OperationKind::Move && cross_volume))
                     {
                         sensitive.insert(format!("{}:{path_digest}:content", operation.id));
                     }
@@ -533,6 +551,14 @@ impl Session {
             .preview
             .operations
             .iter()
+            .any(|op| op.inverse.is_some())
+        {
+            return self.select_inverse_operations(plan, &wanted);
+        }
+        if plan
+            .preview
+            .operations
+            .iter()
             .any(|op| op.kind == OperationKind::Restore)
         {
             return self.select_restores(plan, &wanted);
@@ -585,6 +611,7 @@ impl Session {
         if operation.managed.is_some() {
             return self.validate_managed_operation(plan, operation, changed_parents);
         }
+        self.validate_inverse_operation(plan, operation)?;
         let source = operation.source.to_path()?;
         self.check_source(&source, operation.kind, &policy)?;
         let source_parent = checked_existing(source.parent().ok_or(E::InvalidPath)?, false)?;
@@ -1121,6 +1148,7 @@ impl Plan {
                 OperationKind::Rename => "重命名",
                 OperationKind::Quarantine => "移入隔离区",
                 OperationKind::Restore => "从隔离区恢复",
+                OperationKind::UndoCopy => "撤销复制并移入隔离区",
                 OperationKind::PermanentDelete => "永久删除（不可撤销）",
             };
             output.push_str(&format!(
@@ -1128,10 +1156,19 @@ impl Plan {
                 index + 1,
                 operation.source.display
             ));
-            if operation.kind == OperationKind::Quarantine {
+            if matches!(
+                operation.kind,
+                OperationKind::Quarantine | OperationKind::UndoCopy
+            ) {
                 output.push_str(&format!(
                     "\n   保留 {} 天，到期后列入提醒",
                     self.preview.options.quarantine_retention_days
+                ));
+            }
+            if let Some(inverse) = &operation.inverse {
+                output.push_str(&format!(
+                    "\n   撤销操作：{}（批次 {}）",
+                    inverse.operation, inverse.batch
                 ));
             }
             if let Some(destination) = &operation.destination {
