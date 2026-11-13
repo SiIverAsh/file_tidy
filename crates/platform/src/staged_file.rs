@@ -62,6 +62,9 @@ impl StagedFile {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
+    pub(crate) fn into_file(self) -> File {
+        self.file
+    }
     pub fn inspect(&self) -> io::Result<NodeInfo> {
         let mut info = crate::inspect_file(&self.file)?;
         info.hidden |= self

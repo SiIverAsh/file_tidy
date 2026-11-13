@@ -24,6 +24,7 @@ pub struct MetadataInventory {
     opaque_bytes: u64,
     owner_is_current: bool,
     privileged_permissions: bool,
+    native_flags: u64,
     binding: Vec<u8>,
     portable: Vec<u8>,
 }
@@ -49,6 +50,9 @@ impl MetadataInventory {
     }
     pub fn privileged_permissions(&self) -> bool {
         self.privileged_permissions
+    }
+    pub fn native_flags(&self) -> u64 {
+        self.native_flags
     }
 
     /// Identity and metadata change time bind this description to its source version.
@@ -83,6 +87,15 @@ pub fn metadata_inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metada
     }
     Ok(result)
 }
+pub(crate) fn inventory_open(path: &Path, file: &std::fs::File) -> io::Result<MetadataInventory> {
+    #[cfg(unix)]
+    {
+        let _ = file;
+        metadata_inventory(path, &crate::inspect(path)?)
+    }
+    #[cfg(windows)]
+    windows::inventory_open(path, &crate::inspect_file(file)?, file)
+}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -106,6 +119,7 @@ fn finish(
     mut attributes: Vec<MetadataAttribute>,
     owner_is_current: bool,
     privileged_permissions: bool,
+    native_flags: u64,
 ) -> io::Result<MetadataInventory> {
     attributes.sort_by(|a, b| a.name.cmp(&b.name));
     let mut portable = portable;
@@ -137,6 +151,7 @@ fn finish(
         opaque_bytes,
         owner_is_current,
         privileged_permissions,
+        native_flags,
         binding,
         portable,
     })
@@ -186,6 +201,26 @@ mod unix {
         field(&mut portable, &before.mode().to_le_bytes())?;
         field(&mut portable, &before.uid().to_le_bytes())?;
         field(&mut portable, &before.gid().to_le_bytes())?;
+        #[cfg(target_os = "linux")]
+        let native_flags = {
+            use rustix::fs::{AtFlags, StatxFlags, statx};
+            let metadata = match &file {
+                Some(file) => statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)?,
+                None => statx(
+                    rustix::fs::CWD,
+                    path,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                    StatxFlags::BASIC_STATS,
+                )?,
+            };
+            metadata.stx_attributes.bits()
+        };
+        #[cfg(target_os = "macos")]
+        let native_flags = u64::from(before.st_flags());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let native_flags = 0;
+        #[cfg(target_os = "linux")]
+        field(&mut portable, &native_flags.to_le_bytes())?;
         #[cfg(target_os = "macos")]
         field(&mut portable, &before.st_flags().to_le_bytes())?;
         #[cfg(target_os = "macos")]
@@ -251,6 +286,7 @@ mod unix {
             attributes,
             before.uid() == rustix::process::geteuid().as_raw(),
             privileged,
+            native_flags,
         )
     }
     #[cfg(target_os = "macos")]

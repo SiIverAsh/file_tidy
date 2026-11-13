@@ -17,6 +17,8 @@ mod metadata_inventory;
 pub use metadata_inventory::{
     MetadataAttribute, MetadataAttributeKind, MetadataInventory, metadata_inventory,
 };
+mod migration;
+pub use migration::{MigrationData, MigrationFile, check_migration_metadata, visit_migration_data};
 mod removal;
 pub use removal::{RemovalError, remove_verified};
 mod staged_directory;

@@ -271,10 +271,21 @@ pub(super) fn inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metadata
     }
     // SAFETY: successful CreateFileW transferred ownership of this live handle.
     let file = unsafe { File::from_raw_handle(handle) };
-    if !expected.matches(&crate::inspect_file(&file)?) {
+    inventory_open(path, expected, &file)
+}
+pub(super) fn inventory_open(
+    path: &Path,
+    expected: &NodeInfo,
+    file: &File,
+) -> io::Result<MetadataInventory> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("metadata parent required"))?;
+    let before_parent = crate::inspect(parent)?;
+    if !expected.matches(&crate::inspect_file(file)?) {
         return Err(invalid("metadata handle does not match source"));
     }
-    let before = basic(&file)?;
+    let before = basic(file)?;
     let mut portable = Vec::new();
     field(&mut portable, &before.FileAttributes.to_le_bytes())?;
     let mut flags = 0u32;
@@ -295,12 +306,12 @@ pub(super) fn inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metadata
         return Err(io::Error::last_os_error());
     }
     let owner_is_current = if flags & FILE_PERSISTENT_ACLS != 0 {
-        security(&file, &mut portable)?
+        security(file, &mut portable)?
     } else {
         true
     };
     let mut attributes = if flags & FILE_NAMED_STREAMS != 0 {
-        streams(&file)?
+        streams(file)?
     } else {
         Vec::new()
     };
@@ -332,10 +343,10 @@ pub(super) fn inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metadata
             });
         }
     }
-    let after = basic(&file)?;
+    let after = basic(file)?;
     if before.ChangeTime != after.ChangeTime
         || before.FileAttributes != after.FileAttributes
-        || !expected.matches(&crate::inspect_file(&file)?)
+        || !expected.matches(&crate::inspect_file(file)?)
         || before_parent.identity != crate::inspect(parent)?.identity
     {
         return Err(invalid("metadata source changed during inspection"));
@@ -347,5 +358,6 @@ pub(super) fn inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metadata
         attributes,
         owner_is_current,
         false,
+        u64::from(before.FileAttributes),
     )
 }
