@@ -137,9 +137,16 @@ impl MigrationFile {
         self.verify()?;
         if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
             != expected.binding_bytes()
-            || self.metadata()?.portable_bytes() != expected.portable_bytes()
         {
-            return Err(unsupported("migration metadata could not be preserved"));
+            return Err(invalid("source metadata changed during transfer"));
+        }
+        let actual = self.metadata()?;
+        if actual.portable_bytes() != expected.portable_bytes() {
+            let part = metadata_difference(expected.portable_bytes(), actual.portable_bytes());
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("migration metadata field {part} could not be preserved"),
+            ));
         }
         Ok(())
     }
@@ -233,4 +240,26 @@ fn invalid(message: &'static str) -> io::Error {
 }
 fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
+}
+fn metadata_difference(mut source: &[u8], mut target: &[u8]) -> usize {
+    let mut field = 0;
+    while !source.is_empty() && !target.is_empty() {
+        let next = |value: &[u8]| -> Option<usize> {
+            let header: [u8; 8] = value.get(..8)?.try_into().ok()?;
+            usize::try_from(u64::from_le_bytes(header))
+                .ok()?
+                .checked_add(8)
+                .filter(|length| *length <= value.len())
+        };
+        let (Some(a), Some(b)) = (next(source), next(target)) else {
+            return field;
+        };
+        if source[..a] != target[..b] {
+            return field;
+        }
+        source = &source[a..];
+        target = &target[b..];
+        field += 1;
+    }
+    field
 }

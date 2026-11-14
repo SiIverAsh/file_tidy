@@ -94,7 +94,7 @@ pub(crate) fn inventory_open(path: &Path, file: &std::fs::File) -> io::Result<Me
         metadata_inventory(path, &crate::inspect(path)?)
     }
     #[cfg(windows)]
-    windows::inventory_open(path, &crate::inspect_file(file)?, file)
+    windows::inventory_open(path, &crate::inspect(path)?, file)
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)

@@ -66,7 +66,7 @@ fn attached(source: &Path, value: &[u8]) -> TestResult {
 fn migration_preserves_body_permissions_and_attached_data_before_publication() -> TestResult {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().canonicalize()?;
-    let source = root.join("source");
+    let source = root.join(".env");
     let body = [vec![0u8; 65536], vec![41u8; 150000], vec![0u8; 65536]].concat();
     std::fs::write(&source, &body)?;
     attached(&source, b"migration-attached-value")?;
