@@ -7,8 +7,9 @@ use std::ptr;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FILE_LINK_INFORMATION, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileLinkInformation, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -68,6 +69,55 @@ fn source_handle_with_access(parent: &File, name: &OsStr, access: u32) -> io::Re
 fn nt_error(status: i32) -> io::Error {
     // SAFETY: status conversion has no pointer arguments or retained state.
     io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+}
+
+pub(crate) fn link_open_file(source: &File, parent: &File, name: &OsStr) -> io::Result<()> {
+    let units = name.encode_wide().collect::<Vec<_>>();
+    if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
+        return Err(invalid("invalid native link component"));
+    }
+    let name_bytes = units
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| invalid("link name too long"))?;
+    let allocation_bytes = size_of::<FILE_LINK_INFORMATION>()
+        .checked_add(name_bytes)
+        .ok_or_else(|| invalid("link name too long"))?;
+    let native_bytes =
+        u32::try_from(allocation_bytes).map_err(|_| invalid("link name too long"))?;
+    let mut allocation = vec![0usize; allocation_bytes.div_ceil(size_of::<usize>())];
+    let information = allocation.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+    // SAFETY: aligned zeroed storage covers the header and native name. The
+    // default false ReplaceIfExists excludes replacement. Both handles and all
+    // buffers stay live through this synchronous handle-relative request.
+    unsafe {
+        (*information).RootDirectory = parent.as_raw_handle();
+        (*information).FileNameLength = name_bytes as u32;
+        ptr::copy_nonoverlapping(
+            units.as_ptr(),
+            information
+                .cast::<u8>()
+                .add(offset_of!(FILE_LINK_INFORMATION, FileName))
+                .cast::<u16>(),
+            units.len(),
+        );
+    }
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: a live identified regular source and pinned destination directory
+    // are borrowed with the correctly sized initialized link-information buffer.
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut status_block,
+            information.cast(),
+            native_bytes,
+            FileLinkInformation,
+        )
+    };
+    if status < 0 {
+        return Err(nt_error(status));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

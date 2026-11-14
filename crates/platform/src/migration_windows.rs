@@ -28,6 +28,7 @@ fn native_error(action: &'static str) -> io::Error {
 
 pub(super) fn check_metadata(metadata: &MetadataInventory) -> io::Result<()> {
     let supported = FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_DIRECTORY
         | FILE_ATTRIBUTE_HIDDEN
         | FILE_ATTRIBUTE_SYSTEM
         | FILE_ATTRIBUTE_ARCHIVE
@@ -474,9 +475,30 @@ pub(super) fn copy(
     metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
+    copy_payload(source, target, metadata, check, false)
+}
+
+pub(super) fn copy_directory_metadata(
+    source: &File,
+    target: &mut File,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    copy_payload(source, target, metadata, check, true)
+}
+
+fn copy_payload(
+    source: &File,
+    target: &mut File,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+    directory: bool,
+) -> io::Result<()> {
     let mut source = source.try_clone()?;
-    source.seek(SeekFrom::Start(0))?;
-    target.seek(SeekFrom::Start(0))?;
+    if !directory {
+        source.seek(SeekFrom::Start(0))?;
+        target.seek(SeekFrom::Start(0))?;
+    }
     let security_target = target.try_clone()?;
     if metadata.native_flags() & u64::from(FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
         control(&security_target, FSCTL_SET_SPARSE, &[], &mut [])?;
@@ -493,6 +515,9 @@ pub(super) fn copy(
         check()?;
         header(&mut reader)?
     } {
+        if directory && matches!(header.kind, DATA | SPARSE) {
+            return Err(invalid("directory backup contains a regular data stream"));
+        }
         writer.push(&header.raw)?;
         writer.push(&header.encoded_name)?;
         let mut remaining = header.length;
@@ -546,7 +571,9 @@ pub(super) fn visit(
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
+    if !file.metadata()?.is_dir() {
+        file.seek(SeekFrom::Start(0))?;
+    }
     let mut reader = Reader::new(file);
     let mut buffer = [0u8; 65536];
     while let Some(header) = {

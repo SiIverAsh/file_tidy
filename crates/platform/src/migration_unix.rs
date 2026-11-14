@@ -40,7 +40,12 @@ pub(super) fn copy(
 ) -> io::Result<()> {
     check()?;
     #[cfg(target_os = "macos")]
-    darwin_copy(source, target, check)?;
+    darwin_copy(
+        source,
+        target,
+        libc::COPYFILE_METADATA | libc::COPYFILE_DATA | libc::COPYFILE_DATA_SPARSE,
+        check,
+    )?;
     #[cfg(not(target_os = "macos"))]
     {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -74,49 +79,78 @@ pub(super) fn copy(
             return Err(invalid("source length changed during migration"));
         }
         target.set_len(length)?;
-        let stat = source.metadata()?;
-        if target.metadata()?.gid() != stat.gid() {
-            rustix::fs::fchown(
-                &*target,
-                None,
-                Some(rustix::process::Gid::from_raw(stat.gid())),
-            )?;
-        }
-        let names = names(target)?;
-        for name in names {
-            check()?;
-            if !metadata.attributes().iter().any(|a| a.name == name) {
-                rustix::fs::fremovexattr(&*target, &name)?;
-            }
-        }
-        let mut attributes = metadata.attributes().iter().collect::<Vec<_>>();
-        attributes.sort_by_key(|attribute| attribute.name == "system.posix_acl_access");
-        for attribute in attributes {
-            check()?;
-            let mut value = vec![
-                0u8;
-                usize::try_from(attribute.bytes)
-                    .map_err(|_| invalid("attribute length overflow"))?
-            ];
-            let used = rustix::fs::fgetxattr(source, &attribute.name, value.as_mut_slice())?;
-            if used != value.len() {
-                return Err(invalid("attribute changed during migration"));
-            }
-            rustix::fs::fsetxattr(
-                &*target,
-                &attribute.name,
-                &value,
-                rustix::fs::XattrFlags::empty(),
-            )?;
-        }
-        rustix::fs::fchmod(
-            &*target,
-            rustix::fs::Mode::from_raw_mode(stat.mode() & 0o1777),
-        )?;
-        target.set_times(std::fs::FileTimes::new().set_modified(stat.modified()?))?;
+        copy_permissions_and_attributes(source, target, metadata, check)?;
     }
     let _ = metadata;
     check()
+}
+
+pub(super) fn copy_directory_metadata(
+    source: &File,
+    target: &mut File,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    check()?;
+    #[cfg(target_os = "macos")]
+    darwin_copy(source, target, libc::COPYFILE_METADATA, check)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        copy_inode_flags(source, target)?;
+        copy_permissions_and_attributes(source, target, metadata, check)?;
+    }
+    let _ = metadata;
+    check()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_permissions_and_attributes(
+    source: &File,
+    target: &File,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    let stat = source.metadata()?;
+    if target.metadata()?.gid() != stat.gid() {
+        rustix::fs::fchown(
+            target,
+            None,
+            Some(rustix::process::Gid::from_raw(stat.gid())),
+        )?;
+    }
+    for name in names(target)? {
+        check()?;
+        if !metadata.attributes().iter().any(|a| a.name == name) {
+            rustix::fs::fremovexattr(target, &name)?;
+        }
+    }
+    let mut attributes = metadata.attributes().iter().collect::<Vec<_>>();
+    attributes.sort_by_key(|attribute| attribute.name == "system.posix_acl_access");
+    for attribute in attributes {
+        check()?;
+        let mut value = vec![
+            0u8;
+            usize::try_from(attribute.bytes)
+                .map_err(|_| invalid("attribute length overflow"))?
+        ];
+        let used = rustix::fs::fgetxattr(source, &attribute.name, value.as_mut_slice())?;
+        if used != value.len() {
+            return Err(invalid("attribute changed during migration"));
+        }
+        rustix::fs::fsetxattr(
+            target,
+            &attribute.name,
+            &value,
+            rustix::fs::XattrFlags::empty(),
+        )?;
+    }
+    rustix::fs::fchmod(
+        target,
+        rustix::fs::Mode::from_raw_mode(stat.mode() & 0o1777),
+    )?;
+    target.set_times(std::fs::FileTimes::new().set_modified(stat.modified()?))?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -131,7 +165,13 @@ fn copy_inode_flags(source: &File, target: &File) -> io::Result<()> {
         Err(rustix::io::Errno::NOTTY | rustix::io::Errno::NOTSUP) => 0,
         Err(error) => return Err(error.into()),
     };
-    if flags & !(USER | EXTENTS) != 0 {
+    let representation = EXTENTS
+        | if source.metadata()?.is_dir() {
+            0x1000
+        } else {
+            0
+        };
+    if flags & !(USER | representation) != 0 {
         return Err(unsupported("source inode flags cannot be preserved"));
     }
     match ioctl_getflags(target) {
@@ -255,6 +295,7 @@ fn visit_fork(
 fn darwin_copy(
     source: &File,
     target: &File,
+    flags: libc::copyfile_flags_t,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
     use std::ffi::c_void;
@@ -327,17 +368,10 @@ fn darwin_copy(
     if !setup {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: both descriptors are live regular files. The destination lies in
-    // the private envelope; ALL includes ACL, stat, xattrs and data, with sparse
-    // copying enabled. No MOVE or UNLINK option is used.
-    let result = unsafe {
-        libc::fcopyfile(
-            source.as_raw_fd(),
-            target.as_raw_fd(),
-            state.0,
-            libc::COPYFILE_METADATA | libc::COPYFILE_DATA | libc::COPYFILE_DATA_SPARSE,
-        )
-    };
+    // SAFETY: both identified descriptors are live. The destination lies in a
+    // private envelope. Directory calls select metadata alone; regular-file
+    // calls also select sparse data. No recursive, MOVE or UNLINK flag is used.
+    let result = unsafe { libc::fcopyfile(source.as_raw_fd(), target.as_raw_fd(), state.0, flags) };
     let native_error = io::Error::last_os_error();
     if let Some(error) = context
         .error

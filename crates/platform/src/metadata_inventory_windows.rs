@@ -292,7 +292,10 @@ pub(super) fn inventory(path: &Path, expected: &NodeInfo) -> io::Result<Metadata
         .parent()
         .ok_or_else(|| invalid("metadata parent required"))?;
     let before_parent = crate::inspect(parent)?;
-    let _guard = crate::open_directory_pinned(parent, &before_parent)?;
+    let _guard = crate::windows::open_metadata_directory(parent)?;
+    if crate::inspect_file(&_guard.0)?.identity != before_parent.identity {
+        return Err(invalid("metadata parent changed before opening"));
+    }
     let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if wide.contains(&0) {
         return Err(invalid("metadata path contains NUL"));

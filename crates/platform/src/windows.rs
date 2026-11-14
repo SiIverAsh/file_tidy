@@ -238,14 +238,23 @@ pub(crate) fn read_directory_using_pin(
 }
 
 pub(crate) fn open_pinned(path: &Path, directory: bool) -> io::Result<(File, Vec<File>)> {
-    open_pinned_impl(path, directory, false)
+    open_pinned_impl(path, directory, false, false)
 }
 
 pub(crate) fn open_state_directory(path: &Path) -> io::Result<(File, Vec<File>)> {
-    open_pinned_impl(path, true, true)
+    open_pinned_impl(path, true, true, false)
 }
 
-fn open_pinned_impl(path: &Path, directory: bool, state: bool) -> io::Result<(File, Vec<File>)> {
+pub(crate) fn open_metadata_directory(path: &Path) -> io::Result<(File, Vec<File>)> {
+    open_pinned_impl(path, true, false, true)
+}
+
+fn open_pinned_impl(
+    path: &Path,
+    directory: bool,
+    state: bool,
+    metadata: bool,
+) -> io::Result<(File, Vec<File>)> {
     let mut prefix = PathBuf::new();
     let mut guards = Vec::<File>::new();
     let mut components = path.components().peekable();
@@ -294,7 +303,7 @@ fn open_pinned_impl(path: &Path, directory: bool, state: bool) -> io::Result<(Fi
         };
         let file = OpenOptions::new()
             .access_mode(access)
-            .share_mode(if state {
+            .share_mode(if state || metadata {
                 FILE_SHARE_READ | FILE_SHARE_WRITE
             } else {
                 FILE_SHARE_READ

@@ -17,15 +17,37 @@ pub struct StagedDirectory {
 }
 impl StagedDirectory {
     pub fn create(parent_path: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
+        Self::create_impl(parent_path, expected, name, false)
+    }
+    pub(crate) fn create_migration_payload(
+        parent_path: &Path,
+        expected: &NodeInfo,
+        name: &OsStr,
+    ) -> io::Result<Self> {
+        Self::create_impl(parent_path, expected, name, true)
+    }
+    fn create_impl(
+        parent_path: &Path,
+        expected: &NodeInfo,
+        name: &OsStr,
+        migration: bool,
+    ) -> io::Result<Self> {
         crate::staged_file::component(name)?;
         let parent = crate::open_directory_pinned(parent_path, expected)?;
         #[cfg(unix)]
-        let root = crate::create_private_directory(&parent, name)?;
+        let root = {
+            let _ = migration;
+            crate::create_private_directory(&parent, name)?
+        };
         #[cfg(windows)]
-        let root = crate::private_storage::create_staged_directory_handle(
-            &parent.try_clone_file()?,
-            name,
-        )?;
+        let root = if migration {
+            crate::private_storage::create_migration_directory_handle(
+                &parent.try_clone_file()?,
+                name,
+            )?
+        } else {
+            crate::private_storage::create_staged_directory_handle(&parent.try_clone_file()?, name)?
+        };
         let identity = crate::inspect_file(&root)?
             .identity
             .ok_or_else(|| io::Error::other("directory identity unavailable"))?;
@@ -70,7 +92,7 @@ impl StagedDirectory {
         }
         crate::verify_private_file(&self.root, true)
     }
-    fn directory(&self, relative: &Path) -> io::Result<PinnedDirectory> {
+    pub(crate) fn directory(&self, relative: &Path) -> io::Result<PinnedDirectory> {
         relative_path(relative)?;
         self.verify()?;
         let mut file = self.root.try_clone()?;
@@ -174,6 +196,50 @@ impl StagedDirectory {
                 .file_name()
                 .ok_or_else(|| io::Error::other("child name required"))?,
         )
+    }
+    pub(crate) fn migration_file(&self, relative: &Path) -> io::Result<File> {
+        relative_path(relative)?;
+        let parent = self.directory(
+            relative
+                .parent()
+                .ok_or_else(|| io::Error::other("child path required"))?,
+        )?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| io::Error::other("child name required"))?;
+        #[cfg(unix)]
+        return crate::create_private_file(&parent, name);
+        #[cfg(windows)]
+        return crate::private_storage::create_migration_handle(&parent.try_clone_file()?, name);
+    }
+    pub(crate) fn migration_directory(&self, relative: &Path) -> io::Result<File> {
+        relative_path(relative)?;
+        if relative.as_os_str().is_empty() {
+            self.verify()?;
+            return self.root.try_clone();
+        }
+        let parent = self.directory(
+            relative
+                .parent()
+                .ok_or_else(|| io::Error::other("child path required"))?,
+        )?;
+        #[cfg(unix)]
+        let file = self.directory(relative)?.try_clone_file()?;
+        #[cfg(windows)]
+        let file = crate::private_storage::open_migration_directory_handle(
+            &parent.try_clone_file()?,
+            relative
+                .file_name()
+                .ok_or_else(|| io::Error::other("child name required"))?,
+        )?;
+        let _ = parent;
+        if crate::inspect_file(&file)?.identity.as_ref() != self.directories.get(relative) {
+            return Err(io::Error::other("migration directory changed"));
+        }
+        Ok(file)
+    }
+    pub(crate) fn into_migration_root(self) -> File {
+        self.root
     }
     #[cfg(windows)]
     pub(crate) fn create_migration_file(&self) -> io::Result<File> {

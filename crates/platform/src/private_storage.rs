@@ -139,6 +139,16 @@ pub(crate) fn create_migration_handle(parent: &File, name: &OsStr) -> io::Result
 }
 
 #[cfg(windows)]
+pub(crate) fn create_migration_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::create_migration_directory(parent, name)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_migration_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    windows::open_migration_directory(parent, name)
+}
+
+#[cfg(windows)]
 pub(crate) fn create_staged_directory_handle(parent: &File, name: &OsStr) -> io::Result<File> {
     windows::create_staged_directory(parent, name)
 }

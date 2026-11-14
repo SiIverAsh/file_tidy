@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 #[path = "migration_unix.rs"]
 mod native;
 
+#[path = "migration_directory.rs"]
+mod directory;
+pub use directory::{MigrationDirectory, MigrationTreeFile, open_directory_attached_data};
+
 #[cfg(windows)]
 pub(crate) use native::AccessSnapshot;
 #[cfg(windows)]
@@ -127,8 +131,7 @@ impl MigrationFile {
         let parent = source_path
             .parent()
             .ok_or_else(|| invalid("source parent missing"))?;
-        let parent_info = crate::inspect(parent)?;
-        let _guard = crate::open_directory_pinned(parent, &parent_info)?;
+        let _guard = pin_metadata_parent(parent)?;
         if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
             != expected.binding_bytes()
         {
@@ -223,7 +226,7 @@ pub fn visit_migration_data(
     let parent = source_path
         .parent()
         .ok_or_else(|| invalid("source parent missing"))?;
-    let _guard = crate::open_directory_pinned(parent, &crate::inspect(parent)?)?;
+    let _guard = pin_metadata_parent(parent)?;
     if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
         != expected.binding_bytes()
     {
@@ -243,6 +246,15 @@ fn invalid(message: &'static str) -> io::Error {
 }
 fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
+}
+
+#[cfg(unix)]
+fn pin_metadata_parent(path: &Path) -> io::Result<crate::PinnedDirectory> {
+    crate::open_directory_pinned(path, &crate::inspect(path)?)
+}
+#[cfg(windows)]
+fn pin_metadata_parent(path: &Path) -> io::Result<(File, Vec<File>)> {
+    crate::windows::open_metadata_directory(path)
 }
 pub(crate) fn metadata_difference(mut source: &[u8], mut target: &[u8]) -> usize {
     let mut field = 0;

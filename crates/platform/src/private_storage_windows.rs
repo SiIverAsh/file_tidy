@@ -121,6 +121,23 @@ pub(super) fn create_staged_file(parent: &File, name: &OsStr) -> io::Result<File
 pub(super) fn create_migration_file(parent: &File, name: &OsStr) -> io::Result<File> {
     create_object(parent, name, false, true, WRITE_DAC | WRITE_OWNER)
 }
+pub(super) fn create_migration_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    create_object(
+        parent,
+        name,
+        true,
+        true,
+        WRITE_DAC | WRITE_OWNER | FILE_READ_EA | FILE_WRITE_EA,
+    )
+}
+pub(super) fn open_migration_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_staged_object_with_access(
+        parent,
+        name,
+        true,
+        WRITE_DAC | WRITE_OWNER | FILE_READ_EA | FILE_WRITE_EA,
+    )
+}
 fn create_object(
     parent: &File,
     name: &OsStr,
@@ -303,6 +320,14 @@ pub(super) fn open_staged_link(parent: &File, name: &OsStr) -> io::Result<File> 
     open_staged_object(parent, name, false)
 }
 fn open_staged_object(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+    open_staged_object_with_access(parent, name, directory, 0)
+}
+fn open_staged_object_with_access(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    extra_access: u32,
+) -> io::Result<File> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
     let mut units: Vec<u16> = name.encode_wide().collect();
     if units.is_empty() || units.iter().any(|u| matches!(u, 0 | 58 | 47 | 92)) {
@@ -337,7 +362,8 @@ fn open_staged_object(parent: &File, name: &OsStr, directory: bool) -> io::Resul
             }) | FILE_READ_ATTRIBUTES
                 | FILE_WRITE_ATTRIBUTES
                 | READ_CONTROL
-                | SYNCHRONIZE,
+                | SYNCHRONIZE
+                | extra_access,
             &attrs,
             &mut ios,
             ptr::null(),

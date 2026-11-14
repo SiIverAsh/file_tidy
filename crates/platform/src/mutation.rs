@@ -459,6 +459,15 @@ pub(crate) fn publish_open_file(
 }
 
 #[cfg(windows)]
+pub(crate) fn link_open_file(
+    source: &std::fs::File,
+    parent: &std::fs::File,
+    name: &OsStr,
+) -> io::Result<()> {
+    windows::link_open_file(source, parent, name)
+}
+
+#[cfg(windows)]
 pub(crate) fn open_mutation_source(
     parent: &std::fs::File,
     name: &OsStr,
