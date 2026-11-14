@@ -86,7 +86,7 @@ fn current_owner(owner: PSID) -> io::Result<bool> {
     Ok(!owner.is_null()
         && unsafe { EqualSid(owner, (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid) } != 0)
 }
-fn security(file: &File, output: &mut Vec<u8>) -> io::Result<bool> {
+fn security(file: &File, output: &mut Vec<u8>) -> io::Result<(bool, Vec<u8>)> {
     let mut owner = ptr::null_mut();
     let mut group = ptr::null_mut();
     let mut dacl = ptr::null_mut();
@@ -113,6 +113,7 @@ fn security(file: &File, output: &mut Vec<u8>) -> io::Result<bool> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let _owned = LocalDescriptor(descriptor);
+    let mut version = Vec::new();
     for sid in [owner, group] {
         let bytes = if sid.is_null() {
             &[][..]
@@ -126,6 +127,7 @@ fn security(file: &File, output: &mut Vec<u8>) -> io::Result<bool> {
             unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }
         };
         field(output, bytes)?;
+        field(&mut version, bytes)?;
     }
     for acl in [dacl, label] {
         let bytes = if acl.is_null() {
@@ -139,7 +141,8 @@ fn security(file: &File, output: &mut Vec<u8>) -> io::Result<bool> {
             // SAFETY: GetSecurityInfo initialized the complete ACL of AclSize bytes.
             unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), length) }
         };
-        field(output, bytes)?;
+        field(&mut version, bytes)?;
+        field(output, &canonical_acl(acl)?)?;
     }
     let mut control = 0u16;
     let mut revision = 0u32;
@@ -147,8 +150,50 @@ fn security(file: &File, output: &mut Vec<u8>) -> io::Result<bool> {
     if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    field(output, &control.to_le_bytes())?;
-    current_owner(owner)
+    field(&mut version, &control.to_le_bytes())?;
+    Ok((current_owner(owner)?, version))
+}
+fn canonical_acl(acl: *mut ACL) -> io::Result<Vec<u8>> {
+    if acl.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: GetSecurityInfo owns this valid ACL until its descriptor is freed.
+    let header = unsafe { &*acl };
+    let start = acl as usize;
+    let end = start
+        .checked_add(header.AclSize as usize)
+        .ok_or_else(|| invalid("ACL size overflow"))?;
+    let mut result = Vec::new();
+    field(&mut result, &header.AceCount.to_le_bytes())?;
+    for index in 0..header.AceCount {
+        let mut entry = ptr::null_mut();
+        // SAFETY: acl is live and entry is an initialized output pointer slot.
+        if unsafe { GetAce(acl, u32::from(index), &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let address = entry as usize;
+        if address < start
+            || address
+                .checked_add(std::mem::size_of::<ACE_HEADER>())
+                .is_none_or(|n| n > end)
+        {
+            return Err(invalid("ACE header exceeds ACL"));
+        }
+        // SAFETY: the header lies inside the validated live ACL allocation.
+        let size = unsafe { (*entry.cast::<ACE_HEADER>()).AceSize } as usize;
+        if size < std::mem::size_of::<ACE_HEADER>()
+            || address.checked_add(size).is_none_or(|n| n > end)
+        {
+            return Err(invalid("ACE exceeds ACL"));
+        }
+        // SAFETY: entry covers exactly size initialized bytes within the ACL.
+        let mut bytes = unsafe { std::slice::from_raw_parts(entry.cast::<u8>(), size) }.to_vec();
+        // Origin bookkeeping is bound in version; portable access rules retain
+        // ACE order, masks, SIDs, conditions and propagation flags.
+        bytes[1] &= !(INHERITED_ACE as u8);
+        field(&mut result, &bytes)?;
+    }
+    Ok(result)
 }
 fn streams(file: &File) -> io::Result<Vec<MetadataAttribute>> {
     let mut capacity = 4096usize;
@@ -305,10 +350,10 @@ pub(super) fn inventory_open(
     {
         return Err(io::Error::last_os_error());
     }
-    let owner_is_current = if flags & FILE_PERSISTENT_ACLS != 0 {
+    let (owner_is_current, security_version) = if flags & FILE_PERSISTENT_ACLS != 0 {
         security(file, &mut portable)?
     } else {
-        true
+        (true, Vec::new())
     };
     let mut attributes = if flags & FILE_NAMED_STREAMS != 0 {
         streams(file)?
@@ -354,7 +399,11 @@ pub(super) fn inventory_open(
     finish(
         expected,
         portable,
-        &before.ChangeTime.to_le_bytes(),
+        &[
+            before.ChangeTime.to_le_bytes().as_slice(),
+            security_version.as_slice(),
+        ]
+        .concat(),
         attributes,
         owner_is_current,
         false,

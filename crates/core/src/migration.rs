@@ -63,6 +63,8 @@ pub(crate) struct MigrationScope {
     pub(crate) capture: QuarantineScope,
     pub(crate) metadata: MetadataDescription,
     preservation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acl_inheritance: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -403,6 +405,7 @@ impl Session {
             capture,
             metadata: MetadataDescription::capture(&metadata),
             preservation: "native_permissions_and_attached_data".into(),
+            acl_inheritance: cfg!(windows).then(|| "preserve_source_rules".into()),
         });
         Ok(())
     }
@@ -422,6 +425,7 @@ impl Session {
             || op.manifest[0].kind != "Regular"
             || op.manifest[0].path != op.source
             || scope.preservation != "native_permissions_and_attached_data"
+            || scope.acl_inheritance.as_deref() != cfg!(windows).then_some("preserve_source_rules")
         {
             return Err(E::InvalidPlan);
         }

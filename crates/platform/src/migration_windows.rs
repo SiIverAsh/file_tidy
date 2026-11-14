@@ -4,6 +4,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawHandle;
 use std::ptr;
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+};
+use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -327,6 +332,99 @@ fn control(file: &File, code: u32, input: &[u8], output: &mut [u8]) -> io::Resul
     }
     Ok(())
 }
+fn restore_access(source: &File, target: &File) -> io::Result<()> {
+    struct Descriptor(*mut c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocated this unique descriptor with LocalAlloc.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut label = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let information = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION;
+    // SAFETY: all output slots are initialized; the descriptor retains SID/ACL
+    // storage until after the synchronous restore call below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut label,
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _owned = Descriptor(descriptor);
+    let mut storage = Vec::<u64>::new();
+    if !dacl.is_null() {
+        // SAFETY: dacl points into the live descriptor returned by the API.
+        let size = unsafe { (*dacl).AclSize } as usize;
+        if size < std::mem::size_of::<ACL>() {
+            return Err(invalid("ACL header truncated"));
+        }
+        storage.resize(size.div_ceil(8), 0);
+        // SAFETY: aligned storage covers the complete validated source ACL.
+        unsafe {
+            ptr::copy_nonoverlapping(dacl.cast::<u8>(), storage.as_mut_ptr().cast::<u8>(), size);
+        }
+        dacl = storage.as_mut_ptr().cast::<ACL>();
+        // SAFETY: the copied header and all ACEs lie in this live owned buffer.
+        let count = unsafe { (*dacl).AceCount };
+        for index in 0..count {
+            let mut entry = ptr::null_mut();
+            // SAFETY: GetAce validates the index against this copied ACL.
+            if unsafe { GetAce(dacl, u32::from(index), &mut entry) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let address = entry as usize;
+            let start = storage.as_ptr() as usize;
+            if address < start
+                || address
+                    .checked_add(std::mem::size_of::<ACE_HEADER>())
+                    .is_none_or(|n| n > start + size)
+            {
+                return Err(invalid("ACE header exceeds copied ACL"));
+            }
+            // SAFETY: the header is inside owned aligned ACL storage. Only the
+            // inherited-origin marker changes; every access rule stays intact.
+            unsafe {
+                (*entry.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8);
+            }
+        }
+    }
+    // SAFETY: SIDs and label remain in _owned, dacl is null or points to aligned
+    // owned storage. The private payload handle has WRITE_DAC/WRITE_OWNER. A
+    // protected DACL freezes the restored source rules during publication.
+    let status = unsafe {
+        SetSecurityInfo(
+            target.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            group,
+            dacl,
+            label,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
 pub(super) fn copy(
     source: &File,
     target: &mut File,
@@ -365,6 +463,7 @@ pub(super) fn copy(
     }
     writer.finish()?;
     drop(reader);
+    restore_access(&source, &security_target)?;
     let mut basic = FILE_BASIC_INFO::default();
     // SAFETY: both live handles are synchronous and basic is an aligned,
     // correctly sized input/output object for these metadata requests.
