@@ -258,6 +258,9 @@ pub struct QueryScanEntriesRequest {
     pub sort: SortField,
     pub offset: usize,
     pub limit: usize,
+    /// Only limit the presentation query; selection filters keep their existing scope.
+    #[serde(default)]
+    pub tree_roots_only: bool,
 }
 
 #[derive(Serialize)]
@@ -444,9 +447,26 @@ pub fn filter_entries<'a>(
         ScanTab::Skipped => Vec::new(),
     };
 
+    let hidden_directories: BTreeSet<&Path> = if filter.hide_hidden {
+        report
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Directory && entry.hidden)
+            .map(|entry| entry.path.as_path())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let search = filter.search_text.trim().to_ascii_lowercase();
     base.retain(|entry| {
-        if filter.hide_hidden && entry.hidden {
+        if filter.hide_hidden
+            && (entry.hidden
+                || entry
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| hidden_directories.contains(parent)))
+        {
             return false;
         }
         if !search.is_empty() {

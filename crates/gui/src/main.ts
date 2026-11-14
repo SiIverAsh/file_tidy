@@ -1,9 +1,10 @@
 import "./styles/main.css";
 import { tauriApi, type ApiClient } from "./api/tauri.ts";
-import type { BuildPlanRequest, PlanPreviewDto } from "./api/types.ts";
+import type { BuildPlanRequest, PlanPreviewDto, ScanFilter, SortField } from "./api/types.ts";
 import { PermanentDeleteModal } from "./components/permanent-modal.ts";
 import { ReviewDrawer } from "./components/review-drawer.ts";
 import { clearChildren, el } from "./components/safe-text.ts";
+import { isTreeBrowseFilter } from "./components/entry-tree.ts";
 import {
   AppStore,
   clearSelection,
@@ -42,6 +43,7 @@ export class FileTidyApp {
 
   private renameResolver: ((name: string | null) => void) | null = null;
   private activeViewMounted: MainView | null = null;
+  private exploreReloadSeq = 0;
 
   constructor(root: HTMLElement, api: ApiClient = tauriApi) {
     this.root = root;
@@ -93,16 +95,43 @@ export class FileTidyApp {
         if (!gen) {
           return { totalCount: 0, entries: [] };
         }
+        const filter = { ...this.store.state.scanFilter };
+        const sort = this.store.state.scanSort;
         const res = await this.api.queryScanEntries({
           scan_generation: gen,
-          filter: this.store.state.scanFilter,
-          sort: this.store.state.scanSort,
+          filter,
+          sort,
           offset,
           limit,
         });
-        this.store.state.totalFilteredCount = res.total_count;
-        this.store.notify();
+        if (this.isCurrentExploreQuery(gen, filter, sort)) {
+          this.store.state.totalFilteredCount = res.total_count;
+          this.store.notify();
+        }
         return { totalCount: res.total_count, entries: res.entries };
+      },
+      onFetchChildren: async (parentId, offset, limit) => {
+        const gen = this.store.state.scanSummary?.scan_generation;
+        if (!gen) return { totalCount: 0, entries: [] };
+        const filter = { ...this.store.state.scanFilter };
+        const sort = this.store.state.scanSort;
+        const request = { scan_generation: gen, filter, sort, offset, limit };
+        const [children, all] = await Promise.all([
+          this.api.queryScanEntries({
+            ...request,
+            filter: { ...filter, parent_entry_id: parentId },
+            tree_roots_only: parentId === null,
+          }),
+          // The selection count still covers the full filter, including descendants.
+          parentId === null && offset === 0
+            ? this.api.queryScanEntries({ ...request, offset: 0, limit: 0 })
+            : Promise.resolve(null),
+        ]);
+        if (all && this.isCurrentExploreQuery(gen, filter, sort)) {
+          this.store.state.totalFilteredCount = all.total_count;
+          this.store.notify();
+        }
+        return { totalCount: children.total_count, entries: children.entries };
       },
       onFetchSkipped: async () => {
         const gen = this.store.state.scanSummary?.scan_generation;
@@ -571,26 +600,41 @@ export class FileTidyApp {
   }
 
   private async reloadExploreData(reloadTreemap: boolean): Promise<void> {
+    const seq = ++this.exploreReloadSeq;
     const gen = this.store.state.scanSummary?.scan_generation;
     if (!gen) {
       return;
     }
     try {
-      if (reloadTreemap && this.store.state.scanFilter.tab === "browse") {
-        this.store.state.treemap = await this.api.getTreemapNodes(
-          gen,
-          this.store.state.scanFilter.parent_entry_id,
-          40,
-        );
-      }
-      await this.exploreView.virtualList.resetAndLoad(
+      const filter = { ...this.store.state.scanFilter };
+      // Invalidate the old list immediately, before any treemap request can yield.
+      const listLoad = this.exploreView.virtualList.resetAndLoad(
         gen,
         this.store.state.selection,
+        isTreeBrowseFilter(filter),
       );
+      const [, treemap] = await Promise.all([
+        listLoad,
+        reloadTreemap && filter.tab === "browse"
+          ? this.api.getTreemapNodes(gen, filter.parent_entry_id, 40)
+          : Promise.resolve(null),
+      ]);
+      if (seq !== this.exploreReloadSeq || this.store.state.scanSummary?.scan_generation !== gen) return;
+      if (treemap) this.store.state.treemap = treemap;
       this.store.notify();
     } catch (err) {
-      this.reportError(err);
+      if (seq === this.exploreReloadSeq) this.reportError(err);
     }
+  }
+
+  private isCurrentExploreQuery(
+    generation: string,
+    filter: ScanFilter,
+    sort: SortField,
+  ): boolean {
+    return this.store.state.scanSummary?.scan_generation === generation &&
+      this.store.state.scanSort === sort &&
+      JSON.stringify(this.store.state.scanFilter) === JSON.stringify(filter);
   }
 
   private async openPlanForAction(

@@ -7,6 +7,7 @@ import type {
 import { isEntrySelected } from "../state/store.ts";
 import { clearChildren, el, formatBytes, formatUnixTime } from "./safe-text.ts";
 import { createZoneBadge } from "./zone-badge.ts";
+import { EntryTree, type EntryBranch } from "./entry-tree.ts";
 
 export interface VirtualListCallbacks {
   onFetchWindow(offset: number, limit: number): Promise<{
@@ -16,6 +17,10 @@ export interface VirtualListCallbacks {
   onToggleSelect(entryId: EntryId): void;
   onInspectEntry(entry: FileEntryDto): void;
   onDrillDirectory(entry: FileEntryDto): void;
+  onFetchChildren?(parentId: EntryId | null, offset: number, limit: number): Promise<{
+    totalCount: number;
+    entries: FileEntryDto[];
+  }>;
 }
 
 const WINDOW_ROWS = 18;
@@ -32,6 +37,8 @@ export class VirtualEntryList {
   private readonly rowsEl: HTMLElement;
   private readonly scrubber: HTMLInputElement;
   private readonly statusEl: HTMLElement;
+  private readonly toolbar: HTMLElement;
+  private readonly collapseButton: HTMLButtonElement;
 
   private callbacks: VirtualListCallbacks;
   private generation: ScanGeneration = "0";
@@ -44,10 +51,34 @@ export class VirtualEntryList {
   private requestSeq = 0;
   private wheelAccumulator = 0;
   private destroyed = false;
+  private tree: EntryTree | null = null;
 
   constructor(callbacks: VirtualListCallbacks) {
     this.callbacks = callbacks;
     this.root = el("div", "vlist");
+
+    this.toolbar = el("div", "vlist__toolbar");
+    this.toolbar.hidden = true;
+    const title = el("div", "vlist__title-group");
+    title.appendChild(el("span", "vlist__title", "文件结构"));
+    title.appendChild(el("span", "vlist__hint", "点击箭头展开目录 · ← → 键导航"));
+    this.collapseButton = el("button", "btn btn--ghost btn--compact vlist__collapse", "全部收起");
+    this.collapseButton.type = "button";
+    this.collapseButton.addEventListener("click", () => {
+      if (!this.tree) return;
+      const focused = this.tree.row(this.focusedIndex);
+      let ancestor = focused?.branch;
+      while (ancestor?.parent?.parent) ancestor = ancestor.parent;
+      this.focusedIndex = ancestor?.parent ? ancestor.parentIndex : focused?.siblingIndex ?? 0;
+      this.tree.collapseAll();
+      this.syncTreeCount();
+      this.offset = Math.max(0, Math.min(this.focusedIndex, this.maxOffset()));
+      void this.loadWindow(this.offset);
+      this.viewport.focus();
+    });
+    this.toolbar.appendChild(title);
+    this.toolbar.appendChild(this.collapseButton);
+    this.root.appendChild(this.toolbar);
 
     const header = el("div", "vlist__header");
     header.appendChild(el("span", "vlist__col-check", ""));
@@ -62,6 +93,7 @@ export class VirtualEntryList {
     this.viewport.tabIndex = 0;
     this.viewport.setAttribute("role", "listbox");
     this.viewport.setAttribute("aria-label", "扫描文件列表");
+    this.viewport.setAttribute("aria-multiselectable", "true");
 
     this.rowsEl = el("div", "vlist__rows");
     this.viewport.appendChild(this.rowsEl);
@@ -106,6 +138,7 @@ export class VirtualEntryList {
     });
 
     this.viewport.addEventListener("keydown", (ev) => {
+      if (ev.target !== this.viewport) return;
       if (this.totalCount === 0) {
         return;
       }
@@ -136,16 +169,19 @@ export class VirtualEntryList {
           break;
         case " ": {
           ev.preventDefault();
-          const entry = this.cache.get(this.focusedIndex);
+          const entry = this.entryAt(this.focusedIndex);
           if (entry) {
             this.callbacks.onToggleSelect(entry.id);
           }
           break;
         }
         case "Enter": {
-          const entry = this.cache.get(this.focusedIndex);
+          ev.preventDefault();
+          const entry = this.entryAt(this.focusedIndex);
           if (entry) {
-            if (entry.kind === "directory") {
+            if (this.tree && entry.kind === "directory") {
+              void this.toggleDirectory(this.focusedIndex);
+            } else if (entry.kind === "directory") {
               this.callbacks.onDrillDirectory(entry);
             } else {
               this.callbacks.onInspectEntry(entry);
@@ -153,11 +189,37 @@ export class VirtualEntryList {
           }
           break;
         }
+        case "ArrowRight":
+          if (this.tree) {
+            ev.preventDefault();
+            const row = this.tree.row(this.focusedIndex);
+            if (row?.entry?.kind === "directory") {
+              if (this.tree.child(row)?.expanded) {
+                const firstChild = this.tree.row(this.focusedIndex + 1);
+                if (firstChild && !firstChild.note && firstChild.branch === this.tree.child(row)) {
+                  void this.moveFocus(this.focusedIndex + 1);
+                }
+              }
+              else void this.toggleDirectory(this.focusedIndex);
+            }
+          }
+          break;
+        case "ArrowLeft":
+          if (this.tree) {
+            ev.preventDefault();
+            const row = this.tree.row(this.focusedIndex);
+            if (row && this.tree.child(row)?.expanded) void this.toggleDirectory(this.focusedIndex);
+            else if (row?.branch.parent) {
+              const parentIndex = this.tree.indexOf(row.branch.parent, row.branch.parentIndex);
+              if (parentIndex !== null) void this.moveFocus(parentIndex);
+            }
+          }
+          break;
       }
     });
   }
 
-  async resetAndLoad(generation: ScanGeneration, selection: SelectionSpec): Promise<void> {
+  async resetAndLoad(generation: ScanGeneration, selection: SelectionSpec, treeMode = false): Promise<void> {
     this.generation = generation;
     this.selection = selection;
     this.offset = 0;
@@ -165,6 +227,15 @@ export class VirtualEntryList {
     this.requestSeq += 1;
     this.loadingSeq = null;
     this.cache.clear();
+    this.totalCount = 0;
+    this.wheelAccumulator = 0;
+    this.tree = treeMode && this.callbacks.onFetchChildren ? new EntryTree() : null;
+    this.toolbar.hidden = !this.tree;
+    if (this.tree) this.root.classList.add("vlist--tree");
+    else this.root.classList.remove("vlist--tree");
+    this.viewport.setAttribute("role", this.tree ? "tree" : "listbox");
+    this.viewport.setAttribute("aria-label", this.tree ? "扫描文件树" : "扫描文件列表");
+    this.render();
     await this.loadWindow(0);
   }
 
@@ -178,15 +249,99 @@ export class VirtualEntryList {
     return Math.max(0, this.totalCount - WINDOW_ROWS);
   }
 
+  private entryAt(index: number): FileEntryDto | undefined {
+    return this.tree ? this.tree.row(index)?.entry : this.cache.get(index);
+  }
+
+  private syncTreeCount(): void {
+    if (!this.tree) return;
+    this.totalCount = this.tree.count();
+    this.focusedIndex = Math.max(0, Math.min(this.focusedIndex, this.totalCount - 1));
+    this.offset = Math.max(0, Math.min(this.offset, this.maxOffset()));
+    this.scrubber.max = String(this.maxOffset());
+    this.scrubber.value = String(this.offset);
+    this.collapseButton.disabled = ![...this.tree.root.children.values()].some((child) => child.expanded);
+  }
+
+  private async fetchBranch(tree: EntryTree, branch: EntryBranch, start: number): Promise<void> {
+    const page = Math.floor(start / PAGE_CACHE_SIZE) * PAGE_CACHE_SIZE;
+    const pending = branch.pending.get(page);
+    if (pending) return pending;
+    branch.error = false;
+    const load = async (): Promise<void> => {
+      try {
+        const res = await this.callbacks.onFetchChildren!(branch.parentId, page, PAGE_CACHE_SIZE);
+        if (this.destroyed || this.tree !== tree) return;
+        const focusAnchor = tree.row(this.focusedIndex);
+        const focusWasVisible = this.focusedIndex >= this.offset && this.focusedIndex < this.offset + WINDOW_ROWS;
+        const scrollAnchor = tree.row(this.offset);
+        branch.initialized = true;
+        branch.total = res.totalCount;
+        res.entries.forEach((entry, index) => branch.entries.set(page + index, entry));
+        if (focusAnchor && !focusAnchor.note) {
+          this.focusedIndex = tree.indexOf(focusAnchor.branch, focusAnchor.siblingIndex) ?? this.focusedIndex;
+        }
+        if (scrollAnchor && !scrollAnchor.note) {
+          this.offset = tree.indexOf(scrollAnchor.branch, scrollAnchor.siblingIndex) ?? this.offset;
+        }
+        if (focusWasVisible) {
+          if (this.focusedIndex < this.offset) this.offset = this.focusedIndex;
+          else if (this.focusedIndex >= this.offset + WINDOW_ROWS) this.offset = this.focusedIndex - WINDOW_ROWS + 1;
+        }
+        // Keep pages bounded even for a directory with millions of children.
+        if (branch.entries.size > 600) {
+          for (const at of branch.entries.keys()) {
+            if (Math.abs(at - start) > 300 && !branch.children.has(at)) branch.entries.delete(at);
+          }
+        }
+      } catch {
+        if (this.tree === tree) branch.error = true;
+      } finally {
+        branch.pending.delete(page);
+        if (!this.destroyed && this.tree === tree) {
+          this.syncTreeCount();
+          this.render();
+        }
+      }
+    };
+    const promise = Promise.resolve().then(load);
+    branch.pending.set(page, promise);
+    this.render();
+    return promise;
+  }
+
+  private async toggleDirectory(index: number): Promise<void> {
+    const tree = this.tree;
+    const row = tree?.row(index);
+    if (!tree || !row || row.entry?.kind !== "directory") return;
+    this.focusedIndex = index;
+    let child = tree.child(row);
+    if (child?.expanded) child.expanded = false;
+    else child = tree.expand(row);
+    this.syncTreeCount();
+    this.render();
+    this.viewport.focus();
+    if (child?.expanded && !child.initialized) await this.fetchBranch(tree, child, 0);
+    if (this.tree === tree) await this.loadWindow(this.offset);
+  }
+
   private async moveFocus(nextIndex: number): Promise<void> {
-    const clamped = Math.max(0, Math.min(this.totalCount - 1, nextIndex));
+    let clamped = Math.max(0, Math.min(this.totalCount - 1, nextIndex));
+    if (this.tree?.row(clamped)?.note) {
+      const step = clamped === this.totalCount - 1 || nextIndex < this.focusedIndex ? -1 : 1;
+      while (this.tree.row(clamped)?.note) {
+        const next = clamped + step;
+        if (next < 0 || next >= this.totalCount) return;
+        clamped = next;
+      }
+    }
     this.focusedIndex = clamped;
     if (clamped < this.offset) {
       await this.scrollTo(clamped);
     } else if (clamped >= this.offset + WINDOW_ROWS) {
       await this.scrollTo(clamped - WINDOW_ROWS + 1);
     } else {
-      const entry = this.cache.get(clamped);
+      const entry = this.entryAt(clamped);
       if (entry) {
         this.callbacks.onInspectEntry(entry);
       }
@@ -209,7 +364,7 @@ export class VirtualEntryList {
   private hasMissingRows(start: number, count: number): boolean {
     const end = Math.min(this.totalCount, start + count);
     for (let i = start; i < end; i += 1) {
-      if (!this.cache.has(i)) {
+      if (!this.entryAt(i) && !this.tree?.row(i)?.note) {
         return true;
       }
     }
@@ -217,6 +372,24 @@ export class VirtualEntryList {
   }
 
   private async loadWindow(startOffset: number): Promise<void> {
+    if (this.tree) {
+      const tree = this.tree;
+      if (!tree.root.initialized) await this.fetchBranch(tree, tree.root, 0);
+      if (this.destroyed || this.tree !== tree) return;
+      const loads = new Map<EntryBranch, Set<number>>();
+      const end = Math.min(this.totalCount, this.offset + WINDOW_ROWS);
+      for (let index = this.offset; index < end; index += 1) {
+        const row = tree.row(index);
+        if (!row || row.entry || row.note) continue;
+        const pages = loads.get(row.branch) ?? new Set<number>();
+        pages.add(Math.floor(row.siblingIndex / PAGE_CACHE_SIZE) * PAGE_CACHE_SIZE);
+        loads.set(row.branch, pages);
+      }
+      await Promise.all([...loads].flatMap(([branch, pages]) =>
+        [...pages].map((page) => this.fetchBranch(tree, branch, page))));
+      if (!this.destroyed && this.tree === tree) this.render();
+      return;
+    }
     const fetchOffset = Math.max(0, startOffset - 10);
     const seq = ++this.requestSeq;
     this.loadingSeq = seq;
@@ -254,6 +427,7 @@ export class VirtualEntryList {
 
   render(): void {
     clearChildren(this.rowsEl);
+    this.viewport.removeAttribute("aria-activedescendant");
     if (this.totalCount <= WINDOW_ROWS) {
       this.scrubber.classList.add("vlist__scrubber--hidden");
     } else {
@@ -261,8 +435,12 @@ export class VirtualEntryList {
     }
 
     if (this.totalCount === 0) {
-      this.rowsEl.appendChild(el("div", "vlist__empty", "当前筛选条件下没有条目"));
-      this.statusEl.textContent = "0 项";
+      const root = this.tree?.root;
+      const empty = el("div", "vlist__empty", root?.error ? "文件结构加载失败" :
+        root && !root.initialized ? "正在加载文件结构…" : "当前筛选条件下没有条目");
+      if (root?.error) empty.appendChild(this.retryButton(root, 0));
+      this.rowsEl.appendChild(empty);
+      this.statusEl.textContent = root && !root.initialized ? "按需加载子目录" : "0 项";
       return;
     }
 
@@ -270,9 +448,20 @@ export class VirtualEntryList {
     let focusedPath: string | null = null;
 
     for (let index = this.offset; index < end; index += 1) {
-      const entry = this.cache.get(index);
+      const treeRow = this.tree?.row(index);
+      const entry = this.entryAt(index);
       if (!entry) {
-        this.rowsEl.appendChild(el("div", "vlist__row vlist__row--loading", "加载中…"));
+        const note = el("div", "vlist__row vlist__branch-note");
+        note.appendChild(el("span"));
+        const label = el("div", "vlist__name-line");
+        this.appendIndents(label, treeRow?.branch.depth ?? 0);
+        const branch = treeRow?.branch;
+        label.appendChild(el("span", "", branch?.error ? "加载失败" :
+          treeRow?.note && branch?.initialized ? "没有可见条目" : "加载中…"));
+        if (branch?.error) label.appendChild(this.retryButton(branch, treeRow?.siblingIndex ?? 0));
+        note.appendChild(label);
+        note.setAttribute("role", "presentation");
+        this.rowsEl.appendChild(note);
         continue;
       }
       const row = el("div", "vlist__row");
@@ -284,8 +473,17 @@ export class VirtualEntryList {
         row.classList.add("vlist__row--focused");
         focusedPath = entry.path_display;
       }
-      row.setAttribute("role", "option");
+      row.id = `file-entry-${index}`;
+      if (index === this.focusedIndex) this.viewport.setAttribute("aria-activedescendant", row.id);
+      row.setAttribute("role", this.tree ? "treeitem" : "option");
       row.setAttribute("aria-selected", selected ? "true" : "false");
+      const expanded = treeRow ? this.tree?.child(treeRow)?.expanded ?? false : false;
+      if (treeRow) {
+        row.setAttribute("aria-level", String(treeRow.branch.depth + 1));
+        row.setAttribute("aria-posinset", String(treeRow.siblingIndex + 1));
+        row.setAttribute("aria-setsize", String(treeRow.branch.total));
+        if (entry.kind === "directory") row.setAttribute("aria-expanded", String(expanded));
+      }
       row.title = entry.policy.blocked_reason
         ? `${entry.path_display}\n${entry.policy.blocked_reason}`
         : entry.path_display;
@@ -305,9 +503,26 @@ export class VirtualEntryList {
 
       const nameCell = el("div", "vlist__col-name");
       const titleRow = el("div", "vlist__name-line");
-      titleRow.appendChild(
-        el("span", "vlist__kind-icon", entry.kind === "directory" ? "📁" : "📄"),
-      );
+      if (treeRow) {
+        this.appendIndents(titleRow, treeRow.branch.depth);
+        if (entry.kind === "directory") {
+          const toggle = el("button", "vlist__toggle");
+          toggle.type = "button";
+          toggle.tabIndex = -1;
+          toggle.setAttribute("aria-label", `${expanded ? "收起" : "展开"} ${entry.name_display}`);
+          toggle.setAttribute("aria-expanded", String(expanded));
+          if (this.tree?.child(treeRow)?.pending.size) toggle.classList.add("vlist__toggle--loading");
+          toggle.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            void this.toggleDirectory(index);
+          });
+          toggle.addEventListener("dblclick", (ev) => ev.stopPropagation());
+          titleRow.appendChild(toggle);
+        } else titleRow.appendChild(el("span", "vlist__toggle-spacer"));
+      }
+      const icon = el("span", `vlist__kind-icon vlist__kind-icon--${entry.kind}${expanded ? " vlist__kind-icon--open" : ""}`);
+      icon.setAttribute("aria-hidden", "true");
+      titleRow.appendChild(icon);
       titleRow.appendChild(el("span", "vlist__name", entry.name_display));
       if (entry.hidden) {
         titleRow.appendChild(el("span", "chip-quiet", "隐藏"));
@@ -330,16 +545,19 @@ export class VirtualEntryList {
       row.appendChild(sizeCell);
 
       const timeCell = el("div", "vlist__col-time", formatUnixTime(entry.modified_unix));
+      timeCell.title = formatUnixTime(entry.modified_unix);
       row.appendChild(timeCell);
 
       row.addEventListener("click", () => {
         this.focusedIndex = index;
         this.callbacks.onInspectEntry(entry);
         this.render();
+        this.viewport.focus();
       });
       row.addEventListener("dblclick", () => {
         if (entry.kind === "directory") {
-          this.callbacks.onDrillDirectory(entry);
+          if (this.tree) void this.toggleDirectory(index);
+          else this.callbacks.onDrillDirectory(entry);
         }
       });
 
@@ -351,8 +569,25 @@ export class VirtualEntryList {
       el("span", "vlist__status-path", focusedPath ?? ""),
     );
     this.statusEl.appendChild(
-      el("span", "vlist__status-count", `${this.offset + 1}–${end} / 共 ${this.totalCount} 项`),
+      el("span", "vlist__status-count", `${this.offset + 1}–${end} / ${this.totalCount} ${this.tree ? "行" : "项"}`),
     );
+  }
+
+  private appendIndents(target: HTMLElement, depth: number): void {
+    for (let level = 0; level < depth; level += 1) {
+      const indent = el("span", "vlist__indent");
+      indent.setAttribute("aria-hidden", "true");
+      target.appendChild(indent);
+    }
+  }
+
+  private retryButton(branch: EntryBranch, offset: number): HTMLButtonElement {
+    const button = el("button", "btn btn--link vlist__retry", "重试");
+    button.type = "button";
+    button.addEventListener("click", () => {
+      if (this.tree) void this.fetchBranch(this.tree, branch, offset);
+    });
+    return button;
   }
 
   destroy(): void {

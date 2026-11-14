@@ -38,6 +38,10 @@ export interface ExploreViewCallbacks {
     totalCount: number;
     entries: FileEntryDto[];
   }>;
+  onFetchChildren?(parentId: EntryId | null, offset: number, limit: number): Promise<{
+    totalCount: number;
+    entries: FileEntryDto[];
+  }>;
   onFetchSkipped(): Promise<SkippedEntryDto[]>;
   onSelectionChange(next: AppStateModel["selection"]): void;
   onInspectEntry(entry: FileEntryDto | null): void;
@@ -86,6 +90,10 @@ export class ExploreView {
 
     this.virtualList = new VirtualEntryList({
       onFetchWindow: (offset, limit) => this.callbacks.onFetchWindow(offset, limit),
+      ...(callbacks.onFetchChildren ? {
+        onFetchChildren: (parentId: EntryId | null, offset: number, limit: number) =>
+          callbacks.onFetchChildren!(parentId, offset, limit),
+      } : {}),
       onToggleSelect: (entryId) => {
         // Store handles toggle in main coordinator
         const current = this.lastModel;

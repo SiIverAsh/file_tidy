@@ -19,7 +19,7 @@ use crate::dto::{
     ConfirmAndExecuteInput, ExecutionReportDto, GrantDto, PermanentChallengeDto,
     PickedDestinationDto, PickedRulesFileDto, PickedScanRootsDto, PlanActionKindDto,
     PlanPreviewDto, QuarantineItemDto, QueryScanEntriesRequest, QueryScanEntriesResponse,
-    RecoveryReportDto, ScanSummaryDto, SelectionSpec, SortField, StorageInitPreviewDto,
+    RecoveryReportDto, ScanSummaryDto, ScanTab, SelectionSpec, SortField, StorageInitPreviewDto,
     SuggestedDirectoriesResponse, SuggestedDirectoryDto, TreemapNodeDto, TreemapResponse,
     WorkspaceStatusDto, build_policy_view, compute_sensitive_parent_dirs, entry_name_display,
     filter_entries, policy_view_for_path, to_batch_detail_dto, to_batch_dto,
@@ -354,6 +354,24 @@ pub async fn query_scan_entries_inner(
             .collect();
 
         let mut filtered = filter_entries(&report, &request.filter, &grant_refs, &sensitive_dirs)?;
+        if request.tree_roots_only
+            && matches!(request.filter.tab, ScanTab::Browse)
+            && request.filter.parent_entry_id.is_none()
+        {
+            // Match treemap roots: a nested or overlapping scan root remains a child
+            // when its parent directory is already represented in this report.
+            let directories: BTreeSet<&Path> = report
+                .directory_usage
+                .iter()
+                .map(|usage| usage.path.as_path())
+                .collect();
+            filtered.retain(|entry| {
+                entry
+                    .path
+                    .parent()
+                    .is_none_or(|parent| !directories.contains(parent))
+            });
+        }
         match request.sort {
             SortField::SizeDesc => {
                 filtered.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes).then(a.id.cmp(&b.id)));

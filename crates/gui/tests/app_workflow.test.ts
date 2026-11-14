@@ -42,6 +42,7 @@ class FakeElement {
   inputMode = "";
   disabled = false;
   checked = false;
+  id = "";
   title = "";
   tabIndex = -1;
   width = 0;
@@ -90,6 +91,12 @@ class FakeElement {
   getAttribute(name: string): string | null {
     return this.attributes.get(name) ?? null;
   }
+
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+
+  focus(): void {}
 
   addEventListener(type: string, cb: (ev: unknown) => void): void {
     const list = this.listeners.get(type) ?? [];
@@ -351,6 +358,271 @@ test("VirtualEntryList drops stale in-flight query results after resetAndLoad", 
     .findAll((el) => el.className === "vlist__name")
     .map((el) => el.textContent);
   assert.deepEqual(names, ["file-2.txt"]);
+  vlist.destroy();
+});
+
+function treeEntry(id: string, name: string, kind: FileEntryDto["kind"]): FileEntryDto {
+  return {
+    id,
+    path_display: `/work/${name}`,
+    name_display: name,
+    kind,
+    size_bytes: "1024",
+    allocated_bytes: "1024",
+    modified_unix: "1700000000",
+    hidden: false,
+    category: null,
+    type_evidence: null,
+    content_inspected: false,
+    is_stale: false,
+    policy: {
+      zone: "C_GrantedSession",
+      protected: false,
+      sensitive: false,
+      atomic_root_display: null,
+      sensitivity_reason: null,
+      allowed_actions: [],
+      blocked_reason: null,
+    },
+  };
+}
+
+function treeNames(root: FakeElement): Array<string | null> {
+  return root.findAll((el) => el.className === "vlist__name").map((el) => el.textContent);
+}
+
+function treeToggle(root: FakeElement, label: string): FakeElement {
+  const toggle = root.findAll((el) => el.getAttribute("aria-label") === label)[0];
+  if (!toggle) throw new Error(`expected tree toggle ${label}`);
+  return toggle;
+}
+
+async function settleTree(): Promise<void> {
+  // DOM event callbacks launch async work without returning its promise.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+test("VirtualEntryList lazily expands nested directories and reopens cached branches", async () => {
+  installFakeDom();
+  const requests: Array<string | null> = [];
+  const selected: string[] = [];
+  const pending: { resolve?: (value: { totalCount: number; entries: FileEntryDto[] }) => void } = {};
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => { throw new Error("tree must use child queries"); },
+    onFetchChildren: async (parentId) => {
+      requests.push(parentId);
+      if (parentId === null) return { totalCount: 1, entries: [treeEntry("root", "Project", "directory")] };
+      if (parentId === "root") return new Promise((resolve) => { pending.resolve = resolve; });
+      return { totalCount: 1, entries: [treeEntry("leaf", "notes.txt", "file")] };
+    },
+    onToggleSelect: (id) => { selected.push(id); },
+    onInspectEntry: () => {},
+    onDrillDirectory: () => { throw new Error("tree expansion must stay in place"); },
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  assert.deepEqual(requests, [null]);
+  assert.deepEqual(treeNames(root), ["Project"]);
+  assert.equal(root.findAll((el) => el.getAttribute("role") === "tree").length, 1);
+  assert.equal(root.findAll((el) => el.getAttribute("role") === "treeitem")[0]?.getAttribute("aria-level"), "1");
+
+  const checkbox = root.findAll((el) => el.getAttribute("aria-label") === "选择 Project")[0];
+  let stopped = false;
+  checkbox?.dispatch("click", { stopPropagation: () => { stopped = true; } });
+  assert.equal(stopped, true);
+  assert.deepEqual(selected, ["root"]);
+  assert.deepEqual(requests, [null]);
+  assert.equal(treeToggle(root, "展开 Project").getAttribute("aria-expanded"), "false");
+
+  treeToggle(root, "展开 Project").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.deepEqual(requests, [null, "root"]);
+  assert.equal(treeToggle(root, "收起 Project").getAttribute("aria-expanded"), "true");
+  assert.equal(root.findAll((el) => el.textContent === "加载中…").length, 1);
+  pending.resolve?.({ totalCount: 2, entries: [treeEntry("nested", "Documents", "directory"), treeEntry("report", "report.pdf", "file")] });
+  await settleTree();
+  treeToggle(root, "展开 Documents").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Project", "Documents", "notes.txt", "report.pdf"]);
+  assert.deepEqual(root.findAll((el) => el.getAttribute("role") === "treeitem").map((el) => el.getAttribute("aria-level")), ["1", "2", "3", "2"]);
+
+  treeToggle(root, "收起 Project").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Project"]);
+  treeToggle(root, "展开 Project").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Project", "Documents", "notes.txt", "report.pdf"]);
+  assert.deepEqual(requests, [null, "root", "nested"]);
+
+  root.findAll((el) => el.textContent === "全部收起")[0]?.dispatch("click");
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Project"]);
+  treeToggle(root, "展开 Project").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Project", "Documents", "report.pdf"]);
+  assert.deepEqual(requests, [null, "root", "nested"]);
+  vlist.destroy();
+});
+
+test("VirtualEntryList ignores an old directory response after a new scan reset", async () => {
+  installFakeDom();
+  let scan = 1;
+  const pending: { resolve?: (value: { totalCount: number; entries: FileEntryDto[] }) => void } = {};
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchChildren: async (parentId) => {
+      if (parentId === null) return { totalCount: 1, entries: [treeEntry(`scan-${scan}`, `Scan ${scan}`, "directory")] };
+      return new Promise((resolve) => { pending.resolve = resolve; });
+    },
+    onToggleSelect: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  treeToggle(root, "展开 Scan 1").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  scan = 2;
+  await vlist.resetAndLoad("2", { mode: "ids", scan_generation: "2", ids: [] }, true);
+  pending.resolve?.({ totalCount: 1, entries: [treeEntry("stale", "old result.txt", "file")] });
+  await settleTree();
+  assert.deepEqual(treeNames(root), ["Scan 2"]);
+  assert.equal(treeToggle(root, "展开 Scan 2").getAttribute("aria-expanded"), "false");
+  vlist.destroy();
+});
+
+test("VirtualEntryList retries a failed directory load and identifies an empty folder", async () => {
+  installFakeDom();
+  let childRequests = 0;
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchChildren: async (parentId) => {
+      if (parentId === null) return { totalCount: 1, entries: [treeEntry("empty", "Empty", "directory")] };
+      childRequests += 1;
+      if (childRequests === 1) throw new Error("temporary failure");
+      return { totalCount: 0, entries: [] };
+    },
+    onToggleSelect: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  treeToggle(root, "展开 Empty").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.equal(root.findAll((el) => el.textContent === "加载失败").length, 1);
+  root.findAll((el) => el.textContent === "重试")[0]?.dispatch("click");
+  await settleTree();
+  assert.equal(childRequests, 2);
+  assert.equal(root.findAll((el) => el.textContent === "没有可见条目").length, 1);
+  assert.equal(root.findAll((el) => el.textContent === "重试").length, 0);
+  treeToggle(root, "收起 Empty").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.equal(root.findAll((el) => el.textContent === "没有可见条目").length, 0);
+  vlist.destroy();
+});
+
+test("VirtualEntryList supports keyboard tree navigation without turning selection into expansion", async () => {
+  installFakeDom();
+  const selected: string[] = [];
+  const inspected: string[] = [];
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchChildren: async (parentId) => parentId === null
+      ? { totalCount: 1, entries: [treeEntry("project", "Project", "directory")] }
+      : { totalCount: 1, entries: [treeEntry("notes", "notes.txt", "file")] },
+    onToggleSelect: (id) => { selected.push(id); },
+    onInspectEntry: (entry) => { inspected.push(entry.id); },
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  const viewport = root.findAll((el) => el.getAttribute("role") === "tree")[0];
+  if (!viewport) throw new Error("expected focusable tree viewport");
+  const key = async (value: string): Promise<void> => {
+    viewport.dispatch("keydown", { key: value, target: viewport, preventDefault: () => {} });
+    await settleTree();
+  };
+  await key(" ");
+  assert.deepEqual(selected, ["project"]);
+  assert.deepEqual(treeNames(root), ["Project"]);
+  await key("ArrowRight");
+  assert.deepEqual(treeNames(root), ["Project", "notes.txt"]);
+  await key("ArrowRight");
+  assert.equal(viewport.getAttribute("aria-activedescendant"), "file-entry-1");
+  assert.deepEqual(inspected, ["notes"]);
+  await key("ArrowLeft");
+  assert.equal(viewport.getAttribute("aria-activedescendant"), "file-entry-0");
+  await key("ArrowLeft");
+  assert.deepEqual(treeNames(root), ["Project"]);
+  await key("Enter");
+  assert.deepEqual(treeNames(root), ["Project", "notes.txt"]);
+  assert.deepEqual(selected, ["project"]);
+  vlist.destroy();
+});
+
+test("VirtualEntryList keeps focus on the same sibling when an earlier folder finishes loading", async () => {
+  installFakeDom();
+  const pending: { resolve?: (value: { totalCount: number; entries: FileEntryDto[] }) => void } = {};
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchChildren: async (parentId) => {
+      if (parentId === null) return {
+        totalCount: 2,
+        entries: [treeEntry("a", "A", "directory"), treeEntry("b", "B", "directory")],
+      };
+      return new Promise((resolve) => { pending.resolve = resolve; });
+    },
+    onToggleSelect: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  const viewport = root.findAll((el) => el.getAttribute("role") === "tree")[0];
+  if (!viewport) throw new Error("expected tree viewport");
+  treeToggle(root, "展开 A").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  viewport.dispatch("keydown", { key: "ArrowDown", target: viewport, preventDefault: () => {} });
+  await settleTree();
+  const focusedName = (): string | null | undefined => {
+    const activeId = viewport.getAttribute("aria-activedescendant");
+    const active = root.findAll((el) => el.id === activeId)[0];
+    return active?.findAll((el) => el.className === "vlist__name")[0]?.textContent;
+  };
+  assert.equal(focusedName(), "B");
+  pending.resolve?.({
+    totalCount: 24,
+    entries: Array.from({ length: 24 }, (_, index) => treeEntry(`child-${index}`, `child-${index}.txt`, "file")),
+  });
+  await settleTree();
+  assert.equal(focusedName(), "B");
+  assert.equal(root.findAll((el) => el.getAttribute("role") === "treeitem").length, 18);
+  vlist.destroy();
+});
+
+test("VirtualEntryList keeps ArrowRight on an expanded empty directory", async () => {
+  installFakeDom();
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchChildren: async (parentId) => parentId === null
+      ? { totalCount: 2, entries: [treeEntry("empty", "Empty", "directory"), treeEntry("next", "Next", "directory")] }
+      : { totalCount: 0, entries: [] },
+    onToggleSelect: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] }, true);
+  const root = vlist.root as unknown as FakeElement;
+  const viewport = root.findAll((el) => el.getAttribute("role") === "tree")[0];
+  if (!viewport) throw new Error("expected tree viewport");
+  treeToggle(root, "展开 Empty").dispatch("click", { stopPropagation: () => {} });
+  await settleTree();
+  assert.equal(root.findAll((el) => el.textContent === "没有可见条目").length, 1);
+  viewport.dispatch("keydown", { key: "ArrowRight", target: viewport, preventDefault: () => {} });
+  await settleTree();
+  assert.equal(viewport.getAttribute("aria-activedescendant"), "file-entry-0");
+  assert.equal(treeToggle(root, "收起 Empty").getAttribute("aria-expanded"), "true");
   vlist.destroy();
 });
 

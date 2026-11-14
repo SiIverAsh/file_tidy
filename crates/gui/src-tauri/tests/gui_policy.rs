@@ -213,6 +213,7 @@ fn query_and_treemap_reject_stale_scan_generation() -> TestResult {
             sort: SortField::SizeDesc,
             offset: 0,
             limit: 50,
+            tree_roots_only: false,
         },
     ));
     assert!(matches!(q_res, Err(GuiError::StaleScanGeneration { .. })));
@@ -224,6 +225,212 @@ fn query_and_treemap_reject_stale_scan_generation() -> TestResult {
         Some(40),
     ));
     assert!(matches!(t_res, Err(GuiError::StaleScanGeneration { .. })));
+    Ok(())
+}
+
+#[test]
+fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -> TestResult {
+    let base_raw = std::env::current_dir()?
+        .join("target")
+        .join("tree-query-fixtures")
+        .join(format!(
+            "run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+    let nested_raw = base_raw.join("alpha").join("nested");
+    std::fs::create_dir_all(&nested_raw)?;
+    std::fs::create_dir_all(base_raw.join("beta"))?;
+    std::fs::write(nested_raw.join("nested.txt"), b"nested")?;
+    std::fs::write(base_raw.join("alpha").join("direct.txt"), b"direct")?;
+    std::fs::write(base_raw.join("beta").join("other.txt"), b"other")?;
+    let base = std::fs::canonicalize(&base_raw)?;
+    let state = AppState::new()?;
+    *state.pending_roots.lock().map_err(|_| "lock poisoned")? = vec![
+        base.join("alpha"),
+        base.join("alpha").join("nested"),
+        base.join("beta"),
+    ];
+    let summary = tauri::async_runtime::block_on(start_scan_inner(
+        &state,
+        StartScanRequest {
+            all_volumes: false,
+            metadata_only: true,
+            no_duplicates: true,
+            stale_days: 30,
+            max_entries: 100,
+        },
+        None,
+    ))?;
+    let request_json = serde_json::json!({
+        "scan_generation": summary.scan_generation,
+        "filter": {
+            "tab": "browse",
+            "parent_entry_id": null,
+            "search_text": "",
+            "zone_filter": "all",
+            "category_filter": "all",
+            "hide_hidden": false,
+            "duplicate_group_id": null,
+            "skip_reason_filter": ""
+        },
+        "sort": "name_asc",
+        "offset": 0,
+        "limit": 100
+    });
+    let flat_request: QueryScanEntriesRequest = serde_json::from_value(request_json.clone())?;
+    assert!(!flat_request.tree_roots_only, "legacy requests remain flat");
+    let flat = tauri::async_runtime::block_on(query_scan_entries_inner(&state, flat_request))?;
+    assert_eq!(
+        flat.total_count, 6,
+        "all scanned entries stay in flat queries"
+    );
+
+    let mut root_request: QueryScanEntriesRequest = serde_json::from_value(request_json.clone())?;
+    root_request.tree_roots_only = true;
+    root_request.limit = 1;
+    let first_page =
+        tauri::async_runtime::block_on(query_scan_entries_inner(&state, root_request))?;
+    assert_eq!(first_page.total_count, 2);
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].name_display, "alpha");
+
+    let mut second_request: QueryScanEntriesRequest = serde_json::from_value(request_json.clone())?;
+    second_request.tree_roots_only = true;
+    second_request.offset = 1;
+    second_request.limit = 1;
+    let second_page =
+        tauri::async_runtime::block_on(query_scan_entries_inner(&state, second_request))?;
+    assert_eq!(second_page.total_count, 2);
+    assert_eq!(second_page.entries[0].name_display, "beta");
+
+    let mut child_request: QueryScanEntriesRequest = serde_json::from_value(request_json)?;
+    child_request.tree_roots_only = true;
+    child_request.filter.parent_entry_id = Some(first_page.entries[0].id.clone());
+    let children = tauri::async_runtime::block_on(query_scan_entries_inner(&state, child_request))?;
+    assert_eq!(children.total_count, 2);
+    assert_eq!(
+        children
+            .entries
+            .iter()
+            .map(|entry| entry.name_display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["direct.txt", "nested"]
+    );
+    let treemap = tauri::async_runtime::block_on(get_treemap_nodes_inner(
+        &state,
+        summary.scan_generation,
+        None,
+        Some(40),
+    ))?;
+    let mut treemap_root_ids = treemap
+        .nodes
+        .iter()
+        .filter_map(|node| node.entry_id.as_deref())
+        .collect::<Vec<_>>();
+    treemap_root_ids.sort_unstable();
+    let mut query_root_ids = vec![
+        first_page.entries[0].id.as_str(),
+        second_page.entries[0].id.as_str(),
+    ];
+    query_root_ids.sort_unstable();
+    assert_eq!(query_root_ids, treemap_root_ids);
+    std::fs::remove_dir_all(base)?;
+    Ok(())
+}
+
+#[test]
+fn hidden_directory_descendants_are_excluded_from_flat_and_child_queries() -> TestResult {
+    let base_raw = std::env::current_dir()?
+        .join("target")
+        .join("tree-query-fixtures")
+        .join(format!("hidden-{}", generate_challenge_code()?));
+    std::fs::create_dir_all(base_raw.join("hidden-folder").join("nested"))?;
+    std::fs::write(base_raw.join("visible.txt"), b"visible")?;
+    std::fs::write(base_raw.join("hidden-folder").join("direct.txt"), b"direct")?;
+    std::fs::write(
+        base_raw
+            .join("hidden-folder")
+            .join("nested")
+            .join("report.txt"),
+        b"nested",
+    )?;
+    let base = std::fs::canonicalize(base_raw)?;
+    let state = AppState::new()?;
+    *state.pending_roots.lock().map_err(|_| "lock poisoned")? = vec![base.clone()];
+    let summary = tauri::async_runtime::block_on(start_scan_inner(
+        &state,
+        StartScanRequest {
+            all_volumes: false,
+            metadata_only: true,
+            no_duplicates: true,
+            stale_days: 30,
+            max_entries: 100,
+        },
+        None,
+    ))?;
+    let (hidden_id, nested_id) = {
+        let mut slot = state.scan.write().map_err(|_| "lock poisoned")?;
+        let report = std::sync::Arc::make_mut(slot.report.as_mut().ok_or("scan missing")?);
+        // Exercise the platform-independent metadata flag, including Windows and
+        // macOS hidden attributes on directories whose names do not start with '.'.
+        let hidden = report
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == base.join("hidden-folder"))
+            .ok_or("hidden directory missing")?;
+        hidden.hidden = true;
+        let hidden_id = hidden.id.to_string();
+        let nested_id = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == base.join("hidden-folder").join("nested"))
+            .ok_or("nested directory missing")?
+            .id
+            .to_string();
+        (hidden_id, nested_id)
+    };
+    let query = |parent_entry_id: Option<String>, hide_hidden| {
+        tauri::async_runtime::block_on(query_scan_entries_inner(
+            &state,
+            QueryScanEntriesRequest {
+                scan_generation: summary.scan_generation.clone(),
+                filter: ScanFilter {
+                    tab: ScanTab::Browse,
+                    parent_entry_id,
+                    search_text: String::new(),
+                    zone_filter: "all".to_owned(),
+                    category_filter: "all".to_owned(),
+                    hide_hidden,
+                    duplicate_group_id: None,
+                    skip_reason_filter: "all".to_owned(),
+                },
+                sort: SortField::NameAsc,
+                offset: 0,
+                limit: 100,
+                tree_roots_only: false,
+            },
+        ))
+    };
+    let visible = query(None, true)?;
+    assert_eq!(
+        visible.total_count, 2,
+        "only the root and visible.txt remain"
+    );
+    assert!(
+        visible
+            .entries
+            .iter()
+            .any(|entry| entry.name_display == "visible.txt")
+    );
+    assert_eq!(query(Some(hidden_id.clone()), true)?.total_count, 0);
+    assert_eq!(query(Some(nested_id.clone()), true)?.total_count, 0);
+    assert_eq!(query(None, false)?.total_count, 6);
+    assert_eq!(query(Some(hidden_id), false)?.total_count, 2);
+    assert_eq!(query(Some(nested_id), false)?.total_count, 1);
+    std::fs::remove_dir_all(base)?;
     Ok(())
 }
 
@@ -442,6 +649,7 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
             sort: SortField::SizeDesc,
             offset: 0,
             limit: 50,
+            tree_roots_only: false,
         },
     ))?;
     let treemap = tauri::async_runtime::block_on(get_treemap_nodes_inner(

@@ -126,6 +126,7 @@ export interface QueryScanEntriesRequest {
   sort: SortField;
   offset: number;
   limit: number;
+  tree_roots_only?: boolean;
 }
 
 export interface QueryScanEntriesResponse {
