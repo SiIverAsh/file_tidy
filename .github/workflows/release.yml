@@ -189,6 +189,7 @@ jobs:
           name: dist-global
           path: artifacts
       - name: Publish complete release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -201,6 +202,10 @@ jobs:
             args+=(--prerelease)
           fi
           # Internal per-platform manifests are not release assets.
-          find artifacts -name '*-dist-manifest.json' -delete
+          mapfile -d '' -t assets < <(find artifacts -type f ! -name '*-dist-manifest.json' -print0)
+          if (( ${#assets[@]} == 0 )); then
+            echo 'No release assets found' >&2
+            exit 1
+          fi
           gh release create "$RELEASE_TAG" --verify-tag --target "$RELEASE_COMMIT" \
-            --title "$title" --notes-file release-notes.md "${args[@]}" artifacts/*
+            --title "$title" --notes-file release-notes.md "${args[@]}" "${assets[@]}"
