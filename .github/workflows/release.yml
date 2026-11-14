@@ -193,7 +193,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
           title=$(jq -r '.announcement_title' artifacts/dist-manifest.json)
           jq -r '.announcement_github_body' artifacts/dist-manifest.json > release-notes.md
@@ -207,5 +206,8 @@ jobs:
             echo 'No release assets found' >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" --verify-tag --target "$RELEASE_COMMIT" \
+          # The tag already identifies the release commit. Passing --target for an
+          # older commit with workflow differences requires Workflows: write,
+          # which GITHUB_TOKEN cannot receive.
+          gh release create "$RELEASE_TAG" --verify-tag \
             --title "$title" --notes-file release-notes.md "${args[@]}" "${assets[@]}"
