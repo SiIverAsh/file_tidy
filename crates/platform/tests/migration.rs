@@ -1,5 +1,6 @@
 use file_tidy_platform::{
-    MigrationData, MigrationFile, inspect, metadata_inventory, open_verified, visit_migration_data,
+    MigrationData, MigrationFile, capture_migration_source, inspect, metadata_inventory,
+    open_verified, visit_migration_data,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -122,6 +123,39 @@ fn migration_preserves_body_permissions_and_attached_data_before_publication() -
     assert!(!root.join(".file-tidy-migration.stage").exists());
     assert_eq!(std::fs::read(root.join("target"))?, body);
     assert_eq!(metadata_inventory(&source, &source_before)?, metadata);
+    drop(input);
+    let private = root.join("captured");
+    let root_pin = file_tidy_platform::open_directory_pinned(&root, &inspect(&root)?)?;
+    let _private_file =
+        file_tidy_platform::create_private_directory(&root_pin, "captured".as_ref())?;
+    let retained = private.join("payload");
+    capture_migration_source(
+        &source,
+        &source_before,
+        &metadata,
+        &retained,
+        &inspect(&root)?,
+        &inspect(&private)?,
+    )?;
+    let captured_info = inspect(&retained)?;
+    assert!(source_before.matches(&captured_info));
+    let captured_metadata = metadata_inventory(&retained, &captured_info)?;
+    assert_eq!(
+        captured_metadata.portable_bytes(),
+        metadata.portable_bytes()
+    );
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&retained)?, body);
+    let mut captured_file = open_verified(&retained, &captured_info)?;
+    let mut captured_streams = Streams::new();
+    visit_migration_data(
+        &retained,
+        &mut captured_file,
+        &captured_metadata,
+        &|| Ok(()),
+        &mut |event| collect(event, &mut current, &mut captured_streams),
+    )?;
+    assert_eq!(captured_streams, source_streams);
     Ok(())
 }
 #[test]
@@ -169,7 +203,7 @@ fn migration_conflicts_and_cancellation_keep_the_source_and_existing_target() ->
     Ok(())
 }
 #[test]
-fn migration_rejects_a_changed_metadata_version_before_copying() -> TestResult {
+fn migration_rejects_a_changed_attached_data_description_before_copying() -> TestResult {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().canonicalize()?;
     let source = root.join("source");
@@ -177,7 +211,7 @@ fn migration_rejects_a_changed_metadata_version_before_copying() -> TestResult {
     attached(&source, b"first")?;
     let before = inspect(&source)?;
     let expected = metadata_inventory(&source, &before)?;
-    attached(&source, b"other")?;
+    attached(&source, b"other-size")?;
     let current = inspect(&source)?;
     let input = open_verified(&source, &current)?;
     let mut staged =

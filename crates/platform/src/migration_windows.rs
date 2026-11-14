@@ -332,98 +332,141 @@ fn control(file: &File, code: u32, input: &[u8], output: &mut [u8]) -> io::Resul
     }
     Ok(())
 }
-fn restore_access(source: &File, target: &File) -> io::Result<()> {
-    struct Descriptor(*mut c_void);
-    impl Drop for Descriptor {
-        fn drop(&mut self) {
-            // SAFETY: GetSecurityInfo allocated this unique descriptor with LocalAlloc.
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-    let mut owner = ptr::null_mut();
-    let mut group = ptr::null_mut();
-    let mut dacl = ptr::null_mut();
-    let mut label = ptr::null_mut();
-    let mut descriptor = ptr::null_mut();
-    let information = OWNER_SECURITY_INFORMATION
-        | GROUP_SECURITY_INFORMATION
-        | DACL_SECURITY_INFORMATION
-        | LABEL_SECURITY_INFORMATION;
-    // SAFETY: all output slots are initialized; the descriptor retains SID/ACL
-    // storage until after the synchronous restore call below.
-    let status = unsafe {
-        GetSecurityInfo(
-            source.as_raw_handle(),
-            SE_FILE_OBJECT,
-            information,
-            &mut owner,
-            &mut group,
-            &mut dacl,
-            &mut label,
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status as i32));
-    }
-    let _owned = Descriptor(descriptor);
-    let mut storage = Vec::<u64>::new();
-    if !dacl.is_null() {
-        // SAFETY: dacl points into the live descriptor returned by the API.
-        let size = unsafe { (*dacl).AclSize } as usize;
-        if size < std::mem::size_of::<ACL>() {
-            return Err(invalid("ACL header truncated"));
-        }
-        storage.resize(size.div_ceil(8), 0);
-        // SAFETY: aligned storage covers the complete validated source ACL.
+struct Descriptor(*mut c_void);
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: GetSecurityInfo allocated this unique descriptor with LocalAlloc.
         unsafe {
-            ptr::copy_nonoverlapping(dacl.cast::<u8>(), storage.as_mut_ptr().cast::<u8>(), size);
-        }
-        dacl = storage.as_mut_ptr().cast::<ACL>();
-        // SAFETY: the copied header and all ACEs lie in this live owned buffer.
-        let count = unsafe { (*dacl).AceCount };
-        for index in 0..count {
-            let mut entry = ptr::null_mut();
-            // SAFETY: GetAce validates the index against this copied ACL.
-            if unsafe { GetAce(dacl, u32::from(index), &mut entry) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let address = entry as usize;
-            let start = storage.as_ptr() as usize;
-            if address < start
-                || address
-                    .checked_add(std::mem::size_of::<ACE_HEADER>())
-                    .is_none_or(|n| n > start + size)
-            {
-                return Err(invalid("ACE header exceeds copied ACL"));
-            }
-            // SAFETY: the header is inside owned aligned ACL storage. Only the
-            // inherited-origin marker changes; every access rule stays intact.
-            unsafe {
-                (*entry.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8);
-            }
+            LocalFree(self.0);
         }
     }
-    // SAFETY: SIDs and label remain in _owned, dacl is null or points to aligned
-    // owned storage. The private payload handle has WRITE_DAC/WRITE_OWNER. A
-    // protected DACL freezes the restored source rules during publication.
-    let status = unsafe {
-        SetSecurityInfo(
-            target.as_raw_handle(),
-            SE_FILE_OBJECT,
-            information | PROTECTED_DACL_SECURITY_INFORMATION,
+}
+
+pub(crate) struct AccessSnapshot {
+    _descriptor: Descriptor,
+    owner: PSID,
+    group: PSID,
+    dacl: Vec<u64>,
+    label: *mut ACL,
+}
+impl AccessSnapshot {
+    pub(crate) fn capture(source: &File) -> io::Result<Self> {
+        let mut owner = ptr::null_mut();
+        let mut group = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut label = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        let information = OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | LABEL_SECURITY_INFORMATION;
+        // SAFETY: all output slots are initialized; the descriptor retains SID/ACL
+        // storage until this snapshot is dropped.
+        let status = unsafe {
+            GetSecurityInfo(
+                source.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut label,
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let owned = Descriptor(descriptor);
+        let mut storage = Vec::<u64>::new();
+        if !dacl.is_null() {
+            // SAFETY: dacl points into the live descriptor returned by the API.
+            let size = unsafe { (*dacl).AclSize } as usize;
+            if size < std::mem::size_of::<ACL>() {
+                return Err(invalid("ACL header truncated"));
+            }
+            storage.resize(size.div_ceil(8), 0);
+            // SAFETY: aligned storage covers the complete validated source ACL.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    dacl.cast::<u8>(),
+                    storage.as_mut_ptr().cast::<u8>(),
+                    size,
+                );
+            }
+            dacl = storage.as_mut_ptr().cast::<ACL>();
+            // SAFETY: the copied header and all ACEs lie in this live owned buffer.
+            let count = unsafe { (*dacl).AceCount };
+            for index in 0..count {
+                let mut entry = ptr::null_mut();
+                // SAFETY: GetAce validates the index against this copied ACL.
+                if unsafe { GetAce(dacl, u32::from(index), &mut entry) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let address = entry as usize;
+                let start = storage.as_ptr() as usize;
+                if address < start
+                    || address
+                        .checked_add(std::mem::size_of::<ACE_HEADER>())
+                        .is_none_or(|n| n > start + size)
+                {
+                    return Err(invalid("ACE header exceeds copied ACL"));
+                }
+                // SAFETY: the header is inside owned aligned ACL storage. Only the
+                // inherited-origin marker changes; every access rule stays intact.
+                unsafe {
+                    (*entry.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8);
+                }
+            }
+        }
+        Ok(Self {
+            _descriptor: owned,
             owner,
             group,
-            dacl,
+            dacl: storage,
             label,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status as i32));
+        })
     }
-    Ok(())
+
+    pub(crate) fn restore_dacl(&self, target: &File) -> io::Result<()> {
+        self.restore(target, DACL_SECURITY_INFORMATION)
+    }
+
+    fn restore(&self, target: &File, information: u32) -> io::Result<()> {
+        let dacl = if self.dacl.is_empty() {
+            ptr::null_mut()
+        } else {
+            self.dacl.as_ptr().cast_mut().cast::<ACL>()
+        };
+        // SAFETY: this snapshot owns the SID/label descriptor and aligned ACL.
+        // The caller holds WRITE_DAC and any identity rights selected below.
+        // Protection freezes the source rules against destination inheritance.
+        let status = unsafe {
+            SetSecurityInfo(
+                target.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information | PROTECTED_DACL_SECURITY_INFORMATION,
+                self.owner,
+                self.group,
+                dacl,
+                self.label,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+}
+
+fn restore_access(source: &File, target: &File) -> io::Result<()> {
+    AccessSnapshot::capture(source)?.restore(
+        target,
+        OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | LABEL_SECURITY_INFORMATION,
+    )
 }
 pub(super) fn copy(
     source: &File,

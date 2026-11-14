@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 mod mounts;
 mod mutation;
-pub use mutation::{RenameError, rename_noreplace};
+pub use mutation::{RenameError, capture_migration_source, rename_noreplace};
 mod metadata_inventory;
 pub use metadata_inventory::{
     MetadataAttribute, MetadataAttributeKind, MetadataInventory, metadata_inventory,

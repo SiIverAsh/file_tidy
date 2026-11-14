@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 #[path = "migration_unix.rs"]
 mod native;
+
+#[cfg(windows)]
+pub(crate) use native::AccessSnapshot;
 #[cfg(windows)]
 #[path = "migration_windows.rs"]
 mod native;
@@ -241,7 +244,7 @@ fn invalid(message: &'static str) -> io::Error {
 fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
-fn metadata_difference(mut source: &[u8], mut target: &[u8]) -> usize {
+pub(crate) fn metadata_difference(mut source: &[u8], mut target: &[u8]) -> usize {
     let mut field = 0;
     while !source.is_empty() && !target.is_empty() {
         let next = |value: &[u8]| -> Option<usize> {

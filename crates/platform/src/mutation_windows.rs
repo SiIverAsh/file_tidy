@@ -12,11 +12,16 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, SYNCHRONIZE,
+    DELETE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 pub(super) fn source_handle(parent: &File, name: &OsStr) -> io::Result<File> {
+    source_handle_with_access(parent, name, 0)
+}
+
+fn source_handle_with_access(parent: &File, name: &OsStr, access: u32) -> io::Result<File> {
     let mut units = name.encode_wide().collect::<Vec<_>>();
     if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
         return Err(invalid("invalid native source component"));
@@ -41,7 +46,7 @@ pub(super) fn source_handle(parent: &File, name: &OsStr) -> io::Result<File> {
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE | access,
             &attributes,
             &mut status_block,
             ptr::null(),
@@ -74,15 +79,33 @@ pub(super) fn rename(
     destination_name: &OsStr,
     expected_source_parent: &NodeInfo,
     expected_destination_parent: &NodeInfo,
+    metadata: Option<&crate::MetadataInventory>,
 ) -> Result<(), RenameError> {
     let (from, _from_guards) = crate::windows::open_state_directory(source_parent)?;
     let (to, _to_guards) = crate::windows::open_state_directory(destination_parent)?;
     parent_matches(expected_source_parent, &crate::inspect_file(&from)?)?;
     parent_matches(expected_destination_parent, &crate::inspect_file(&to)?)?;
-    let source = source_handle(&from, source_name)?;
+    let access = if metadata.is_some() {
+        READ_CONTROL | FILE_READ_EA | WRITE_DAC
+    } else {
+        0
+    };
+    let source = source_handle_with_access(&from, source_name, access)?;
     if !expected.matches(&crate::inspect_file(&source)?) {
         return Err(invalid("source changed before rename").into());
     }
+    let captured_access = if let Some(metadata) = metadata {
+        let snapshot = crate::migration::AccessSnapshot::capture(&source)?;
+        if crate::metadata_inventory::inventory_open(&source_parent.join(source_name), &source)?
+            .binding_bytes()
+            != metadata.binding_bytes()
+        {
+            return Err(invalid("migration source metadata changed before capture").into());
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
     let destination = destination_parent.join(destination_name);
     match crate::inspect(&destination) {
         Ok(_) => {
@@ -95,6 +118,25 @@ pub(super) fn rename(
     // Win32 does not provide a portable directory fsync. Keep the source handle
     // and no-delete ancestor guards until metadata and namespace checks finish.
     let after = || -> io::Result<()> {
+        if let Some(snapshot) = captured_access {
+            snapshot.restore_dacl(&source)?;
+            let captured = crate::metadata_inventory::inventory_open(&destination, &source)?;
+            let reviewed = metadata.ok_or_else(|| invalid("capture metadata missing"))?;
+            if captured.portable_bytes() != reviewed.portable_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "captured migration metadata differs at field {} (attributes {} -> {})",
+                        crate::migration::metadata_difference(
+                            reviewed.portable_bytes(),
+                            captured.portable_bytes(),
+                        ),
+                        reviewed.native_flags(),
+                        captured.native_flags(),
+                    ),
+                ));
+            }
+        }
         if !expected.matches(&crate::inspect_file(&source)?)
             || !expected.matches(&crate::inspect(&destination)?)
         {

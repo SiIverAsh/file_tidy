@@ -73,6 +73,52 @@ pub fn rename_noreplace(
     expected_source_parent: &NodeInfo,
     expected_destination_parent: &NodeInfo,
 ) -> Result<(), RenameError> {
+    rename_checked(
+        source,
+        expected_source,
+        destination,
+        expected_source_parent,
+        expected_destination_parent,
+        None,
+    )
+}
+
+/// Capture a reviewed migration source into its same-volume private payload.
+/// Windows restores the reviewed DACL as protected rules after the rename,
+/// keeping permissions independent of the private destination's inheritance.
+pub fn capture_migration_source(
+    source: &Path,
+    expected_source: &NodeInfo,
+    metadata: &crate::MetadataInventory,
+    destination: &Path,
+    expected_source_parent: &NodeInfo,
+    expected_destination_parent: &NodeInfo,
+) -> Result<(), RenameError> {
+    crate::check_migration_metadata(metadata)?;
+    if expected_source.kind != NodeKind::Regular
+        || expected_source.identity.map(|id| id.volume)
+            != expected_destination_parent.identity.map(|id| id.volume)
+    {
+        return Err(invalid("same-volume regular migration source required").into());
+    }
+    rename_checked(
+        source,
+        expected_source,
+        destination,
+        expected_source_parent,
+        expected_destination_parent,
+        Some(metadata),
+    )
+}
+
+fn rename_checked(
+    source: &Path,
+    expected_source: &NodeInfo,
+    destination: &Path,
+    expected_source_parent: &NodeInfo,
+    expected_destination_parent: &NodeInfo,
+    metadata: Option<&crate::MetadataInventory>,
+) -> Result<(), RenameError> {
     let (source_parent, source_name) = split(source)?;
     let (destination_parent, destination_name) = split(destination)?;
     if source == destination
@@ -97,25 +143,36 @@ pub fn rename_noreplace(
         }
     }
     #[cfg(unix)]
-    return unix::rename(
-        source_parent,
-        source_name,
-        expected_source,
-        destination_parent,
-        destination_name,
-        expected_source_parent,
-        expected_destination_parent,
-    );
+    {
+        if let Some(metadata) = metadata
+            && crate::metadata_inventory(source, expected_source)?.binding_bytes()
+                != metadata.binding_bytes()
+        {
+            return Err(invalid("migration source metadata changed before capture").into());
+        }
+        unix::rename(
+            source_parent,
+            source_name,
+            expected_source,
+            destination_parent,
+            destination_name,
+            expected_source_parent,
+            expected_destination_parent,
+        )
+    }
     #[cfg(windows)]
-    return windows::rename(
-        source_parent,
-        source_name,
-        expected_source,
-        destination_parent,
-        destination_name,
-        expected_source_parent,
-        expected_destination_parent,
-    );
+    {
+        windows::rename(
+            source_parent,
+            source_name,
+            expected_source,
+            destination_parent,
+            destination_name,
+            expected_source_parent,
+            expected_destination_parent,
+            metadata,
+        )
+    }
 }
 
 fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {

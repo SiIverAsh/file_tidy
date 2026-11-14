@@ -252,8 +252,15 @@ impl Session {
             let to_before = platform::inspect(to)?;
             let original = platform::inspect(&source)?;
             let _pins = self.validate_scope(&capture, parents)?;
-            platform::rename_noreplace(&source, &original, &payload, &from_before, &to_before)
-                .map_err(|error| E::Io(error.error))?;
+            platform::capture_migration_source(
+                &source,
+                &original,
+                &metadata,
+                &payload,
+                &from_before,
+                &to_before,
+            )
+            .map_err(|error| E::Io(error.error))?;
             let observed = self.payload_manifest(
                 &capture,
                 &PlanOptions {
