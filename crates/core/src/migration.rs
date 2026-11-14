@@ -1421,6 +1421,11 @@ pub(crate) mod tests {
             scope.tree.len(),
             preview.preview.operations[0].manifest.len()
         );
+        assert!(
+            preview
+                .review_text()?
+                .contains("显式清理隔离副本后释放源卷空间")
+        );
         #[cfg(any(target_os = "macos", windows))]
         assert!(scope.opaque_bytes()? > 0);
         let no_content = preview

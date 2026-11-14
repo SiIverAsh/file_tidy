@@ -443,6 +443,46 @@ pub(crate) struct DirectoryProof {
 }
 
 impl MigrationScope {
+    pub(crate) fn review_description(&self) -> String {
+        let mut text = format!(
+            "\n   跨卷迁移：保留普通权限、修改时间和附属数据\n   校验暂存：{}\n   源端保留位置：{}",
+            self.temporary.display, self.capture.payload.display
+        );
+        if self.tree.is_empty() {
+            text.push_str("\n   完整性校验后移除源端载荷");
+        } else {
+            text.push_str(&format!(
+                "\n   原目录保留 {} 天，显式清理隔离副本后释放源卷空间",
+                self.capture.retention_days
+            ));
+        }
+        let descriptions = if self.tree.is_empty() {
+            vec![(".".to_owned(), &self.metadata)]
+        } else {
+            self.tree
+                .iter()
+                .map(|e| {
+                    (
+                        if e.relative.display.is_empty() {
+                            ".".into()
+                        } else {
+                            e.relative.display.clone()
+                        },
+                        &e.metadata,
+                    )
+                })
+                .collect()
+        };
+        for (relative, metadata) in descriptions {
+            for attribute in &metadata.attributes {
+                text.push_str(&format!(
+                    "\n   附属数据：{relative} / {}（{}，{} 字节）",
+                    attribute.name.display, attribute.kind, attribute.bytes
+                ));
+            }
+        }
+        text
+    }
     pub(crate) fn opaque_bytes(&self) -> Result<u64> {
         if self.tree.is_empty() {
             return self.metadata.opaque_bytes.parse().map_err(|_| E::Overflow);

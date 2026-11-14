@@ -281,7 +281,7 @@ impl Plan {
                 if operation.migration.is_some() {
                     "读取正文及对象附属数据，用于迁移和完整性校验"
                 } else {
-                    "读取内容用于复制和完整性校验"
+                    "读取内容用于操作和完整性校验"
                 }
             } else {
                 "修改文件或目标位置"
@@ -1278,6 +1278,9 @@ impl Plan {
                 for directory in &destination.create_directories {
                     output.push_str(&format!("\n   创建目录：{}", directory.display));
                 }
+            }
+            if let Some(migration) = &operation.migration {
+                output.push_str(&migration.review_description());
             }
             output.push_str("\n   完整清单：\n");
             let root = operation.source.to_path()?;
