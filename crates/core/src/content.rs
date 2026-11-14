@@ -196,8 +196,9 @@ impl OperationContentPermit {
         if !matches!(
             operation.kind,
             crate::plan::OperationKind::Copy | crate::plan::OperationKind::UndoCopy
-        ) && !(operation.kind == crate::plan::OperationKind::Move
+        ) && !((operation.kind == crate::plan::OperationKind::Move
             && operation.migration.is_some())
+            || session.is_directory_migration_inverse(operation)?)
             || !operation.manifest.iter().any(|item| item == entry)
             || !approved
                 .preview()
@@ -209,7 +210,10 @@ impl OperationContentPermit {
         }
         let path = entry.path.to_path()?;
         let expected = file_tidy_platform::inspect(&path)?;
-        if expected.kind != NodeKind::Regular
+        let attached =
+            operation.migration.is_some() || session.is_directory_migration_inverse(operation)?;
+        if !(expected.kind == NodeKind::Regular
+            || (attached && matches!(expected.kind, NodeKind::Directory | NodeKind::Symlink)))
             || crate::plan::Stamp::capture(&expected)? != entry.stamp
         {
             return Err(E::ChangedSincePlan);
@@ -273,10 +277,16 @@ impl OperationContentPermit {
         {
             return Err(E::ConfirmationRequired);
         }
-        Ok(file_tidy_platform::open_verified(
-            &self.path,
-            &self.expected,
-        )?)
+        Ok(match self.expected.kind {
+            NodeKind::Regular => file_tidy_platform::open_verified(&self.path, &self.expected)?,
+            NodeKind::Directory => {
+                file_tidy_platform::open_directory_attached_data(&self.path, &self.expected)?
+            }
+            NodeKind::Symlink => {
+                file_tidy_platform::open_symlink_attached_data(&self.path, &self.expected)?
+            }
+            _ => return Err(E::UnsupportedNode),
+        })
     }
     pub(crate) fn verify_after(&self, file: &File) -> crate::authorization::Result<()> {
         self.check_live()?;

@@ -239,13 +239,7 @@ impl Session {
             if let Some(migration) = &operation.migration {
                 entry.0 = entry
                     .0
-                    .checked_add(
-                        migration
-                            .metadata
-                            .opaque_bytes
-                            .parse::<u64>()
-                            .map_err(|_| E::Overflow)?,
-                    )
+                    .checked_add(migration.opaque_bytes()?)
                     .ok_or(E::Overflow)?;
             }
             for item in operation

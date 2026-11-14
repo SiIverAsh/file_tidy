@@ -65,7 +65,14 @@ pub(crate) struct MigrationScope {
     preservation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acl_inheritance: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tree: Vec<directory::ReviewedEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_commit: Option<String>,
 }
+
+#[path = "migration_directory.rs"]
+pub(crate) mod directory;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct StreamProof {
@@ -102,6 +109,13 @@ impl Session {
         parents: &mut BTreeMap<PathBuf, Stamp>,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), CopyFailure> {
+        if op
+            .migration
+            .as_ref()
+            .is_some_and(|scope| !scope.tree.is_empty())
+        {
+            return self.execute_directory_migration(approved, op, parents, cancel);
+        }
         let mut created = false;
         let mut journal = false;
         let mut step = "migration_begin";
@@ -382,8 +396,9 @@ impl Session {
         force: bool,
     ) -> Result<()> {
         if op.kind != OperationKind::Move
-            || op.manifest.len() != 1
-            || op.manifest[0].kind != "Regular"
+            || !op.manifest.iter().any(|entry| {
+                entry.path == op.source && matches!(entry.kind.as_str(), "Regular" | "Directory")
+            })
         {
             return Ok(());
         }
@@ -422,6 +437,13 @@ impl Session {
             metadata: MetadataDescription::capture(&metadata),
             preservation: "native_permissions_and_attached_data".into(),
             acl_inheritance: cfg!(windows).then(|| "preserve_source_rules".into()),
+            tree: if source_node.kind == platform::NodeKind::Directory {
+                directory::reviewed_entries(op)?
+            } else {
+                Vec::new()
+            },
+            source_commit: (source_node.kind == platform::NodeKind::Directory)
+                .then(|| "retain_original_tree".into()),
         });
         Ok(())
     }
@@ -437,11 +459,14 @@ impl Session {
         if op.kind != OperationKind::Move
             || op.managed.is_some()
             || op.permanent.is_some()
-            || op.manifest.len() != 1
-            || op.manifest[0].kind != "Regular"
-            || op.manifest[0].path != op.source
+            || (scope.tree.is_empty()
+                && (op.manifest.len() != 1
+                    || op.manifest[0].kind != "Regular"
+                    || op.manifest[0].path != op.source))
             || scope.preservation != "native_permissions_and_attached_data"
             || scope.acl_inheritance.as_deref() != cfg!(windows).then_some("preserve_source_rules")
+            || scope.source_commit.as_deref()
+                != (!scope.tree.is_empty()).then_some("retain_original_tree")
         {
             return Err(E::InvalidPlan);
         }
@@ -470,6 +495,9 @@ impl Session {
         absent(&capture)?;
         self.validate_scope(&scope.capture, parents)?;
         self.migration_source_metadata(op)?;
+        if !scope.tree.is_empty() && directory::reviewed_entries(op)? != scope.tree {
+            return Err(E::ChangedSincePlan);
+        }
         Ok(())
     }
     fn migration_source_metadata(
@@ -751,6 +779,13 @@ impl Session {
         &self,
         op: &PlannedOperation,
     ) -> Result<MigrationProgress> {
+        if op
+            .migration
+            .as_ref()
+            .is_some_and(|scope| !scope.tree.is_empty())
+        {
+            return self.inspect_directory_migration_progress(op);
+        }
         use crate::recovery::RecoveryDisposition as D;
         let scope = op.migration.as_ref().ok_or(E::StorageUnavailable)?;
         let destination = op.destination.as_ref().ok_or(E::StorageUnavailable)?;
@@ -961,6 +996,13 @@ impl Session {
         op: &PlannedOperation,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        if op.inverse.is_some() {
+            let (original, history) = self.inverse_original(op)?;
+            if let Some(proof) = directory::completed_directory_proof(&original, &history)? {
+                return self
+                    .verify_directory_migration_inverse_content(approved, op, &proof, cancel);
+            }
+        }
         if op.kind != OperationKind::Move || op.inverse.is_none() {
             return Ok(());
         }
@@ -1335,6 +1377,228 @@ pub(crate) mod tests {
         let report = session.execute_approved(approved, &CancellationToken::new())?;
         assert!(report.completed(), "{report:?}");
         assert_eq!(std::fs::read(&source)?, body);
+        assert!(!target.exists());
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires independent FILE_TIDY_TEST_ROOT"]
+    fn directory_migration_retains_original_objects_and_undo_restores_their_identity()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _forced = Forced::new();
+        let (_fixture, root, mut session) = fixture()?;
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("nested/empty"))?;
+        std::fs::write(source.join("nested/.env"), vec![23u8; 131173])?;
+        std::fs::hard_link(source.join("nested/.env"), source.join("alias"))?;
+        std::fs::hard_link(source.join("nested/.env"), root.join("external-alias"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing", source.join("dangling"))?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("missing", source.join("dangling"))?;
+        #[cfg(target_os = "macos")]
+        assert!(
+            std::process::Command::new("/usr/bin/xattr")
+                .args(["-w", "com.file-tidy.directory-core", "directory-attached"])
+                .arg(&source)
+                .status()?
+                .success()
+        );
+        #[cfg(windows)]
+        {
+            let mut name = source.as_os_str().to_os_string();
+            name.push(":directory_core");
+            std::fs::write(PathBuf::from(name), b"directory-attached")?;
+        }
+        let original = platform::inspect(&source)?;
+        let original_leaf = platform::inspect(&source.join("nested/.env"))?;
+        let preview = plan(&session, &source, &target)?;
+        let scope = preview.preview.operations[0]
+            .migration
+            .as_ref()
+            .ok_or("missing tree migration")?;
+        assert_eq!(
+            scope.tree.len(),
+            preview.preview.operations[0].manifest.len()
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(scope.opaque_bytes()? > 0);
+        let no_content = preview
+            .preview
+            .sensitive_acknowledgements
+            .iter()
+            .filter(|k| !k.ends_with(":content"))
+            .cloned()
+            .collect();
+        let confirmation = Confirmation {
+            digest: preview.digest().into(),
+            sensitive_acknowledgements: no_content,
+            ..Default::default()
+        };
+        assert!(session.confirm(preview, confirmation).is_err());
+        let preview = plan(&session, &source, &target)?;
+        let approved = confirm(&mut session, preview)?;
+        let batch = approved.preview().id.clone();
+        let result = session.execute_approved(approved, &CancellationToken::new())?;
+        assert!(result.completed(), "{result:?}");
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(target.join("nested/.env"))?,
+            vec![23u8; 131173]
+        );
+        assert_eq!(
+            platform::inspect(&target.join("nested/.env"))?.identity,
+            platform::inspect(&target.join("alias"))?.identity
+        );
+        assert_ne!(
+            original_leaf.identity,
+            platform::inspect(&target.join("alias"))?.identity
+        );
+        let retained = session.quarantine_items(10, false)?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, "stored");
+        let payload = retained[0].storage_path.to_path()?;
+        assert_eq!(platform::inspect(&payload)?.identity, original.identity);
+        assert_eq!(
+            platform::inspect(&payload.join("nested/.env"))?.identity,
+            original_leaf.identity
+        );
+        let undo = session.build_undo_plan(
+            &batch,
+            &[],
+            PlanOptions {
+                include_hidden: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(undo.preview.operations.len(), 2);
+        let approved = confirm(&mut session, undo)?;
+        let result = session.execute_approved(approved, &CancellationToken::new())?;
+        assert!(result.completed(), "{result:?}");
+        assert!(!target.exists());
+        assert_eq!(platform::inspect(&source)?.identity, original.identity);
+        assert_eq!(
+            platform::inspect(&source.join("nested/.env"))?.identity,
+            platform::inspect(&root.join("external-alias"))?.identity
+        );
+        assert_eq!(
+            std::fs::read_link(source.join("dangling"))?,
+            PathBuf::from("missing")
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires independent FILE_TIDY_TEST_ROOT"]
+    fn interrupted_directory_migration_reports_and_restores_the_retained_original()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _forced = Forced::new();
+        let (_fixture, root, mut session) = fixture()?;
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join("data"), b"original")?;
+        let original = platform::inspect(&source)?;
+        let preview = plan(&session, &source, &target)?;
+        let approved = confirm(&mut session, preview)?;
+        let batch = approved.preview().id.clone();
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        AFTER_CAPTURE.with(|h| *h.borrow_mut() = Some(Box::new(move || signal.cancel())));
+        let result = session.execute_approved(approved, &cancel)?;
+        assert!(!result.completed());
+        let before = session.batch_history(&batch)?;
+        let recovery = session.recovery_report(Some(&batch), 10)?;
+        assert_eq!(recovery.items.len(), 1);
+        assert!(recovery.items[0].migration.is_some());
+        assert_eq!(
+            serde_json::to_value(session.batch_history(&batch)?)?,
+            serde_json::to_value(before)?
+        );
+        let retained = session.quarantine_items(10, false)?;
+        assert_eq!(retained.len(), 1);
+        let restore = session.build_restore_plan(
+            &[retained[0].id.clone()],
+            None,
+            PlanOptions {
+                include_hidden: true,
+                ..Default::default()
+            },
+        )?;
+        let approved = confirm(&mut session, restore)?;
+        let result = session.execute_approved(approved, &CancellationToken::new())?;
+        assert!(result.completed(), "{result:?}");
+        assert_eq!(platform::inspect(&source)?.identity, original.identity);
+        assert_eq!(std::fs::read(source.join("data"))?, b"original");
+        assert!(target.exists());
+        Ok(())
+    }
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires independent FILE_TIDY_TEST_ROOT and two local volumes"]
+    fn directory_migration_uses_native_windows_volumes_and_restores_the_original_tree() -> TestResult
+    {
+        let (_fixture, root, mut session) = fixture()?;
+        let base = directories::BaseDirs::new().ok_or("profile unavailable")?;
+        let volume_root = base
+            .cache_dir()
+            .ancestors()
+            .last()
+            .ok_or("volume root unavailable")?;
+        let outer = tempfile::Builder::new()
+            .prefix("file-tidy-tree-cross-")
+            .tempdir_in(volume_root)?;
+        let outer_path = outer.path().canonicalize()?;
+        let outer_pin =
+            platform::open_directory_pinned(&outer_path, &platform::inspect(&outer_path)?)?;
+        let source_root_file =
+            platform::create_private_directory(&outer_pin, "source-grant".as_ref())?;
+        let source_grant = outer_path.join("source-grant");
+        drop(source_root_file);
+        let source = source_grant.join("source");
+        std::fs::create_dir(&source)?;
+        let target = root.join("target");
+        std::fs::write(source.join("data"), b"native-directory-migration")?;
+        std::fs::hard_link(source.join("data"), source.join("alias"))?;
+        let original = platform::inspect(&source)?;
+        let leaf = platform::inspect(&source.join("data"))?;
+        if original.identity.ok_or("source ID missing")?.volume
+            == platform::inspect(&root)?
+                .identity
+                .ok_or("target ID missing")?
+                .volume
+        {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI needs distinct local volumes"
+            );
+            return Ok(());
+        }
+        session.grant(&source_grant, false)?;
+        let preview = plan(&session, &source, &target)?;
+        let approved = confirm(&mut session, preview)?;
+        let batch = approved.preview().id.clone();
+        let result = session.execute_approved(approved, &CancellationToken::new())?;
+        assert!(result.completed(), "{result:?}");
+        let history = session.batch_history(&batch)?;
+        assert!(history.events.iter().any(|e| e.step == "rename"
+            && e.phase == "result"
+            && e.payload.get("cross_device").and_then(|v| v.as_bool()) == Some(true)));
+        let inverse = session.build_undo_plan(
+            &batch,
+            &[],
+            PlanOptions {
+                include_hidden: true,
+                ..Default::default()
+            },
+        )?;
+        let approved = confirm(&mut session, inverse)?;
+        let result = session.execute_approved(approved, &CancellationToken::new())?;
+        assert!(result.completed(), "{result:?}");
+        assert_eq!(platform::inspect(&source)?.identity, original.identity);
+        assert_eq!(
+            platform::inspect(&source.join("alias"))?.identity,
+            leaf.identity
+        );
         assert!(!target.exists());
         Ok(())
     }

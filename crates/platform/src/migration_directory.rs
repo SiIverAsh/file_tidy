@@ -69,6 +69,9 @@ struct LinkRecord {
 }
 
 impl MigrationDirectory {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
     /// Creation and subsequent mutations belong to a durable caller-owned plan.
     pub fn create(parent: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
         let envelope = StagedDirectory::create(parent, expected, name)?;
@@ -466,6 +469,38 @@ impl MigrationDirectory {
             crate::metadata_inventory::inventory_open(&self.path.join(relative), &opened.file)?;
         self.verify()?;
         Ok(result)
+    }
+
+    pub fn visit_body(
+        &self,
+        relative: &Path,
+        check: &(impl Fn() -> io::Result<()> + Sync),
+        sink: &mut impl FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        use std::io::Read;
+        check()?;
+        let mut opened = self.read_entry(relative)?;
+        if crate::inspect_file(&opened.file)?.kind != NodeKind::Regular {
+            return Err(invalid("regular migration payload required"));
+        }
+        let path = self.path.join(relative);
+        let before = crate::metadata_inventory::inventory_open(&path, &opened.file)?;
+        let mut buffer = [0u8; 65536];
+        loop {
+            check()?;
+            let count = opened.file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            sink(&buffer[..count])?;
+        }
+        check()?;
+        if crate::metadata_inventory::inventory_open(&path, &opened.file)?.binding_bytes()
+            != before.binding_bytes()
+        {
+            return Err(invalid("payload changed during body verification"));
+        }
+        self.verify()
     }
 
     pub fn visit_data(

@@ -94,6 +94,29 @@ impl Session {
                 .ok_or(E::InvalidRequest)?
                 .path
                 .to_path()?;
+            if let Some(proof) =
+                crate::migration::directory::completed_directory_proof(original, &history)?
+            {
+                for mut op in
+                    self.build_directory_migration_undo(original, &proof, batch, &options)?
+                {
+                    budget = budget
+                        .checked_sub(op.manifest.len())
+                        .ok_or(E::IncompleteManifest)?;
+                    self.rebind_quarantine(&mut op, &batch_id)?;
+                    requests.push(OperationRequest {
+                        kind: op.kind,
+                        source: op.source.to_path()?,
+                        destination: op
+                            .destination
+                            .as_ref()
+                            .map(|d| d.path.to_path())
+                            .transpose()?,
+                    });
+                    operations.push(op);
+                }
+                continue;
+            }
             let mut inverse = match original.kind {
                 K::Quarantine | K::UndoCopy => self.build_restore_plan(
                     std::slice::from_ref(&original.id),
@@ -244,6 +267,11 @@ impl Session {
             })
             .collect();
         self.check_undo_dependencies(&original.id, &live_ids)?;
+        if let Some(proof) =
+            crate::migration::directory::completed_directory_proof(&original, &history)?
+        {
+            return self.validate_directory_migration_inverse(plan, op, &original, &proof);
+        }
         let target = original
             .destination
             .as_ref()
@@ -295,6 +323,8 @@ impl Session {
                 serde_json::from_value::<Vec<TreeEntryProof>>(entries.clone())?.into_iter().map(|entry|entry.stamp).collect::<Vec<_>>()
             } else if let Some(entries) = after.get("observed_manifest") {
                 serde_json::from_value::<Vec<crate::plan::ManifestEntry>>(entries.clone())?.into_iter().map(|entry|entry.stamp).collect()
+            } else if after.get("protocol").and_then(Value::as_str)==Some("verified_directory_migration") {
+                crate::migration::directory::target_stamps(&after)?
             } else if after.get("protocol").and_then(Value::as_str)==Some("verified_migration") {
                 vec![serde_json::from_value::<Stamp>(after.get("target").ok_or(E::StorageUnavailable)?.clone())?]
             } else { vec![serde_json::from_value::<Stamp>(after.get("stamp").ok_or(E::StorageUnavailable)?.clone())?] };

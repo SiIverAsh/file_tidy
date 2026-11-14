@@ -279,7 +279,7 @@ impl Plan {
             "敏感项逐项许可：{path}（{}）",
             if scope == "content" {
                 if operation.migration.is_some() {
-                    "读取文件正文及附属数据，用于迁移和完整性校验"
+                    "读取正文及对象附属数据，用于迁移和完整性校验"
                 } else {
                     "读取内容用于复制和完整性校验"
                 }
@@ -489,15 +489,11 @@ impl Session {
         for operation in &operations {
             if let Some(migration) = &operation.migration {
                 bytes = bytes
-                    .checked_add(
-                        migration
-                            .metadata
-                            .opaque_bytes
-                            .parse::<u64>()
-                            .map_err(|_| E::Overflow)?,
-                    )
+                    .checked_add(migration.opaque_bytes()?)
                     .ok_or(E::Overflow)?;
             }
+            let migration_content =
+                operation.migration.is_some() || self.is_directory_migration_inverse(operation)?;
             permanent |= operation.kind == OperationKind::PermanentDelete;
             let mut nonempty_directories = HashSet::new();
             for child in &operation.manifest {
@@ -530,12 +526,12 @@ impl Session {
                     let cross_volume = operation.destination.as_ref().is_some_and(|d| {
                         d.parent_stamp.identity.volume != entry.stamp.identity.volume
                     });
-                    if entry.kind == "Regular"
-                        && (matches!(
-                            operation.kind,
-                            OperationKind::Copy | OperationKind::UndoCopy
-                        ) || (operation.kind == OperationKind::Move
-                            && (cross_volume || operation.migration.is_some())))
+                    if migration_content
+                        || (entry.kind == "Regular"
+                            && (matches!(
+                                operation.kind,
+                                OperationKind::Copy | OperationKind::UndoCopy
+                            ) || (operation.kind == OperationKind::Move && cross_volume)))
                     {
                         sensitive.insert(format!("{}:{path_digest}:content", operation.id));
                     }
