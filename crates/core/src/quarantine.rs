@@ -508,7 +508,7 @@ impl Session {
         item: &Id,
     ) -> Result<(QuarantineScope, PlannedOperation)> {
         let (batch, digest, original, storage) = self.store.as_ref().ok_or(E::StorageRequired)?.journal_read(|db| {
-            db.query_row("SELECT hex(o.batch_id),q.manifest_digest,q.original_path,q.storage_path FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE q.item_id=?1 AND q.op_id=q.item_id AND q.state IN ('stored','needs_recovery') AND (o.state='done' OR o.kind='permanent_delete')", [id_bytes(item)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?))).map_err(E::from)
+            db.query_row("SELECT hex(o.batch_id),q.manifest_digest,q.original_path,q.storage_path FROM quarantine_items q JOIN operations o ON q.op_id=o.op_id WHERE q.item_id=?1 AND q.op_id=q.item_id AND q.state IN ('stored','needs_recovery') AND (o.state='done' OR o.kind IN ('permanent_delete','move'))", [id_bytes(item)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?))).map_err(E::from)
         })?;
         let history = self.batch_history(&batch.parse()?)?;
         let preview: crate::plan::PlanPreview = serde_json::from_value(history.snapshot)?;
@@ -522,6 +522,7 @@ impl Session {
                         OperationKind::Quarantine
                             | OperationKind::UndoCopy
                             | OperationKind::PermanentDelete
+                            | OperationKind::Move
                     )
             })
             .ok_or(E::StorageUnavailable)?;
@@ -529,6 +530,9 @@ impl Session {
             metadata(self, &item_key(item))?.ok_or(E::StorageUnavailable)?;
         let planned = match &op.managed {
             Some(ManagedOperation::Quarantine(scope)) => scope,
+            _ if op.migration.is_some() => {
+                &op.migration.as_ref().ok_or(E::StorageUnavailable)?.capture
+            }
             _ => {
                 &op.permanent
                     .as_ref()
@@ -706,6 +710,7 @@ impl Session {
                 destination: Some(target),
                 inverse: None,
                 permanent: None,
+                migration: None,
                 manifest,
                 source_parent_stamp: Stamp::capture(&platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
@@ -742,6 +747,25 @@ impl Session {
                 .filter(|d| d.identity.is_none())
                 .map(|d| d.path.clone())
                 .collect();
+        }
+        if let Some(migration) = &op.migration {
+            let options = PlanOptions {
+                quarantine_retention_days: migration.capture.retention_days,
+                ..Default::default()
+            };
+            let (_, capture) =
+                self.plan_quarantine(&op.source.to_path()?, batch, &op.id, &options)?;
+            let temporary = op
+                .destination
+                .as_ref()
+                .ok_or(E::InvalidPlan)?
+                .path
+                .to_path()?
+                .parent()
+                .ok_or(E::InvalidPath)?
+                .join(format!(".file-tidy-{}.stage", op.id));
+            op.migration.as_mut().ok_or(E::InvalidPlan)?.capture = capture;
+            op.migration.as_mut().ok_or(E::InvalidPlan)?.temporary = NativePath::new(&temporary);
         }
         Ok(())
     }

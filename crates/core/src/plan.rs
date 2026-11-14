@@ -182,6 +182,8 @@ pub struct PlannedOperation {
     pub(crate) managed: Option<crate::quarantine::ManagedOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) permanent: Option<crate::permanent::PermanentScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) migration: Option<crate::migration::MigrationScope>,
     pub(crate) source_parent_stamp: Stamp,
 }
 
@@ -276,7 +278,11 @@ impl Plan {
         Ok(format!(
             "敏感项逐项许可：{path}（{}）",
             if scope == "content" {
-                "读取内容用于复制和完整性校验"
+                if operation.migration.is_some() {
+                    "读取文件正文及附属数据，用于迁移和完整性校验"
+                } else {
+                    "读取内容用于复制和完整性校验"
+                }
             } else {
                 "修改文件或目标位置"
             }
@@ -402,7 +408,7 @@ impl Session {
                 source: source.clone(),
                 destination: destination.as_ref().map(|d| d.path.to_path()).transpose()?,
             });
-            operations.push(PlannedOperation {
+            let mut operation = PlannedOperation {
                 id: operation_id,
                 kind: request.kind,
                 source: NativePath::new(&source),
@@ -413,10 +419,16 @@ impl Session {
                 inverse: None,
                 managed,
                 permanent,
+                migration: None,
                 source_parent_stamp: Stamp::capture(&file_tidy_platform::inspect(
                     source.parent().ok_or(E::InvalidPath)?,
                 )?)?,
-            });
+            };
+            self.prepare_migration_review(&mut operation, &batch_id, &options, false)?;
+            if let Some(migration) = &operation.migration {
+                reserved.insert(migration.temporary.to_path()?);
+            }
+            operations.push(operation);
         }
         self.seal_plan(operations, resolved, options, batch_id)
     }
@@ -475,6 +487,17 @@ impl Session {
         let mut sensitive = BTreeSet::new();
         let mut permanent = false;
         for operation in &operations {
+            if let Some(migration) = &operation.migration {
+                bytes = bytes
+                    .checked_add(
+                        migration
+                            .metadata
+                            .opaque_bytes
+                            .parse::<u64>()
+                            .map_err(|_| E::Overflow)?,
+                    )
+                    .ok_or(E::Overflow)?;
+            }
             permanent |= operation.kind == OperationKind::PermanentDelete;
             let mut nonempty_directories = HashSet::new();
             for child in &operation.manifest {
@@ -511,7 +534,8 @@ impl Session {
                         && (matches!(
                             operation.kind,
                             OperationKind::Copy | OperationKind::UndoCopy
-                        ) || (operation.kind == OperationKind::Move && cross_volume))
+                        ) || (operation.kind == OperationKind::Move
+                            && (cross_volume || operation.migration.is_some())))
                     {
                         sensitive.insert(format!("{}:{path_digest}:content", operation.id));
                     }
@@ -746,6 +770,7 @@ impl Session {
                 }
             }
         }
+        self.validate_migration_review(plan, operation, changed_parents)?;
         Ok(())
     }
 

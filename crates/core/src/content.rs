@@ -196,7 +196,9 @@ impl OperationContentPermit {
         if !matches!(
             operation.kind,
             crate::plan::OperationKind::Copy | crate::plan::OperationKind::UndoCopy
-        ) || !operation.manifest.iter().any(|item| item == entry)
+        ) && !(operation.kind == crate::plan::OperationKind::Move
+            && operation.migration.is_some())
+            || !operation.manifest.iter().any(|item| item == entry)
             || !approved
                 .preview()
                 .operations
@@ -235,6 +237,30 @@ impl OperationContentPermit {
             return Err(crate::authorization::PlanningError::InvalidPlan);
         }
         Ok(())
+    }
+    pub(crate) fn relocated_to_payload(
+        &self,
+        path: &Path,
+        expected: &NodeInfo,
+        permit: &crate::quarantine::ManagedPayloadPermit,
+    ) -> crate::authorization::Result<Self> {
+        use crate::authorization::PlanningError as E;
+        self.check_live()?;
+        permit.relative(path, path)?;
+        let location = file_tidy_platform::classify_location(path)?;
+        if !self.expected.matches(expected)
+            || location.kind != file_tidy_platform::LocationKind::Local
+            || location.mount_root != self.mount_root
+        {
+            return Err(E::ChangedSincePlan);
+        }
+        Ok(Self {
+            path: path.into(),
+            expected: expected.clone(),
+            mount_root: self.mount_root.clone(),
+            sensitive_acknowledged: self.sensitive_acknowledged,
+            expires_at: self.expires_at,
+        })
     }
     pub(crate) fn open(&self) -> crate::authorization::Result<File> {
         self.check_live()?;

@@ -345,6 +345,23 @@ impl StateStore {
         self.record_event(operation, step, "result", payload, Some(state), write)
     }
 
+    pub(crate) fn record_source_remove_intent(
+        &mut self,
+        operation: &Id,
+        step: &str,
+        payload: &impl Serialize,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.record_event(
+            operation,
+            step,
+            "intent",
+            payload,
+            Some(OperationState::SourceRemoveIntent),
+            write,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_event(
         &mut self,

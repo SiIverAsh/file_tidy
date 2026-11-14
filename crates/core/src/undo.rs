@@ -119,6 +119,10 @@ impl Session {
                 K::PermanentDelete => return Err(E::InvalidRequest),
             };
             let mut op = inverse.preview.operations.remove(0);
+            if let Some(proof) = crate::migration::completed_proof(original, &history)? {
+                self.verify_migration_undo_metadata(&proof)?;
+                self.prepare_migration_review(&mut op, &batch_id, &options, true)?;
+            }
             if original.kind == K::Copy {
                 op.kind = K::UndoCopy;
             }
@@ -203,7 +207,7 @@ impl Session {
         self.seal_plan(operations, requests, plan.preview.options.clone(), batch)
     }
 
-    fn inverse_original(
+    pub(crate) fn inverse_original(
         &self,
         op: &PlannedOperation,
     ) -> Result<(PlannedOperation, BatchHistoryDetail)> {
@@ -255,7 +259,11 @@ impl Session {
                 self.verify_tree_copy(&target, &proof, true)?;
             }
             K::Move | K::Rename if op.kind == original.kind => {
-                self.verify_renamed(&original, &target)?;
+                if let Some(proof) = crate::migration::completed_proof(&original, &history)? {
+                    self.verify_migration_undo_metadata(&proof)?;
+                } else {
+                    self.verify_renamed(&original, &target)?;
+                }
             }
             K::Restore if op.kind == K::Quarantine => {
                 self.verify_renamed(&original, &target)?;
@@ -287,6 +295,8 @@ impl Session {
                 serde_json::from_value::<Vec<TreeEntryProof>>(entries.clone())?.into_iter().map(|entry|entry.stamp).collect::<Vec<_>>()
             } else if let Some(entries) = after.get("observed_manifest") {
                 serde_json::from_value::<Vec<crate::plan::ManifestEntry>>(entries.clone())?.into_iter().map(|entry|entry.stamp).collect()
+            } else if after.get("protocol").and_then(Value::as_str)==Some("verified_migration") {
+                vec![serde_json::from_value::<Stamp>(after.get("target").ok_or(E::StorageUnavailable)?.clone())?]
             } else { vec![serde_json::from_value::<Stamp>(after.get("stamp").ok_or(E::StorageUnavailable)?.clone())?] };
             let mut query = db.prepare("SELECT hex(op_id),CASE WHEN inverse_of IS NULL THEN NULL ELSE hex(inverse_of) END,state,path_encoding,source_path,destination_path,manifest FROM operations WHERE rowid>?1 ORDER BY rowid DESC LIMIT 10001")?;
             let mut result=Vec::new();

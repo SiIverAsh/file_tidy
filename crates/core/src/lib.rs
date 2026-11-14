@@ -19,6 +19,7 @@ pub use suggestions::suggested_directories;
 mod content;
 mod copy;
 mod copy_recovery;
+pub mod migration;
 mod model;
 pub mod policy;
 mod report;

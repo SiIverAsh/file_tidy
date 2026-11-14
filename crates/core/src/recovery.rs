@@ -17,6 +17,8 @@ pub enum RecoveryDisposition {
     NotCommitted,
     /// Irreversible per-entry results and the current retained payload are listed.
     PermanentProgressObserved,
+    /// A migration's publication, retained original, and removal intent are reported.
+    MigrationProgressObserved,
     /// The first rename reached the reviewed intermediate name; completion needs review.
     TemporaryObserved,
     /// A durable rename intent matches the relocated object; journal completion is pending.
@@ -46,6 +48,8 @@ pub struct RecoveryItem {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permanent: Option<crate::permanent::PermanentProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration: Option<crate::migration::MigrationProgress>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,11 +87,21 @@ impl Session {
                 // policy below, including for records from an older binary.
                 let policy_changed = preview.policy_digest != policy_digest();
                 let mut permanent = None;
+                let mut migration = None;
                 let (disposition, reason) = if operation.kind == OperationKind::PermanentDelete {
                     match self.inspect_permanent_progress(operation, &history) {
                         Ok(progress) => {
                             let result = (progress.disposition, progress.reason.clone());
                             permanent = Some(progress);
+                            result
+                        }
+                        Err(error) => (RecoveryDisposition::Unavailable, error.to_string()),
+                    }
+                } else if self.migration_started(operation)? {
+                    match self.inspect_migration_progress(operation) {
+                        Ok(progress) => {
+                            let result = (progress.disposition, progress.reason.clone());
+                            migration = Some(progress);
                             result
                         }
                         Err(error) => (RecoveryDisposition::Unavailable, error.to_string()),
@@ -118,16 +132,26 @@ impl Session {
                     operation_id: recorded.id.clone(),
                     source: operation.source.clone(),
                     destination: operation.destination.as_ref().map(|d| d.path.clone()),
-                    temporary: operation.destination.as_ref().and_then(|d| {
-                        d.spelling_temporary
-                            .clone()
-                            .or_else(|| d.copy_temporary.clone())
-                    }),
+                    temporary: operation
+                        .destination
+                        .as_ref()
+                        .and_then(|d| {
+                            d.spelling_temporary
+                                .clone()
+                                .or_else(|| d.copy_temporary.clone())
+                        })
+                        .or_else(|| {
+                            operation
+                                .migration
+                                .as_ref()
+                                .map(|scope| scope.temporary.clone())
+                        }),
                     journal_state: recorded.state,
                     policy_changed,
                     disposition,
                     reason,
                     permanent,
+                    migration,
                 });
             }
         }

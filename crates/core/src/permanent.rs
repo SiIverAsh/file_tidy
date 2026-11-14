@@ -61,6 +61,7 @@ impl Session {
                 manifest,
                 inverse: None,
                 managed: None,
+                migration: None,
                 permanent: Some(PermanentScope {
                     storage,
                     item: Some(item.clone()),

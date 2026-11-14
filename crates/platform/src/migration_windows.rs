@@ -178,6 +178,38 @@ impl<'a> Reader<'a> {
             length: 0,
         }
     }
+    fn skip(&mut self, mut length: u64) -> io::Result<()> {
+        let buffered = length.min((self.length - self.offset) as u64) as usize;
+        self.offset += buffered;
+        length -= buffered as u64;
+        if length == 0 {
+            return Ok(());
+        }
+        let mut low = 0u32;
+        let mut high = 0u32;
+        // SAFETY: the synchronous backup context belongs to this reader. All
+        // buffered bytes precede the requested remainder of this stream; the
+        // skip cannot consume the following stream's header.
+        if unsafe {
+            BackupSeek(
+                self.backup.file.as_raw_handle(),
+                length as u32,
+                (length >> 32) as u32,
+                &mut low,
+                &mut high,
+                &mut self.backup.context,
+            )
+        } == 0
+        {
+            return Err(native_error(
+                "skip migration file data during attached-stream verification",
+            ));
+        }
+        if (u64::from(low) | (u64::from(high) << 32)) != length {
+            return Err(invalid("backup seek did not cover the recorded stream"));
+        }
+        Ok(())
+    }
 }
 impl Read for Reader<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
@@ -380,6 +412,10 @@ pub(super) fn visit(
         header(&mut reader)?
     } {
         let attached = matches!(header.kind, EA | ALTERNATE);
+        if matches!(header.kind, DATA | SPARSE) {
+            reader.skip(header.length)?;
+            continue;
+        }
         if attached {
             sink(MigrationData::Begin {
                 kind: header.kind,

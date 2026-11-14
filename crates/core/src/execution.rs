@@ -227,7 +227,7 @@ impl Session {
             .preview
             .operations
             .iter()
-            .filter(|op| op.kind == OperationKind::Copy)
+            .filter(|op| op.kind == OperationKind::Copy || op.migration.is_some())
         {
             let destination = operation.destination.as_ref().ok_or(E::InvalidPlan)?;
             let parent = destination.existing_parent.to_path()?;
@@ -236,6 +236,18 @@ impl Session {
             let available = platform::available_bytes(&pinned)?;
             let volume = info.identity.ok_or(E::UnsupportedSafetyGuarantee)?.volume;
             let entry = volumes.entry(volume).or_insert((0, available));
+            if let Some(migration) = &operation.migration {
+                entry.0 = entry
+                    .0
+                    .checked_add(
+                        migration
+                            .metadata
+                            .opaque_bytes
+                            .parse::<u64>()
+                            .map_err(|_| E::Overflow)?,
+                    )
+                    .ok_or(E::Overflow)?;
+            }
             for item in operation
                 .manifest
                 .iter()
@@ -288,6 +300,7 @@ impl Session {
                                 .clone()
                                 .or_else(|| d.copy_temporary.clone())
                         })
+                        .or_else(|| op.migration.as_ref().map(|m| m.temporary.clone()))
                         .or_else(|| op.permanent.as_ref().map(|p| p.storage.payload.clone())),
                     status: ExecutionStatus::NotStarted,
                     reason: None,
@@ -302,6 +315,12 @@ impl Session {
                 break;
             }
             if let Err(error) = self.validate_operation(plan, operation, &changed_parents) {
+                self.fail_operation(&mut report, index, operation, error, false);
+                break;
+            }
+            if let Err(error) =
+                self.verify_inverse_migration_content(&approved, operation, cancellation)
+            {
                 self.fail_operation(&mut report, index, operation, error, false);
                 break;
             }
@@ -439,7 +458,53 @@ impl Session {
                         break;
                     }
                 }
-                Err((error, may_have_moved)) => {
+                Err((_, false, true)) if operation.migration.is_some() => {
+                    if let Err(error) = self.store.as_mut().ok_or(E::StorageRequired)?.record_result(&operation.id,"rename",
+                        &serde_json::json!({"cross_device":true,"source":operation.source,"destination":operation.destination.as_ref().map(|d|&d.path)}),OperationState::Prepared) {
+                        report.journal_error=Some(error.to_string());
+                        break;
+                    }
+                    match self.execute_migration(
+                        &approved,
+                        operation,
+                        &mut changed_parents,
+                        cancellation,
+                    ) {
+                        Ok(()) => report.operations[index].status = ExecutionStatus::Done,
+                        Err(failure) => {
+                            let result = &mut report.operations[index];
+                            result.status = if failure.created {
+                                ExecutionStatus::NeedsRecovery
+                            } else if cancellation.is_cancelled() {
+                                ExecutionStatus::Cancelled
+                            } else {
+                                ExecutionStatus::Failed
+                            };
+                            result.reason = Some(failure.error.to_string());
+                            if failure.journal {
+                                report.journal_error = Some(failure.error.to_string());
+                            } else if let Err(error) = self
+                                .store
+                                .as_mut()
+                                .ok_or(E::StorageRequired)?
+                                .record_result(
+                                    &operation.id,
+                                    failure.step,
+                                    result,
+                                    if failure.created {
+                                        OperationState::NeedsRecovery
+                                    } else {
+                                        OperationState::Failed
+                                    },
+                                )
+                            {
+                                report.journal_error = Some(error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err((error, may_have_moved, _)) => {
                     self.fail_operation(&mut report, index, operation, error, may_have_moved);
                     break;
                 }
@@ -520,7 +585,7 @@ impl Session {
         &self,
         operation: &PlannedOperation,
         changed_parents: &mut BTreeMap<PathBuf, Stamp>,
-    ) -> std::result::Result<Vec<ManifestEntry>, (E, bool)> {
+    ) -> std::result::Result<Vec<ManifestEntry>, (E, bool, bool)> {
         let prepare = || -> Result<_> {
             let source = operation.source.to_path()?;
             let destination = operation
@@ -575,7 +640,15 @@ impl Session {
             source_info,
             source_parent_info,
             destination_parent_info,
-        ) = prepare().map_err(|e| (e, false))?;
+        ) = prepare().map_err(|e| (e, false, false))?;
+        #[cfg(test)]
+        if operation.kind == OperationKind::Move && crate::migration::tests::force_cross_device() {
+            return Err((
+                E::Io(std::io::Error::other("injected cross-device rename")),
+                false,
+                true,
+            ));
+        }
         platform::rename_noreplace(
             &source,
             &source_info,
@@ -583,7 +656,10 @@ impl Session {
             &source_parent_info,
             &destination_parent_info,
         )
-        .map_err(|error| (E::Io(error.error), error.may_have_moved))?;
+        .map_err(|error| {
+            let cross = error.is_cross_device();
+            (E::Io(error.error), error.may_have_moved, cross)
+        })?;
         let verify = || -> Result<Vec<ManifestEntry>> {
             let manifest = self.verify_renamed(operation, &destination)?;
             for (path, before) in [
@@ -601,17 +677,17 @@ impl Session {
             }
             Ok(manifest)
         };
-        let manifest = verify().map_err(|e| (e, true))?;
+        let manifest = verify().map_err(|e| (e, true, false))?;
         for (path, before) in [
             (source_parent, source_parent_info),
             (destination_parent, destination_parent_info),
         ] {
-            let node = platform::inspect(&path).map_err(|e| (E::from(e), true))?;
-            let expected = Stamp::capture(&before).map_err(|e| (e, true))?;
+            let node = platform::inspect(&path).map_err(|e| (E::from(e), true, false))?;
+            let expected = Stamp::capture(&before).map_err(|e| (e, true, false))?;
             if !expected.same_identity(&node) {
-                return Err((E::ChangedSincePlan, true));
+                return Err((E::ChangedSincePlan, true, false));
             }
-            let stamp = Stamp::capture(&node).map_err(|e| (e, true))?;
+            let stamp = Stamp::capture(&node).map_err(|e| (e, true, false))?;
             changed_parents.insert(path, stamp);
         }
         Ok(manifest)
@@ -759,7 +835,7 @@ impl Session {
                 ));
             }
             let observed = self.rename_operation(&physical, changed_parents).map_err(
-                |(error, maybe_moved)| failure(error, moved || maybe_moved, false, false, step),
+                |(error, maybe_moved, _)| failure(error, moved || maybe_moved, false, false, step),
             )?;
             if moved {
                 self.verify_renamed(
