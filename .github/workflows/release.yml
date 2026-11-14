@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to release (for example v0.1.0)
+        description: Existing version tag containing CLI and GUI (for example v0.2.0)
         required: true
         type: string
 
@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Validate version tag format
         shell: bash
@@ -42,6 +43,36 @@ jobs:
       - name: Record immutable release commit
         id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Validate GUI sources and release version
+        id: version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+
+          expected = os.environ["RELEASE_TAG"][1:]
+          versions = {
+              "Cargo.toml": tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"],
+          }
+          for name in ("tauri.conf.json", "package.json", "package-lock.json"):
+              path = pathlib.Path("crates/gui") / ("src-tauri" if name == "tauri.conf.json" else "") / name
+              if not path.is_file():
+                  raise SystemExit("Selected tag has no GUI release sources. Create a new version tag containing the GUI and release configuration.")
+              data = json.loads(path.read_text(encoding="utf-8"))
+              versions[str(path)] = data["version"]
+              if name == "package-lock.json":
+                  versions[f"{path} packages[root]"] = data["packages"][""]["version"]
+              if name == "tauri.conf.json" and not data.get("bundle", {}).get("active"):
+                  raise SystemExit("GUI bundling is disabled in the selected tag. Tag the updated release configuration.")
+          for manifest, version in versions.items():
+              if version != expected:
+                  raise SystemExit(f"{manifest}: version {version!r} does not match tag version {expected!r}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={expected}\n")
+          PY
 
   ci:
     name: Release checks
@@ -65,6 +96,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       commit: ${{ needs.resolve.outputs.commit }}
+      version: ${{ needs.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -134,6 +166,90 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  gui:
+    name: Package GUI (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - runner: macos-15
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+    defaults:
+      run:
+        shell: bash
+    env:
+      GUI_TARGET: ${{ matrix.target }}
+      GUI_BUNDLES: ${{ matrix.bundles }}
+      GUI_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: gui-release-${{ matrix.target }}
+          save-if: false
+      - name: Install Linux Tauri 2 system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - name: Install locked GUI build tools
+        working-directory: crates/gui
+        run: npm ci
+      - name: Build GUI installer
+        working-directory: crates/gui
+        run: npm run tauri -- build --ci --target "$GUI_TARGET" --bundles "$GUI_BUNDLES" -- --locked
+      - name: Verify bundled frontend CSP
+        working-directory: crates/gui
+        run: npm run check:csp
+      - name: Collect GUI installer and checksum
+        run: |
+          python3 scripts/collect_gui_artifacts.py \
+            --bundle-dir "target/$GUI_TARGET/release/bundle" \
+            --output-dir target/gui-distrib \
+            --target "$GUI_TARGET" \
+            --version "$GUI_VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gui-${{ matrix.target }}
+          path: target/gui-distrib/*
+          if-no-files-found: error
+          retention-days: 7
+
   installers:
     name: Build installers
     needs: [plan, build]
@@ -173,7 +289,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [ci, security, plan, build, installers]
+    needs: [ci, security, plan, build, gui, installers]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -188,6 +304,11 @@ jobs:
         with:
           name: dist-global
           path: artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: gui-*
+          path: artifacts
+          merge-multiple: true
       - name: Publish complete release
         shell: bash
         env:
@@ -195,7 +316,24 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           title=$(jq -r '.announcement_title' artifacts/dist-manifest.json)
-          jq -r '.announcement_github_body' artifacts/dist-manifest.json > release-notes.md
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG"
+          cat > release-notes.md <<EOF
+          ## Desktop GUI installers
+
+          | Platform | Installer |
+          | --- | --- |
+          | Apple Silicon macOS | [DMG]($base/file-tidy-gui-$version-aarch64-apple-darwin.dmg) |
+          | Intel macOS | [DMG]($base/file-tidy-gui-$version-x86_64-apple-darwin.dmg) |
+          | Windows x64 | [Setup EXE]($base/file-tidy-gui-$version-x86_64-pc-windows-msvc-setup.exe) |
+          | Linux x64 (Ubuntu 22.04+) | [DEB]($base/file-tidy-gui-$version-x86_64-unknown-linux-gnu.deb) |
+
+          Each GUI installer has a matching .sha256 checksum asset. macOS installers use ad-hoc signing and are not Apple-notarized; for a trusted download, use System Settings > Privacy & Security > Open Anyway after the first blocked launch.
+
+          ## Command-line tools
+
+          EOF
+          jq -r '.announcement_github_body' artifacts/dist-manifest.json >> release-notes.md
           args=()
           if jq -e '.announcement_is_prerelease' artifacts/dist-manifest.json > /dev/null; then
             args+=(--prerelease)

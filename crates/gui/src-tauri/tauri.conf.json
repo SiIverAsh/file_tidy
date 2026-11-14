@@ -26,6 +26,14 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["dmg", "nsis", "deb"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "shortDescription": "Local file organization with reviewed operations",
+    "longDescription": "Browse disk usage, find duplicate files, and review authorized file operations with quarantine, undo, and execution history.",
+    "category": "Utility",
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }

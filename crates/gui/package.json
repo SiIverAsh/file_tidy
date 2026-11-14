@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "tauri": "tauri",
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
@@ -14,6 +15,7 @@
     "@tauri-apps/api": "^2.9.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
     "typescript": "^5.8.2",
     "vite": "^6.2.0"
   }

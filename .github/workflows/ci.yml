@@ -53,6 +53,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Validate workflows
         run: actionlint -color
+      - name: Test GUI release artifact collection
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Validate release configuration
         run: dist plan --output-format=json > /dev/null
 

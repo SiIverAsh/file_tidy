@@ -66,8 +66,10 @@ cargo run --locked -p file-tidy-cli -- scan --all --metadata-only
 
 Tauri 2 图形界面位于 [`crates/gui`](crates/gui/README.md)，提供文件浏览与空间分析、操作计划审核、目录授权、隔离区与执行历史。开发运行及检查命令见该目录说明。
 
-当前 Release 下载包为 CLI。GUI 源码已纳入项目，应用安装包的构建与发布尚未启用。
+在 [Releases](https://github.com/SiIverAsh/file_tidy/releases) 中，图形界面安装包以 `file-tidy-gui-` 开头：macOS 下载对应芯片的 `.dmg`，Windows 下载 `-setup.exe`，Linux 下载 `.deb`。`file-tidy-cli-` 开头的压缩包和安装脚本供终端使用。已有的 `v0.1.0` Release 仅包含 CLI；GUI 安装包将在使用新发布流程的版本中提供。
+
+macOS 安装包暂使用临时签名，尚未经过 Apple Developer ID 签名和公证。确认来源可信后，可在“系统设置 → 隐私与安全性”中选择“仍要打开”。
 
 ## CI 与发布
 
-GitHub Actions 在 Linux、Windows 和 macOS 上运行构建与测试，并定期检查依赖安全与许可证。在 Actions 中手动运行 Release 并填写已推送的版本标签，检查通过后发布 CLI 下载包；配置与操作见 [CI 与发布说明](docs/ci-cd.md)。
+GitHub Actions 在 Linux、Windows 和 macOS 上运行构建与测试，并定期检查依赖安全与许可证。在 Actions 中手动运行 Release 并填写已推送的版本标签，检查和全部构建通过后统一发布 CLI 下载包、GUI 安装包及校验文件；配置与操作见 [CI 与发布说明](docs/ci-cd.md)。
