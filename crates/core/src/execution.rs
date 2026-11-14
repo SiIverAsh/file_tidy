@@ -480,7 +480,10 @@ impl Session {
                             } else {
                                 ExecutionStatus::Failed
                             };
-                            result.reason = Some(failure.error.to_string());
+                            result.reason = Some(match &failure.error {
+                                E::Io(error) => format!("{}: {error}", failure.step),
+                                error => format!("{}: {error}", failure.step),
+                            });
                             if failure.journal {
                                 report.journal_error = Some(failure.error.to_string());
                             } else if let Err(error) = self
