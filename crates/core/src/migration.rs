@@ -293,7 +293,10 @@ impl Session {
                 .as_str()
                 != spec.metadata.portable
             {
-                return Err(E::ChangedSincePlan);
+                return Err(E::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "captured permissions differ from the reviewed source",
+                )));
             }
             if source_proof(
                 &payload,
@@ -303,7 +306,10 @@ impl Session {
                 &captured_check,
             )? != proof.content
             {
-                return Err(E::ChangedSincePlan);
+                return Err(E::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "captured content differs from the verified copy",
+                )));
             }
             captured_permit.verify_after(&captured_file)?;
             let target_metadata =
@@ -316,7 +322,10 @@ impl Session {
                 &checkpoint,
             )? != proof.content
             {
-                return Err(E::ChangedSincePlan);
+                return Err(E::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "published content differs from the verified copy",
+                )));
             }
             self.validate_migration_target(&approved.plan, op, &proof, parents)?;
             result!(
@@ -518,11 +527,17 @@ impl Session {
         }
         let node = platform::inspect(&checked_existing(&target, true)?)?;
         if Stamp::capture(&node)? != proof.target {
-            return Err(E::ChangedSincePlan);
+            return Err(E::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "published object stamp changed before source commit",
+            )));
         }
         let metadata = platform::metadata_inventory(&target, &node)?;
         if MetadataDescription::capture(&metadata) != proof.metadata {
-            return Err(E::ChangedSincePlan);
+            return Err(E::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "published metadata version changed before source commit",
+            )));
         }
         Ok(metadata)
     }
