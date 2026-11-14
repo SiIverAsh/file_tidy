@@ -9,6 +9,20 @@ exceptions = [
     { crate = "option-ext", allow = ["MPL-2.0"] },
     { crate = "foldhash@0.2.0", allow = ["Zlib"] },
     { crate = "winx@0.36.4", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    # Scoped exceptions for transitive GUI dependencies (Tauri 2 / rfd / selectors / brotli / zlib-rs).
+    { crate = "alloc-no-stdlib@3.0.0", allow = ["BSD-3-Clause"] },
+    { crate = "alloc-stdlib@0.3.0", allow = ["BSD-3-Clause"] },
+    { crate = "brotli@9.1.1", allow = ["BSD-3-Clause", "MIT"] },
+    { crate = "cssparser@0.37.0", allow = ["MPL-2.0"] },
+    { crate = "cssparser@0.38.0", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros@0.7.1", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short@0.3.5", allow = ["MPL-2.0"] },
+    { crate = "libloading@0.7.4", allow = ["ISC"] },
+    { crate = "libloading@0.8.9", allow = ["ISC"] },
+    { crate = "selectors@0.38.0", allow = ["MPL-2.0"] },
+    { crate = "selectors@0.41.0", allow = ["MPL-2.0"] },
+    { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    { crate = "zlib-rs@0.6.8", allow = ["Zlib"] },
 ]
 
 [bans]

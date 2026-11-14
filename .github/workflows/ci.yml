@@ -92,7 +92,7 @@ jobs:
           PY
       - name: Check lints
         id: lints
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --exclude file-tidy-gui --all-targets --locked -- -D warnings
       - name: Run workspace tests
         run: |
           # Windows fixtures share ancestors whose metadata is revalidated.
@@ -100,7 +100,7 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then
             export RUST_TEST_THREADS=1
           fi
-          cargo test --workspace --locked
+          cargo test --workspace --exclude file-tidy-gui --locked
       - name: Run authorized filesystem tests
         if: ${{ !cancelled() && steps.lints.outcome == 'success' }}
         run: |
@@ -115,7 +115,7 @@ jobs:
           if environment.get("RUNNER_OS") == "Windows":
               environment["RUST_TEST_THREADS"] = "1"
           subprocess.run([
-              "cargo", "test", "--workspace", "--locked",
+              "cargo", "test", "--workspace", "--exclude", "file-tidy-gui", "--locked",
               "--test", "authorization_plan", "--test", "plan_cli",
               "--test", "execution", "--test", "rename", "--test", "case_rename",
               "--test", "copy", "--test", "staging", "--test", "tree_copy",
@@ -123,7 +123,7 @@ jobs:
               "--", "--include-ignored",
           ], env=environment, check=True)
           subprocess.run([
-              "cargo", "test", "--workspace", "--locked", "--lib",
+              "cargo", "test", "--workspace", "--exclude", "file-tidy-gui", "--locked", "--lib",
               "--", "--include-ignored",
           ], env=environment, check=True)
           PY
@@ -133,3 +133,74 @@ jobs:
         env:
           EXE_SUFFIX: ${{ runner.os == 'Windows' && '.exe' || '' }}
         run: ./target/release/file-tidy"$EXE_SUFFIX" --help
+
+  gui:
+    name: GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: crates/gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+      - name: Install Linux Tauri 2 system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - name: Typecheck, build frontend, and verify strict CSP
+        working-directory: crates/gui
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm run check:csp
+      - name: Prepare GUI filesystem fixtures
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parent / "file-tidy-gui-fixtures"
+          root.mkdir(exist_ok=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"FILE_TIDY_TEST_ROOT={root.resolve()}\n")
+          PY
+      - name: Check GUI Rust lints and tests
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo clippy -p file-tidy-gui --all-targets --locked -- -D warnings
+          cargo test -p file-tidy-gui --locked
+          cargo test -p file-tidy-gui --locked -- --include-ignored
