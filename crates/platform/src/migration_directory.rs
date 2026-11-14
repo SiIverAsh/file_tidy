@@ -56,8 +56,16 @@ pub struct MigrationDirectory {
     identity: FileIdentity,
     directories: BTreeMap<PathBuf, FileIdentity>,
     files: BTreeMap<PathBuf, FileIdentity>,
+    symlinks: BTreeMap<PathBuf, LinkRecord>,
     finalized: BTreeSet<PathBuf>,
     published: bool,
+}
+
+#[derive(Clone)]
+struct LinkRecord {
+    identity: FileIdentity,
+    target: PathBuf,
+    directory: bool,
 }
 
 impl MigrationDirectory {
@@ -81,6 +89,7 @@ impl MigrationDirectory {
             identity,
             directories: BTreeMap::from([(PathBuf::new(), identity)]),
             files: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             finalized: BTreeSet::new(),
             published: false,
         };
@@ -212,14 +221,96 @@ impl MigrationDirectory {
         Ok(value)
     }
 
-    /// Create another name for an already copied file inside this payload.
+    pub fn copy_symlink(
+        &mut self,
+        relative: &Path,
+        source_path: &Path,
+        source: &File,
+        metadata: &MetadataInventory,
+        check: &(impl Fn() -> io::Result<()> + Sync),
+    ) -> io::Result<NodeInfo> {
+        check_migration_metadata(metadata)?;
+        check()?;
+        let tree = self.building(relative)?;
+        let source_info = crate::inspect(source_path)?;
+        if source_info.kind != NodeKind::Symlink
+            || !source_info.matches(&crate::inspect_file(source)?)
+        {
+            return Err(invalid(
+                "identified symbolic-link migration source required",
+            ));
+        }
+        let source_parent = source_path
+            .parent()
+            .ok_or_else(|| invalid("source parent missing"))?;
+        let _source_guard = pin_metadata_parent(source_parent)?;
+        if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
+            != metadata.binding_bytes()
+        {
+            return Err(invalid("link metadata changed before transfer"));
+        }
+        let target_text = std::fs::read_link(source_path)?;
+        let directory = crate::symlink_directory(source_path)?;
+        let parent = tree.directory(
+            relative
+                .parent()
+                .ok_or_else(|| invalid("link parent missing"))?,
+        )?;
+        let parent_file = parent.try_clone_file()?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| invalid("link name missing"))?;
+        let created = tree.create_symlink(relative, &target_text, directory)?;
+        let mut target = super::link::open_link_at(&parent_file, name, true)?;
+        if !created.matches(&crate::inspect_file(&target)?) {
+            return Err(invalid("created link changed before metadata transfer"));
+        }
+        native::copy_link_metadata(source, &mut target, metadata, &parent_file, name, check)?;
+        check()?;
+        if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
+            != metadata.binding_bytes()
+            || std::fs::read_link(source_path)? != target_text
+            || crate::symlink_directory(source_path)? != directory
+        {
+            return Err(invalid("link source changed during transfer"));
+        }
+        let path = self.path.join(relative);
+        let copied = crate::metadata_inventory::inventory_open(&path, &target)?;
+        compare_metadata(metadata, &copied)?;
+        let info = crate::inspect(&path)?;
+        if info.identity != created.identity
+            || info.kind != NodeKind::Symlink
+            || info.modified != source_info.modified
+            || std::fs::read_link(&path)? != target_text
+            || crate::symlink_directory(&path)? != directory
+        {
+            return Err(invalid("copied symbolic link differs from source"));
+        }
+        self.symlinks.insert(
+            relative.into(),
+            LinkRecord {
+                identity: info
+                    .identity
+                    .ok_or_else(|| invalid("link identity missing"))?,
+                target: target_text,
+                directory,
+            },
+        );
+        self.verify()?;
+        Ok(info)
+    }
+
+    /// Create another name for an already copied file or link inside this payload.
     pub fn create_hard_link(&mut self, existing: &Path, relative: &Path) -> io::Result<NodeInfo> {
         relative_path(existing)?;
         let tree = self.building(relative)?;
-        let identity = *self
+        let link = self.symlinks.get(existing).cloned();
+        let identity = self
             .files
             .get(existing)
-            .ok_or_else(|| invalid("owned regular link source required"))?;
+            .copied()
+            .or_else(|| link.as_ref().map(|link| link.identity))
+            .ok_or_else(|| invalid("owned link source required"))?;
         let before = self.entry(existing)?;
         let from = tree.directory(
             existing
@@ -260,7 +351,7 @@ impl MigrationDirectory {
         }
         let _ = from;
         let info = crate::inspect(&self.path.join(relative))?;
-        if info.kind != NodeKind::Regular
+        if info.kind != before.kind
             || info.identity != Some(identity)
             || info.modified != before.modified
             || info.len != before.len
@@ -272,7 +363,11 @@ impl MigrationDirectory {
         {
             return Err(invalid("created hard link differs from owned source"));
         }
-        self.files.insert(relative.into(), identity);
+        if let Some(link) = link {
+            self.symlinks.insert(relative.into(), link);
+        } else {
+            self.files.insert(relative.into(), identity);
+        }
         self.verify()?;
         Ok(info)
     }
@@ -416,13 +511,14 @@ impl MigrationDirectory {
                 .parent()
                 .ok_or_else(|| invalid("entry parent missing"))?;
             let mut opened = self.read_directory(parent)?;
-            let file = open_owned_read(
-                &opened.file,
-                relative
-                    .file_name()
-                    .ok_or_else(|| invalid("entry name missing"))?,
-                false,
-            )?;
+            let name = relative
+                .file_name()
+                .ok_or_else(|| invalid("entry name missing"))?;
+            let file = if expected.kind == NodeKind::Symlink {
+                super::link::open_link_at(&opened.file, name, false)?
+            } else {
+                open_owned_read(&opened.file, name, false)?
+            };
             opened._ancestors.push(opened.file);
             OpenedEntry {
                 file,
@@ -440,6 +536,8 @@ impl MigrationDirectory {
         self.verify()?;
         let (identity, kind) = if let Some(id) = self.directories.get(relative) {
             (id, NodeKind::Directory)
+        } else if let Some(link) = self.symlinks.get(relative) {
+            (&link.identity, NodeKind::Symlink)
         } else {
             (
                 self.files
@@ -452,13 +550,25 @@ impl MigrationDirectory {
         if info.identity.as_ref() != Some(identity) || info.kind != kind {
             return Err(invalid("owned tree entry changed"));
         }
+        if let Some(link) = self.symlinks.get(relative) {
+            let path = self.path.join(relative);
+            if std::fs::read_link(&path)? != link.target
+                || crate::symlink_directory(&path)? != link.directory
+            {
+                return Err(invalid("owned symbolic-link target changed"));
+            }
+        }
         Ok(info)
     }
 
     pub fn verify_contents(&self, check: &(impl Fn() -> io::Result<()> + Sync)) -> io::Result<()> {
         self.verify()?;
         let mut counts = HashMap::<FileIdentity, u64>::new();
-        for identity in self.files.values() {
+        for identity in self
+            .files
+            .values()
+            .chain(self.symlinks.values().map(|link| &link.identity))
+        {
             *counts.entry(*identity).or_default() += 1;
         }
         let mut children = self
@@ -470,6 +580,7 @@ impl MigrationDirectory {
             .directories
             .keys()
             .chain(self.files.keys())
+            .chain(self.symlinks.keys())
             .filter(|path| !path.as_os_str().is_empty())
         {
             let parent = path
@@ -486,7 +597,7 @@ impl MigrationDirectory {
                 return Err(invalid("duplicate tree entry"));
             }
         }
-        for relative in self.files.keys() {
+        for relative in self.files.keys().chain(self.symlinks.keys()) {
             check()?;
             let info = self.entry(relative)?;
             if info.links

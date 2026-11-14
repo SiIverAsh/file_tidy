@@ -1,8 +1,8 @@
 use super::*;
 use std::ffi::{OsString, c_void};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
@@ -21,6 +21,7 @@ const EA: u32 = 2;
 const SECURITY: u32 = 3;
 const ALTERNATE: u32 = 4;
 const SPARSE: u32 = 9;
+const REPARSE: u32 = 8;
 fn native_error(action: &'static str) -> io::Error {
     let error = io::Error::last_os_error();
     io::Error::new(error.kind(), format!("{action}: {error}"))
@@ -29,6 +30,7 @@ fn native_error(action: &'static str) -> io::Error {
 pub(super) fn check_metadata(metadata: &MetadataInventory) -> io::Result<()> {
     let supported = FILE_ATTRIBUTE_READONLY
         | FILE_ATTRIBUTE_DIRECTORY
+        | FILE_ATTRIBUTE_REPARSE_POINT
         | FILE_ATTRIBUTE_HIDDEN
         | FILE_ATTRIBUTE_SYSTEM
         | FILE_ATTRIBUTE_ARCHIVE
@@ -239,7 +241,7 @@ struct Header {
     name: OsString,
     encoded_name: Vec<u8>,
 }
-fn header(reader: &mut Reader<'_>) -> io::Result<Option<Header>> {
+fn header(reader: &mut Reader<'_>, link: bool) -> io::Result<Option<Header>> {
     // The backup format uses the 20 bytes before cStreamName; Rust/C struct
     // tail alignment is not part of the serialized stream header.
     let mut raw = [0u8; 20];
@@ -251,7 +253,9 @@ fn header(reader: &mut Reader<'_>) -> io::Result<Option<Header>> {
         u32::from_le_bytes([raw[start], raw[start + 1], raw[start + 2], raw[start + 3]])
     };
     let kind = word(0);
-    if !matches!(kind, DATA | EA | SECURITY | ALTERNATE | SPARSE) || word(4) & 1 != 0 {
+    if !(matches!(kind, DATA | EA | SECURITY | ALTERNATE | SPARSE) || (link && kind == REPARSE))
+        || word(4) & 1 != 0
+    {
         return Err(unsupported(
             "backup stream type or read-mutating data cannot be migrated",
         ));
@@ -266,7 +270,7 @@ fn header(reader: &mut Reader<'_>) -> io::Result<Option<Header>> {
     if !name_length.is_multiple_of(2) || name_length > 65536 {
         return Err(invalid("backup stream name exceeds limit"));
     }
-    if matches!(kind, EA | SECURITY) && length > MAX_DESCRIPTOR as u64 {
+    if matches!(kind, EA | SECURITY | REPARSE) && length > MAX_DESCRIPTOR as u64 {
         return Err(unsupported("backup metadata exceeds limit"));
     }
     let mut encoded_name = vec![0u8; name_length];
@@ -469,13 +473,69 @@ fn restore_access(source: &File, target: &File) -> io::Result<()> {
             | LABEL_SECURITY_INFORMATION,
     )
 }
+
+pub(super) fn freeze_access(
+    path: &Path,
+    expected: &NodeInfo,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<MetadataInventory> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("source parent missing"))?;
+    let _guard = super::pin_metadata_parent(parent)?;
+    let mut name = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if name.contains(&0) {
+        return Err(invalid("NUL in migration source"));
+    }
+    name.push(0);
+    // SAFETY: the terminated path and all ancestor pins remain live. The leaf
+    // is opened itself; rights cover metadata and DACL changes, without file
+    // data reads, data writes, ownership changes or privilege adjustment.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL,
+            ptr::null_mut(),
+        )
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(native_error("open reviewed access rules"));
+    }
+    // SAFETY: successful CreateFileW transferred ownership of this live handle.
+    let file = unsafe { File::from_raw_handle(handle) };
+    if !expected.matches(&crate::inspect_file(&file)?) || !expected.matches(&crate::inspect(path)?)
+    {
+        return Err(invalid("source changed before access-rule freeze"));
+    }
+    let snapshot = AccessSnapshot::capture(&file)?;
+    let before = crate::metadata_inventory::inventory_open(path, &file)?;
+    if before.binding_bytes() != metadata.binding_bytes() {
+        return Err(invalid("source metadata changed before access-rule freeze"));
+    }
+    check()?;
+    snapshot.restore_dacl(&file)?;
+    let after = crate::metadata_inventory::inventory_open(path, &file)?;
+    if after.portable_bytes() != metadata.portable_bytes()
+        || !expected.matches(&crate::inspect_file(&file)?)
+        || !expected.matches(&crate::inspect(path)?)
+    {
+        return Err(invalid("source rules changed during access-rule freeze"));
+    }
+    check()?;
+    Ok(after)
+}
 pub(super) fn copy(
     source: &File,
     target: &mut File,
     metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
-    copy_payload(source, target, metadata, check, false)
+    copy_payload(source, target, metadata, check, NodeKind::Regular)
 }
 
 pub(super) fn copy_directory_metadata(
@@ -484,7 +544,19 @@ pub(super) fn copy_directory_metadata(
     metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
-    copy_payload(source, target, metadata, check, true)
+    copy_payload(source, target, metadata, check, NodeKind::Directory)
+}
+
+pub(super) fn copy_link_metadata(
+    source: &File,
+    target: &mut File,
+    metadata: &MetadataInventory,
+    parent: &File,
+    name: &OsStr,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    let _ = (parent, name);
+    copy_payload(source, target, metadata, check, NodeKind::Symlink)
 }
 
 fn copy_payload(
@@ -492,10 +564,11 @@ fn copy_payload(
     target: &mut File,
     metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
-    directory: bool,
+    kind: NodeKind,
 ) -> io::Result<()> {
+    let link = kind == NodeKind::Symlink;
     let mut source = source.try_clone()?;
-    if !directory {
+    if kind == NodeKind::Regular {
         source.seek(SeekFrom::Start(0))?;
         target.seek(SeekFrom::Start(0))?;
     }
@@ -513,10 +586,17 @@ fn copy_payload(
     let mut buffer = [0u8; 65536];
     while let Some(header) = {
         check()?;
-        header(&mut reader)?
+        header(&mut reader, link)?
     } {
-        if directory && matches!(header.kind, DATA | SPARSE) {
-            return Err(invalid("directory backup contains a regular data stream"));
+        if link && header.kind == REPARSE {
+            reader.skip(header.length)?;
+            continue;
+        }
+        if kind != NodeKind::Regular && matches!(header.kind, DATA | SPARSE) {
+            if header.length != 0 {
+                return Err(invalid("nonregular backup contains a regular data stream"));
+            }
+            continue;
         }
         writer.push(&header.raw)?;
         writer.push(&header.encoded_name)?;
@@ -548,6 +628,9 @@ fn copy_payload(
     }
     basic.ChangeTime = 0;
     basic.FileAttributes &= !(FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE);
+    if link {
+        basic.FileAttributes &= !FILE_ATTRIBUTE_REPARSE_POINT;
+    }
     if basic.FileAttributes == 0 {
         basic.FileAttributes = FILE_ATTRIBUTE_NORMAL;
     }
@@ -571,17 +654,26 @@ pub(super) fn visit(
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
-    if !file.metadata()?.is_dir() {
+    let kind = crate::inspect_file(file)?.kind;
+    let link = kind == NodeKind::Symlink;
+    if kind == NodeKind::Regular {
         file.seek(SeekFrom::Start(0))?;
     }
     let mut reader = Reader::new(file);
     let mut buffer = [0u8; 65536];
     while let Some(header) = {
         check()?;
-        header(&mut reader)?
+        header(&mut reader, link)?
     } {
+        if link && header.kind == REPARSE {
+            reader.skip(header.length)?;
+            continue;
+        }
         let attached = matches!(header.kind, EA | ALTERNATE);
         if matches!(header.kind, DATA | SPARSE) {
+            if link && header.length != 0 {
+                return Err(invalid("symbolic link contains a regular data stream"));
+            }
             reader.skip(header.length)?;
             continue;
         }

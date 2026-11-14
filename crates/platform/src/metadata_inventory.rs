@@ -20,6 +20,7 @@ pub struct MetadataAttribute {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct MetadataInventory {
+    kind: NodeKind,
     attributes: Vec<MetadataAttribute>,
     opaque_bytes: u64,
     owner_is_current: bool,
@@ -39,6 +40,9 @@ impl std::fmt::Debug for MetadataInventory {
     }
 }
 impl MetadataInventory {
+    pub fn kind(&self) -> NodeKind {
+        self.kind
+    }
     pub fn attributes(&self) -> &[MetadataAttribute] {
         &self.attributes
     }
@@ -147,6 +151,7 @@ fn finish(
     field(&mut binding, change)?;
     field(&mut binding, &portable)?;
     Ok(MetadataInventory {
+        kind: expected.kind,
         attributes,
         opaque_bytes,
         owner_is_current,
@@ -275,7 +280,8 @@ mod unix {
         {
             return Err(invalid("metadata changed during inspection"));
         }
-        let privileged = before.mode() & 0o6000 != 0
+        let privileged = before.mode() & 0o4000 != 0
+            || (expected.kind != NodeKind::Directory && before.mode() & 0o2000 != 0)
             || attributes
                 .iter()
                 .any(|attribute| attribute.name == "security.capability");

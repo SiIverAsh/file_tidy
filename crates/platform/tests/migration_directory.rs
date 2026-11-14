@@ -120,6 +120,8 @@ fn directory_payload_preserves_metadata_streams_and_hard_links_before_publicatio
     attach(&leaf, b"file-attached-data")?;
     let target = root.join("target");
     let stage_path = root.join(".file-tidy-tree.stage");
+    let retained_parent = root.join("retained");
+    let retained = retained_parent.join("payload");
     let _writable = WritableFixture(vec![
         nested.clone(),
         source.clone(),
@@ -130,13 +132,16 @@ fn directory_payload_preserves_metadata_streams_and_hard_links_before_publicatio
         leaf.clone(),
         stage_path.join("payload/nested/.data"),
         target.join("nested/.data"),
+        retained.join("nested"),
+        retained.clone(),
+        retained.join("nested/.data"),
     ]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o440))?;
-        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o555))?;
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o750))?;
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o2555))?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o2750))?;
     }
     #[cfg(windows)]
     {
@@ -148,6 +153,7 @@ fn directory_payload_preserves_metadata_streams_and_hard_links_before_publicatio
     let nested_info = inspect(&nested)?;
     let leaf_info = inspect(&leaf)?;
     let source_metadata = checked(metadata_inventory(&source, &source_info))?;
+    assert!(!source_metadata.privileged_permissions());
     let nested_metadata = checked(metadata_inventory(&nested, &nested_info))?;
     let leaf_metadata = checked(metadata_inventory(&leaf, &leaf_info))?;
     let source_values = checked(source_streams(&source, true))?;
@@ -283,5 +289,72 @@ fn directory_payload_preserves_metadata_streams_and_hard_links_before_publicatio
     drop(input);
     drop(source_directory);
     drop(nested_directory);
+    // Descendants become independent of parent inheritance before the root moves.
+    let frozen_leaf = checked(file_tidy_platform::freeze_migration_access(
+        &leaf,
+        &inspect(&leaf)?,
+        &leaf_metadata,
+        &|| Ok(()),
+    ))?;
+    let frozen_nested = checked(file_tidy_platform::freeze_migration_access(
+        &nested,
+        &inspect(&nested)?,
+        &nested_metadata,
+        &|| Ok(()),
+    ))?;
+    let frozen_root = checked(file_tidy_platform::freeze_migration_access(
+        &source,
+        &inspect(&source)?,
+        &source_metadata,
+        &|| Ok(()),
+    ))?;
+    assert_eq!(frozen_leaf.portable_bytes(), leaf_metadata.portable_bytes());
+    assert_eq!(
+        frozen_nested.portable_bytes(),
+        nested_metadata.portable_bytes()
+    );
+    assert_eq!(
+        frozen_root.portable_bytes(),
+        source_metadata.portable_bytes()
+    );
+    let parent_pin = file_tidy_platform::open_directory_pinned(&root, &inspect(&root)?)?;
+    let retained_handle =
+        file_tidy_platform::create_private_directory(&parent_pin, "retained".as_ref())?;
+    checked(file_tidy_platform::rename_noreplace(
+        &source,
+        &inspect(&source)?,
+        &retained,
+        &inspect(&root)?,
+        &file_tidy_platform::inspect_file(&retained_handle)?,
+    ))?;
+    assert!(!source.exists());
+    assert_eq!(
+        metadata_inventory(&retained, &inspect(&retained)?)?.portable_bytes(),
+        source_metadata.portable_bytes()
+    );
+    assert_eq!(
+        metadata_inventory(
+            &retained.join("nested"),
+            &inspect(&retained.join("nested"))?
+        )?
+        .portable_bytes(),
+        nested_metadata.portable_bytes()
+    );
+    let retained_leaf = retained.join("nested/.data");
+    assert_eq!(
+        metadata_inventory(&retained_leaf, &inspect(&retained_leaf)?)?.portable_bytes(),
+        leaf_metadata.portable_bytes()
+    );
+    assert_eq!(inspect(&retained_leaf)?.identity, leaf_info.identity);
+    assert_eq!(
+        inspect(&retained.join("alias"))?.identity,
+        leaf_info.identity
+    );
+    assert_eq!(std::fs::read(&retained_leaf)?, body);
+    assert_eq!(source_streams(&retained, true)?, source_values);
+    assert_eq!(
+        source_streams(&retained.join("nested"), true)?,
+        nested_values
+    );
     Ok(())
 }

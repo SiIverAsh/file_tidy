@@ -5,6 +5,12 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_ATTRIBUTE: usize = 1024 * 1024;
 pub(super) fn check_metadata(metadata: &MetadataInventory) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if metadata.kind() == NodeKind::Symlink && !metadata.attributes().is_empty() {
+        return Err(unsupported(
+            "symbolic-link attributes require native no-follow value access",
+        ));
+    }
     #[cfg(target_os = "macos")]
     if metadata.native_flags()
         & u64::from(libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND)
@@ -93,7 +99,17 @@ pub(super) fn copy_directory_metadata(
 ) -> io::Result<()> {
     check()?;
     #[cfg(target_os = "macos")]
-    darwin_copy(source, target, libc::COPYFILE_METADATA, check)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        darwin_copy(source, target, libc::COPYFILE_METADATA, check)?;
+        let mode = source.metadata()?.permissions().mode();
+        if target.metadata()?.permissions().mode() != mode {
+            let mode = (mode & 0o3777)
+                .try_into()
+                .map_err(|_| invalid("directory mode width"))?;
+            rustix::fs::fchmod(&*target, rustix::fs::Mode::from_raw_mode(mode))?;
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     {
         #[cfg(target_os = "linux")]
@@ -101,6 +117,64 @@ pub(super) fn copy_directory_metadata(
         copy_permissions_and_attributes(source, target, metadata, check)?;
     }
     let _ = metadata;
+    check()
+}
+
+pub(super) fn copy_link_metadata(
+    source: &File,
+    target: &mut File,
+    metadata: &MetadataInventory,
+    parent: &File,
+    name: &OsStr,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<()> {
+    check()?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (metadata, parent, name);
+        darwin_copy(source, target, libc::COPYFILE_METADATA, check)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{AtFlags, Timespec, Timestamps, UTIME_OMIT, chownat, utimensat};
+        check_metadata(metadata)?;
+        let stat = source.metadata()?;
+        if stat.gid() != target.metadata()?.gid() {
+            chownat(
+                parent,
+                name,
+                None,
+                Some(rustix::process::Gid::from_raw(stat.gid())),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+        }
+        let nanos = match stat.modified()?.duration_since(std::time::UNIX_EPOCH) {
+            Ok(value) => value.as_nanos() as i128,
+            Err(error) => -(error.duration().as_nanos() as i128),
+        };
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            last_modification: Timespec {
+                tv_sec: nanos
+                    .div_euclid(1_000_000_000)
+                    .try_into()
+                    .map_err(|_| invalid("timestamp overflow"))?,
+                tv_nsec: nanos
+                    .rem_euclid(1_000_000_000)
+                    .try_into()
+                    .map_err(|_| invalid("timestamp overflow"))?,
+            },
+        };
+        utimensat(parent, name, &times, AtFlags::SYMLINK_NOFOLLOW)?;
+        parent.sync_all()?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(unsupported(
+        "native symbolic-link metadata transfer required",
+    ));
     check()
 }
 
@@ -145,10 +219,8 @@ fn copy_permissions_and_attributes(
             rustix::fs::XattrFlags::empty(),
         )?;
     }
-    rustix::fs::fchmod(
-        target,
-        rustix::fs::Mode::from_raw_mode(stat.mode() & 0o1777),
-    )?;
+    let mode = stat.mode() & if stat.is_dir() { 0o3777 } else { 0o1777 };
+    rustix::fs::fchmod(target, rustix::fs::Mode::from_raw_mode(mode))?;
     target.set_times(std::fs::FileTimes::new().set_modified(stat.modified()?))?;
     Ok(())
 }
@@ -221,6 +293,10 @@ pub(super) fn visit(
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if file.metadata()?.file_type().is_symlink() {
+        return Ok(());
+    }
     for name in names(file)? {
         check()?;
         let size = rustix::fs::fgetxattr_query(&*file, &name)?;

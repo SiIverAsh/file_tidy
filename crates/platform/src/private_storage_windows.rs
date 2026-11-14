@@ -144,6 +144,29 @@ pub(super) fn open_migration_read(
     name: &OsStr,
     directory: bool,
 ) -> io::Result<File> {
+    open_migration_object(
+        parent,
+        name,
+        if directory {
+            crate::NodeKind::Directory
+        } else {
+            crate::NodeKind::Regular
+        },
+        false,
+    )
+}
+
+pub(super) fn open_migration_link(parent: &File, name: &OsStr, write: bool) -> io::Result<File> {
+    open_migration_object(parent, name, crate::NodeKind::Symlink, write)
+}
+
+fn open_migration_object(
+    parent: &File,
+    name: &OsStr,
+    kind: crate::NodeKind,
+    write: bool,
+) -> io::Result<File> {
+    let directory = kind == crate::NodeKind::Directory;
     let mut units = name.encode_wide().collect::<Vec<_>>();
     if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
         return Err(io::Error::other("invalid owned migration component"));
@@ -170,12 +193,17 @@ pub(super) fn open_migration_read(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_READ,
+            FILE_GENERIC_READ
+                | if write {
+                    FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
+                } else {
+                    0
+                },
             &attributes,
             &mut ios,
             ptr::null(),
             0,
-            if directory {
+            if directory || write {
                 FILE_SHARE_READ | FILE_SHARE_WRITE
             } else {
                 FILE_SHARE_READ
@@ -183,8 +211,10 @@ pub(super) fn open_migration_read(
             windows_sys::Wdk::Storage::FileSystem::FILE_OPEN,
             (if directory {
                 FILE_DIRECTORY_FILE
-            } else {
+            } else if kind == crate::NodeKind::Regular {
                 FILE_NON_DIRECTORY_FILE
+            } else {
+                0
             }) | FILE_OPEN_REPARSE_POINT
                 | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),

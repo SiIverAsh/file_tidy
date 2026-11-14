@@ -20,7 +20,8 @@ pub use metadata_inventory::{
 mod migration;
 pub use migration::{
     MigrationData, MigrationDirectory, MigrationFile, MigrationTreeFile, check_migration_metadata,
-    open_directory_attached_data, visit_migration_data,
+    freeze_migration_access, open_directory_attached_data, open_symlink_attached_data,
+    visit_migration_data,
 };
 mod removal;
 pub use removal::{RemovalError, remove_verified};

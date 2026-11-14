@@ -13,6 +13,10 @@ mod native;
 mod directory;
 pub use directory::{MigrationDirectory, MigrationTreeFile, open_directory_attached_data};
 
+#[path = "migration_link.rs"]
+mod link;
+pub use link::open_symlink_attached_data;
+
 #[cfg(windows)]
 pub(crate) use native::AccessSnapshot;
 #[cfg(windows)]
@@ -38,6 +42,45 @@ pub fn check_migration_metadata(metadata: &MetadataInventory) -> io::Result<()> 
         ));
     }
     native::check_metadata(metadata)
+}
+
+/// Freeze reviewed Windows access rules before a retained directory capture.
+/// Callers record each mutation and process descendants before their parents.
+/// Unix verifies the reviewed version and returns its unchanged permissions.
+pub fn freeze_migration_access(
+    path: &Path,
+    expected: &NodeInfo,
+    metadata: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+) -> io::Result<MetadataInventory> {
+    check_migration_metadata(metadata)?;
+    check()?;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || !matches!(
+            expected.kind,
+            NodeKind::Regular | NodeKind::Directory | NodeKind::Symlink
+        )
+        || expected.identity.is_none()
+    {
+        return Err(invalid("identified migration source required"));
+    }
+    if crate::classify_location(path)?.kind != crate::LocationKind::Local {
+        return Err(unsupported("local migration source required"));
+    }
+    #[cfg(unix)]
+    {
+        let current = crate::metadata_inventory(path, expected)?;
+        if current.binding_bytes() != metadata.binding_bytes() {
+            return Err(invalid("source metadata changed before access-rule freeze"));
+        }
+        check()?;
+        Ok(current)
+    }
+    #[cfg(windows)]
+    native::freeze_access(path, expected, metadata, check)
 }
 
 pub struct MigrationFile {
@@ -237,6 +280,7 @@ fn visit_pinned_data(
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
+    check_migration_metadata(expected)?;
     check()?;
     if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
         != expected.binding_bytes()
