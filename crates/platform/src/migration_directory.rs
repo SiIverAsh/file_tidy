@@ -65,11 +65,7 @@ impl MigrationDirectory {
     pub fn create(parent: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
         let envelope = StagedDirectory::create(parent, expected, name)?;
         let envelope_path = parent.join(name);
-        let tree = StagedDirectory::create_migration_payload(
-            &envelope_path,
-            &envelope.inspect()?,
-            OsStr::new("payload"),
-        )?;
+        let tree = StagedDirectory::create_migration_payload(&envelope, OsStr::new("payload"))?;
         let identity = tree
             .inspect()?
             .identity
@@ -259,8 +255,8 @@ impl MigrationDirectory {
         }
         #[cfg(windows)]
         {
-            let source = open_attached_data(&self.path.join(existing), &before)?;
-            crate::mutation::link_open_file(&source, &to.try_clone_file()?, name)?;
+            let source = self.read_entry(existing)?;
+            crate::mutation::link_open_file(&source.file, &to.try_clone_file()?, name)?;
         }
         let _ = from;
         let info = crate::inspect(&self.path.join(relative))?;
@@ -354,8 +350,9 @@ impl MigrationDirectory {
     }
 
     pub fn metadata(&self, relative: &Path) -> io::Result<MetadataInventory> {
-        let info = self.entry(relative)?;
-        let result = crate::metadata_inventory(&self.path.join(relative), &info)?;
+        let opened = self.read_entry(relative)?;
+        let result =
+            crate::metadata_inventory::inventory_open(&self.path.join(relative), &opened.file)?;
         self.verify()?;
         Ok(result)
     }
@@ -367,23 +364,75 @@ impl MigrationDirectory {
         sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         check()?;
-        let info = self.entry(relative)?;
         let path = self.path.join(relative);
-        let metadata = crate::metadata_inventory(&path, &info)?;
-        let mut file = if relative.as_os_str().is_empty() {
-            if let Some(root) = &self.root {
-                root.try_clone()?
-            } else {
-                self.tree
-                    .as_ref()
-                    .ok_or_else(|| invalid("root missing"))?
-                    .migration_directory(relative)?
-            }
-        } else {
-            open_attached_data(&path, &info)?
-        };
-        super::visit_migration_data(&path, &mut file, &metadata, check, sink)?;
+        let mut opened = self.read_entry(relative)?;
+        let metadata = crate::metadata_inventory::inventory_open(&path, &opened.file)?;
+        super::visit_pinned_data(&path, &mut opened.file, &metadata, check, sink)?;
         self.verify()
+    }
+
+    fn read_directory(&self, relative: &Path) -> io::Result<OpenedEntry> {
+        relative_path(relative)?;
+        self.verify()?;
+        let mut file = if let Some(root) = &self.root {
+            root.try_clone()?
+        } else {
+            self.tree
+                .as_ref()
+                .ok_or_else(|| invalid("root missing"))?
+                .clone_root_file()?
+        };
+        let mut ancestors = Vec::new();
+        let mut prefix = PathBuf::new();
+        for part in relative.components() {
+            let std::path::Component::Normal(name) = part else {
+                return Err(invalid("relative directory component required"));
+            };
+            prefix.push(name);
+            let expected = self
+                .directories
+                .get(&prefix)
+                .ok_or_else(|| invalid("unrecorded directory"))?;
+            let next = open_owned_read(&file, name, true)?;
+            let info = crate::inspect_file(&next)?;
+            if info.kind != NodeKind::Directory || info.identity != Some(*expected) {
+                return Err(invalid("owned directory changed before reading"));
+            }
+            ancestors.push(file);
+            file = next;
+        }
+        Ok(OpenedEntry {
+            file,
+            _ancestors: ancestors,
+        })
+    }
+
+    fn read_entry(&self, relative: &Path) -> io::Result<OpenedEntry> {
+        let expected = self.entry(relative)?;
+        let opened = if expected.kind == NodeKind::Directory {
+            self.read_directory(relative)?
+        } else {
+            let parent = relative
+                .parent()
+                .ok_or_else(|| invalid("entry parent missing"))?;
+            let mut opened = self.read_directory(parent)?;
+            let file = open_owned_read(
+                &opened.file,
+                relative
+                    .file_name()
+                    .ok_or_else(|| invalid("entry name missing"))?,
+                false,
+            )?;
+            opened._ancestors.push(opened.file);
+            OpenedEntry {
+                file,
+                _ancestors: opened._ancestors,
+            }
+        };
+        if !expected.matches(&crate::inspect_file(&opened.file)?) {
+            return Err(invalid("owned entry changed before reading"));
+        }
+        Ok(opened)
     }
 
     fn entry(&self, relative: &Path) -> io::Result<NodeInfo> {
@@ -470,11 +519,11 @@ impl MigrationDirectory {
             #[cfg(windows)]
             let listing = {
                 let path = self.path.join(relative);
-                let directory = crate::windows::open_metadata_directory(&path)?;
+                let directory = self.read_directory(relative)?;
                 crate::windows::read_directory_using_pin(
                     &path,
                     &info,
-                    &directory.0,
+                    &directory.file,
                     expected
                         .len()
                         .checked_add(1)
@@ -535,6 +584,32 @@ impl MigrationDirectory {
         let parent = crate::inspect(&self.parent_path)?;
         drop(self);
         crate::remove_verified(&path, &info, &parent)
+    }
+}
+
+struct OpenedEntry {
+    file: File,
+    _ancestors: Vec<File>,
+}
+
+fn open_owned_read(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+    crate::staged_file::component(name)?;
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let flags = OFlags::RDONLY
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | if directory {
+                OFlags::DIRECTORY
+            } else {
+                OFlags::empty()
+            };
+        Ok(File::from(openat(parent, name, flags, Mode::empty())?))
+    }
+    #[cfg(windows)]
+    {
+        crate::private_storage::open_migration_read_handle(parent, name, directory)
     }
 }
 

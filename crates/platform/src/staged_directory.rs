@@ -17,23 +17,23 @@ pub struct StagedDirectory {
 }
 impl StagedDirectory {
     pub fn create(parent_path: &Path, expected: &NodeInfo, name: &OsStr) -> io::Result<Self> {
-        Self::create_impl(parent_path, expected, name, false)
+        crate::staged_file::component(name)?;
+        let parent = crate::open_directory_pinned(parent_path, expected)?;
+        Self::create_pinned(parent_path, expected, parent, name, false)
     }
-    pub(crate) fn create_migration_payload(
+    pub(crate) fn create_migration_payload(envelope: &Self, name: &OsStr) -> io::Result<Self> {
+        envelope.verify()?;
+        let parent = envelope.directory(Path::new(""))?;
+        Self::create_pinned(&envelope.path, &envelope.inspect()?, parent, name, true)
+    }
+    fn create_pinned(
         parent_path: &Path,
         expected: &NodeInfo,
-        name: &OsStr,
-    ) -> io::Result<Self> {
-        Self::create_impl(parent_path, expected, name, true)
-    }
-    fn create_impl(
-        parent_path: &Path,
-        expected: &NodeInfo,
+        parent: PinnedDirectory,
         name: &OsStr,
         migration: bool,
     ) -> io::Result<Self> {
         crate::staged_file::component(name)?;
-        let parent = crate::open_directory_pinned(parent_path, expected)?;
         #[cfg(unix)]
         let root = {
             let _ = migration;
@@ -240,6 +240,9 @@ impl StagedDirectory {
     }
     pub(crate) fn into_migration_root(self) -> File {
         self.root
+    }
+    pub(crate) fn clone_root_file(&self) -> io::Result<File> {
+        self.root.try_clone()
     }
     #[cfg(windows)]
     pub(crate) fn create_migration_file(&self) -> io::Result<File> {

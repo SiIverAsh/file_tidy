@@ -227,6 +227,17 @@ pub fn visit_migration_data(
         .parent()
         .ok_or_else(|| invalid("source parent missing"))?;
     let _guard = pin_metadata_parent(parent)?;
+    visit_pinned_data(source_path, source, expected, check, sink)
+}
+
+fn visit_pinned_data(
+    source_path: &Path,
+    source: &mut File,
+    expected: &MetadataInventory,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+    sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    check()?;
     if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
         != expected.binding_bytes()
     {

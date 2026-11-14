@@ -138,6 +138,68 @@ pub(super) fn open_migration_directory(parent: &File, name: &OsStr) -> io::Resul
         WRITE_DAC | WRITE_OWNER | FILE_READ_EA | FILE_WRITE_EA,
     )
 }
+
+pub(super) fn open_migration_read(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+) -> io::Result<File> {
+    let mut units = name.encode_wide().collect::<Vec<_>>();
+    if units.is_empty() || units.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92)) {
+        return Err(io::Error::other("invalid owned migration component"));
+    }
+    let length =
+        u16::try_from(units.len() * 2).map_err(|_| io::Error::other("migration name too long"))?;
+    let native = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &native,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        ..Default::default()
+    };
+    let mut ios = IO_STATUS_BLOCK::default();
+    let mut handle = ptr::null_mut();
+    // SAFETY: the owner holds the parent handle and validates every returned
+    // identity. One native leaf is opened synchronously without following reparse
+    // points. Read rights suffice after the original permissions are restored.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut ios,
+            ptr::null(),
+            0,
+            if directory {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ
+            },
+            windows_sys::Wdk::Storage::FileSystem::FILE_OPEN,
+            (if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            }) | FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: NTSTATUS conversion is a scalar operation.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    // SAFETY: a successful create transferred ownership of this live handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
 fn create_object(
     parent: &File,
     name: &OsStr,
