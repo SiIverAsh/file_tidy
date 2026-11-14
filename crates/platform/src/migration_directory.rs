@@ -244,6 +244,7 @@ impl MigrationDirectory {
             .parent()
             .ok_or_else(|| invalid("source parent missing"))?;
         let _source_guard = pin_metadata_parent(source_parent)?;
+        let source_parent_file = metadata_parent_file(&_source_guard)?;
         if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
             != metadata.binding_bytes()
         {
@@ -265,7 +266,22 @@ impl MigrationDirectory {
         if !created.matches(&crate::inspect_file(&target)?) {
             return Err(invalid("created link changed before metadata transfer"));
         }
-        native::copy_link_metadata(source, &mut target, metadata, &parent_file, name, check)?;
+        native::copy_link_metadata(
+            source,
+            &mut target,
+            metadata,
+            LinkLocation {
+                parent: &source_parent_file,
+                name: source_path
+                    .file_name()
+                    .ok_or_else(|| invalid("source name missing"))?,
+            },
+            LinkLocation {
+                parent: &parent_file,
+                name,
+            },
+            check,
+        )?;
         check()?;
         if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
             != metadata.binding_bytes()
@@ -462,7 +478,12 @@ impl MigrationDirectory {
         let path = self.path.join(relative);
         let mut opened = self.read_entry(relative)?;
         let metadata = crate::metadata_inventory::inventory_open(&path, &opened.file)?;
-        super::visit_pinned_data(&path, &mut opened.file, &metadata, check, sink)?;
+        let location = opened
+            ._ancestors
+            .last()
+            .zip(path.file_name())
+            .map(|(parent, name)| LinkLocation { parent, name });
+        super::visit_pinned_data(&path, &mut opened.file, &metadata, location, check, sink)?;
         self.verify()
     }
 
@@ -767,7 +788,7 @@ impl MigrationTreeFile<'_> {
     ) -> io::Result<()> {
         self.verify()?;
         let before = self.metadata()?;
-        native::visit(&mut self.file, check, sink)?;
+        native::visit(&mut self.file, &before, check, sink)?;
         if self.metadata()?.binding_bytes() != before.binding_bytes() {
             return Err(invalid("tree file metadata changed during verification"));
         }

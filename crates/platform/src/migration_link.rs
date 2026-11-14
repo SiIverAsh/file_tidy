@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct LinkLocation<'a> {
+    pub(super) parent: &'a File,
+    pub(super) name: &'a OsStr,
+}
+
 /// Open a symbolic link itself for attached-data reads, using a caller-owned
 /// content permission. Its target is neither opened nor traversed.
 pub fn open_symlink_attached_data(path: &Path, expected: &NodeInfo) -> io::Result<File> {

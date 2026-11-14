@@ -124,11 +124,13 @@ pub(super) fn copy_link_metadata(
     source: &File,
     target: &mut File,
     metadata: &MetadataInventory,
-    parent: &File,
-    name: &OsStr,
+    source_location: LinkLocation<'_>,
+    target_location: LinkLocation<'_>,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
     check()?;
+    let _ = source_location;
+    let LinkLocation { parent, name } = target_location;
     #[cfg(target_os = "macos")]
     {
         let _ = (metadata, parent, name);
@@ -290,9 +292,11 @@ fn names(file: &File) -> io::Result<Vec<std::ffi::OsString>> {
 
 pub(super) fn visit(
     file: &mut File,
+    metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
+    let _ = metadata;
     #[cfg(target_os = "linux")]
     if file.metadata()?.file_type().is_symlink() {
         return Ok(());
@@ -324,6 +328,17 @@ pub(super) fn visit(
         sink(MigrationData::End)?;
     }
     Ok(())
+}
+
+pub(super) fn visit_link(
+    file: &mut File,
+    metadata: &MetadataInventory,
+    location: LinkLocation<'_>,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+    sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    let _ = location;
+    visit(file, metadata, check, sink)
 }
 
 #[cfg(target_os = "macos")]

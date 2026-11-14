@@ -59,79 +59,153 @@ fn symbolic_link(target: &Path, path: &Path, directory: bool) -> TestResult {
 
 #[cfg(windows)]
 fn attach_to_link(path: &Path) -> TestResult {
+    use std::io::Write;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::*;
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let file = checked(
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path),
+    )?;
     assert_eq!(
         file_tidy_platform::inspect_file(&file)?.kind,
         file_tidy_platform::NodeKind::Symlink
     );
-    let name = ":file_tidy:$DATA"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
+    let parent_path = path.parent().ok_or("link parent missing")?;
+    let parent = checked(file_tidy_platform::open_directory_pinned(
+        parent_path,
+        &inspect(parent_path)?,
+    ))?;
+    let parent_file = parent.try_clone_file()?;
+    let mut name = path
+        .file_name()
+        .ok_or("link name missing")?
+        .encode_wide()
         .collect::<Vec<_>>();
-    let body = b"symbolic-link-attached-value";
-    let mut stream = Vec::new();
-    stream.extend_from_slice(&4u32.to_le_bytes());
-    stream.extend_from_slice(&0u32.to_le_bytes());
-    stream.extend_from_slice(&(body.len() as i64).to_le_bytes());
-    stream.extend_from_slice(&(name.len() as u32).to_le_bytes());
-    stream.extend_from_slice(&name);
-    stream.extend_from_slice(body);
-    struct Backup<'a> {
-        file: &'a std::fs::File,
-        context: *mut std::ffi::c_void,
-    }
-    impl Drop for Backup<'_> {
-        fn drop(&mut self) {
-            let mut unused = 0;
-            // SAFETY: abort releases only this fixture's unique backup context.
-            unsafe {
-                BackupWrite(
-                    self.file.as_raw_handle(),
-                    ptr::null(),
-                    0,
-                    &mut unused,
-                    1,
-                    0,
-                    &mut self.context,
-                );
-            }
-        }
-    }
-    let mut backup = Backup {
-        file: &file,
-        context: ptr::null_mut(),
+    name.extend(":file_tidy:$DATA".encode_utf16());
+    let length = u16::try_from(name.len() * 2)?;
+    let native = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_mut_ptr(),
     };
-    let mut offset = 0;
-    while offset < stream.len() {
-        let mut written = 0;
-        // SAFETY: this no-follow link handle, byte buffer and unique context
-        // remain live through the synchronous attached-stream initialization.
-        if unsafe {
-            BackupWrite(
-                file.as_raw_handle(),
-                stream[offset..].as_ptr(),
-                (stream.len() - offset) as u32,
-                &mut written,
-                0,
-                0,
-                &mut backup.context,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if written == 0 {
-            return Err("backup fixture made no progress".into());
-        }
-        offset += written as usize;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent_file.as_raw_handle(),
+        ObjectName: &native,
+        ..Default::default()
+    };
+    let mut handle = ptr::null_mut();
+    let mut ios = IO_STATUS_BLOCK::default();
+    // SAFETY: the relative stream and source no-follow handle stay live; this
+    // creates one named stream on the fixture link, without a target pathname.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            &attributes,
+            &mut ios,
+            ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: NTSTATUS conversion is a scalar operation.
+        return Err(format!(
+            "create fixture link-owned stream: {}",
+            std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+        )
+        .into());
+    }
+    // SAFETY: successful NtCreateFile returned this owned live handle.
+    let mut stream = unsafe { std::fs::File::from_raw_handle(handle) };
+    assert_eq!(
+        file_tidy_platform::inspect_file(&stream)?.identity,
+        file_tidy_platform::inspect_file(&file)?.identity
+    );
+    stream.write_all(b"symbolic-link-attached-value")?;
+    stream.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn alias_link(source: &Path, alias: &Path) -> TestResult {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_LINK_INFORMATION, FileLinkInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(source)?;
+    let parent = alias.parent().ok_or("alias parent missing")?;
+    let parent = file_tidy_platform::open_directory_pinned(parent, &inspect(parent)?)?;
+    let name = alias
+        .file_name()
+        .ok_or("alias name missing")?
+        .encode_wide()
+        .collect::<Vec<_>>();
+    let bytes = size_of::<FILE_LINK_INFORMATION>() + name.len() * 2;
+    let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+    let parent_file = parent.try_clone_file()?;
+    // SAFETY: aligned zeroed storage covers the native structure and name. The
+    // source link and destination directory remain held; replacement stays false.
+    unsafe {
+        (*information).RootDirectory = parent_file.as_raw_handle();
+        (*information).FileNameLength = (name.len() * 2) as u32;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            information
+                .cast::<u8>()
+                .add(offset_of!(FILE_LINK_INFORMATION, FileName))
+                .cast::<u16>(),
+            name.len(),
+        );
+    }
+    let mut ios = IO_STATUS_BLOCK::default();
+    // SAFETY: this synchronous handle-relative request uses live buffers and
+    // creates an alias of the link object selected by the no-follow source handle.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut ios,
+            information.cast(),
+            bytes as u32,
+            FileLinkInformation,
+        )
+    };
+    if status < 0 {
+        // SAFETY: NTSTATUS conversion is a scalar operation.
+        return Err(std::io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32
+        )
+        .into());
     }
     Ok(())
 }
@@ -145,8 +219,10 @@ fn symbolic_link_migration_preserves_the_link_and_its_values_without_opening_the
     std::fs::create_dir(&source)?;
     let file_link = source.join(".link");
     let directory_link = source.join("directory-link");
-    let file_text = PathBuf::from("../unreachable/private-file");
-    let directory_text = PathBuf::from("../unreachable/private-directory");
+    let file_text = PathBuf::from("..").join("unreachable").join("private-file");
+    let directory_text = PathBuf::from("..")
+        .join("unreachable")
+        .join("private-directory");
     checked(symbolic_link(&file_text, &file_link, false))?;
     checked(symbolic_link(&directory_text, &directory_link, true))?;
     #[cfg(target_os = "macos")]
@@ -168,7 +244,7 @@ fn symbolic_link_migration_preserves_the_link_and_its_values_without_opening_the
         rustix::fs::AtFlags::empty(),
     ))?;
     #[cfg(windows)]
-    checked(std::fs::hard_link(&file_link, &alias))?;
+    checked(alias_link(&file_link, &alias))?;
     assert_eq!(inspect(&alias)?.kind, file_tidy_platform::NodeKind::Symlink);
     assert_eq!(inspect(&alias)?.identity, inspect(&file_link)?.identity);
     let file_info = inspect(&file_link)?;

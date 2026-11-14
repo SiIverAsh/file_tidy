@@ -15,6 +15,7 @@ pub use directory::{MigrationDirectory, MigrationTreeFile, open_directory_attach
 
 #[path = "migration_link.rs"]
 mod link;
+use link::LinkLocation;
 pub use link::open_symlink_attached_data;
 
 #[cfg(windows)]
@@ -206,7 +207,7 @@ impl MigrationFile {
     ) -> io::Result<()> {
         self.verify()?;
         let before = self.metadata()?;
-        native::visit(&mut self.file, check, sink)?;
+        native::visit(&mut self.file, &before, check, sink)?;
         if self.metadata()?.binding_bytes() != before.binding_bytes() {
             return Err(invalid("payload metadata changed during verification"));
         }
@@ -270,13 +271,21 @@ pub fn visit_migration_data(
         .parent()
         .ok_or_else(|| invalid("source parent missing"))?;
     let _guard = pin_metadata_parent(parent)?;
-    visit_pinned_data(source_path, source, expected, check, sink)
+    let parent_file = metadata_parent_file(&_guard)?;
+    let location = LinkLocation {
+        parent: &parent_file,
+        name: source_path
+            .file_name()
+            .ok_or_else(|| invalid("source name missing"))?,
+    };
+    visit_pinned_data(source_path, source, expected, Some(location), check, sink)
 }
 
 fn visit_pinned_data(
     source_path: &Path,
     source: &mut File,
     expected: &MetadataInventory,
+    location: Option<LinkLocation<'_>>,
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -287,7 +296,17 @@ fn visit_pinned_data(
     {
         return Err(invalid("source metadata changed before verification"));
     }
-    native::visit(source, check, sink)?;
+    if expected.kind() == NodeKind::Symlink {
+        native::visit_link(
+            source,
+            expected,
+            location.ok_or_else(|| invalid("link parent capability missing"))?,
+            check,
+            sink,
+        )?;
+    } else {
+        native::visit(source, expected, check, sink)?;
+    }
     check()?;
     if crate::metadata_inventory::inventory_open(source_path, source)?.binding_bytes()
         != expected.binding_bytes()
@@ -310,6 +329,14 @@ fn pin_metadata_parent(path: &Path) -> io::Result<crate::PinnedDirectory> {
 #[cfg(windows)]
 fn pin_metadata_parent(path: &Path) -> io::Result<(File, Vec<File>)> {
     crate::windows::open_metadata_directory(path)
+}
+#[cfg(unix)]
+fn metadata_parent_file(guard: &crate::PinnedDirectory) -> io::Result<File> {
+    guard.try_clone_file()
+}
+#[cfg(windows)]
+fn metadata_parent_file(guard: &(File, Vec<File>)) -> io::Result<File> {
+    guard.0.try_clone()
 }
 pub(crate) fn metadata_difference(mut source: &[u8], mut target: &[u8]) -> usize {
     let mut field = 0;

@@ -22,12 +22,28 @@ const SECURITY: u32 = 3;
 const ALTERNATE: u32 = 4;
 const SPARSE: u32 = 9;
 const REPARSE: u32 = 8;
+
+#[path = "migration_link_windows.rs"]
+mod link_data;
 fn native_error(action: &'static str) -> io::Error {
     let error = io::Error::last_os_error();
     io::Error::new(error.kind(), format!("{action}: {error}"))
 }
 
 pub(super) fn check_metadata(metadata: &MetadataInventory) -> io::Result<()> {
+    if metadata.kind() == NodeKind::Symlink
+        && (metadata
+            .attributes()
+            .iter()
+            .any(|a| a.kind == crate::MetadataAttributeKind::ExtendedAttributes)
+            || metadata.native_flags()
+                & u64::from(FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED)
+                != 0)
+    {
+        return Err(unsupported(
+            "link attributes require a different migration capability",
+        ));
+    }
     let supported = FILE_ATTRIBUTE_READONLY
         | FILE_ATTRIBUTE_DIRECTORY
         | FILE_ATTRIBUTE_REPARSE_POINT
@@ -551,12 +567,28 @@ pub(super) fn copy_link_metadata(
     source: &File,
     target: &mut File,
     metadata: &MetadataInventory,
-    parent: &File,
-    name: &OsStr,
+    source_location: LinkLocation<'_>,
+    target_location: LinkLocation<'_>,
     check: &(impl Fn() -> io::Result<()> + Sync),
 ) -> io::Result<()> {
-    let _ = (parent, name);
-    copy_payload(source, target, metadata, check, NodeKind::Symlink)
+    link_data::copy(
+        source,
+        target,
+        metadata,
+        source_location,
+        target_location,
+        check,
+    )
+}
+
+pub(super) fn visit_link(
+    file: &mut File,
+    metadata: &MetadataInventory,
+    location: LinkLocation<'_>,
+    check: &(impl Fn() -> io::Result<()> + Sync),
+    sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    link_data::visit(file, metadata, location, check, sink)
 }
 
 fn copy_payload(
@@ -612,6 +644,11 @@ fn copy_payload(
     writer.finish()?;
     drop(reader);
     restore_access(&source, &security_target)?;
+    restore_basic(&source, target, link)?;
+    check()
+}
+
+fn restore_basic(source: &File, target: &File, link: bool) -> io::Result<()> {
     let mut basic = FILE_BASIC_INFO::default();
     // SAFETY: both live handles are synchronous and basic is an aligned,
     // correctly sized input/output object for these metadata requests.
@@ -646,14 +683,18 @@ fn copy_payload(
     {
         return Err(native_error("restore migration file times and attributes"));
     }
-    check()
+    Ok(())
 }
 
 pub(super) fn visit(
     file: &mut File,
+    metadata: &MetadataInventory,
     check: &(impl Fn() -> io::Result<()> + Sync),
     sink: &mut impl FnMut(MigrationData<'_>) -> io::Result<()>,
 ) -> io::Result<()> {
+    if metadata.kind() == NodeKind::Symlink {
+        return Err(invalid("link values require a parent capability"));
+    }
     let kind = crate::inspect_file(file)?.kind;
     let link = kind == NodeKind::Symlink;
     if kind == NodeKind::Regular {
