@@ -68,6 +68,10 @@ export class TreemapPanel {
     this.renderList();
   }
 
+  refreshTheme(): void {
+    this.drawCanvas();
+  }
+
   private bindCanvasEvents(): void {
     this.canvas.addEventListener("mousemove", (ev) => {
       const hit = this.hitTest(ev);
@@ -175,21 +179,25 @@ export class TreemapPanel {
     }
   }
 
-  private fillColorForNode(node: TreemapNodeDto, active: boolean): string {
+  private fillColorForNode(
+    node: TreemapNodeDto,
+    active: boolean,
+    colors: { primary: string; primaryHover: string; danger: string; warn: string; muted: string },
+  ): string {
     if (node.is_other_rollup) {
-      return active ? "#64748b" : "#475569";
+      return colors.muted;
     }
     const zone = node.policy?.zone;
     switch (zone) {
       case "A_Protected":
-        return active ? "#7f1d1d" : "#991b1b";
+        return colors.danger;
       case "B_Sensitive":
-        return active ? "#b45309" : "#92400e";
+        return colors.warn;
       case "C_GrantedPersistent":
       case "C_GrantedSession":
-        return active ? "#2563eb" : "#1d4ed8";
+        return active ? colors.primaryHover : colors.primary;
       default:
-        return active ? "#334155" : "#1e293b";
+        return colors.muted;
     }
   }
 
@@ -198,12 +206,26 @@ export class TreemapPanel {
     if (!ctx) {
       return;
     }
+    const tokens = getComputedStyle(document.documentElement);
+    const color = (name: string): string => tokens.getPropertyValue(name).trim();
+    const colors = {
+      primary: color("--primary"),
+      primaryHover: color("--primary-hover"),
+      danger: color("--danger"),
+      warn: color("--warn"),
+      muted: color("--text-muted"),
+    };
+    const background = color("--surface-alt");
+    // --on-accent resolves to the theme canvas in dark mode and white in light mode.
+    const foreground = document.documentElement.dataset.colorMode === "dark"
+      ? color("--bg")
+      : color("--on-accent");
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    ctx.fillStyle = "#0f172a";
+    ctx.fillStyle = background;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
     if (this.rects.length === 0) {
-      ctx.fillStyle = "#94a3b8";
+      ctx.fillStyle = colors.muted;
       ctx.font = "14px sans-serif";
       ctx.fillText("暂无可绘制的占用节点", 20, 40);
       return;
@@ -211,15 +233,15 @@ export class TreemapPanel {
 
     for (const r of this.rects) {
       const active = r.node.id === this.activeNodeId;
-      ctx.fillStyle = this.fillColorForNode(r.node, active);
+      ctx.fillStyle = this.fillColorForNode(r.node, active, colors);
       ctx.fillRect(r.x, r.y, r.w, r.h);
 
-      ctx.strokeStyle = active ? "#f8fafc" : "#0f172a";
+      ctx.strokeStyle = active ? foreground : background;
       ctx.lineWidth = active ? 2 : 1;
       ctx.strokeRect(r.x, r.y, r.w, r.h);
 
       if (r.w > 54 && r.h > 28) {
-        ctx.fillStyle = "#f8fafc";
+        ctx.fillStyle = foreground;
         ctx.font = "12px sans-serif";
         const label =
           r.node.label_display.length > 16
@@ -227,7 +249,7 @@ export class TreemapPanel {
             : r.node.label_display;
         ctx.fillText(label, r.x + 6, r.y + 16);
         if (r.h > 42) {
-          ctx.fillStyle = "#cbd5e1";
+          ctx.fillStyle = foreground;
           ctx.font = "11px sans-serif";
           ctx.fillText(formatBytes(r.node.logical_bytes), r.x + 6, r.y + 32);
         }

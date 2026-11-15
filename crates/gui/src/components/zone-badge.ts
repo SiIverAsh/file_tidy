@@ -8,13 +8,13 @@ export function describeZoneLabel(zone: ZoneKind): {
 } {
   switch (zone) {
     case "A_Protected":
-      return { icon: "●", text: "A 保护", cssClass: "zone-badge zone-a" };
+      return { icon: "●", text: "系统保护", cssClass: "zone-badge zone-a" };
     case "B_Sensitive":
-      return { icon: "●", text: "B 敏感", cssClass: "zone-badge zone-b" };
+      return { icon: "●", text: "敏感文件", cssClass: "zone-badge zone-b" };
     case "C_GrantedPersistent":
-      return { icon: "●", text: "C 持久", cssClass: "zone-badge zone-c" };
+      return { icon: "●", text: "持久授权", cssClass: "zone-badge zone-c" };
     case "C_GrantedSession":
-      return { icon: "●", text: "C 会话", cssClass: "zone-badge zone-c" };
+      return { icon: "●", text: "本次授权", cssClass: "zone-badge zone-c" };
     case "Unauthenticated":
       return { icon: "○", text: "未授权", cssClass: "zone-badge zone-u" };
   }
@@ -40,6 +40,9 @@ export function describeSensitivityReason(reason: SensitivityReason | null): str
 export function createZoneBadge(policy: EntryPolicyView): HTMLElement {
   const info = describeZoneLabel(policy.zone);
   const badge = el("span", info.cssClass, `${info.icon} ${info.text}`);
+  const code = policy.zone === "A_Protected" ? "A" : policy.zone === "B_Sensitive" ? "B"
+    : policy.zone === "Unauthenticated" ? null : "C";
+  if (code) badge.appendChild(el("span", "technical-detail", ` (${code})`));
   if (policy.blocked_reason) {
     badge.title = policy.blocked_reason;
   }
@@ -66,15 +69,23 @@ export function createPolicyExplanationBox(policy: EntryPolicyView): HTMLElement
   const title = el(
     "div",
     "policy-callout__title",
-    policy.zone === "B_Sensitive" ? "B 区限制" : "操作限制",
+    policy.zone === "B_Sensitive" ? "敏感文件限制" : "操作限制",
   );
   box.appendChild(title);
 
   if (policy.blocked_reason) {
-    box.appendChild(el("p", "policy-callout__line", policy.blocked_reason));
+    const message = policy.zone === "A_Protected"
+      ? "这是系统保护文件，仅允许复制到已授权目录。"
+      : policy.zone === "B_Sensitive"
+        ? "这是敏感文件，不能移动、重命名、隔离或删除。复制需要单独确认。"
+        : policy.zone === "Unauthenticated"
+          ? "此目录尚未授权，整理前请先添加目录授权。"
+          : policy.blocked_reason;
+    box.appendChild(el("p", "policy-callout__line simple-detail", message));
+    box.appendChild(el("p", "policy-callout__line technical-detail", policy.blocked_reason));
   }
   if (cascadeText) {
-    box.appendChild(el("p", "policy-callout__line", cascadeText));
+    box.appendChild(el("p", "policy-callout__line technical-detail", cascadeText));
   }
   if (policy.atomic_root_display) {
     box.appendChild(

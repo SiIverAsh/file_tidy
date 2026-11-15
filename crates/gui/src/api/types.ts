@@ -39,6 +39,8 @@ export interface ScanProgressEvent {
   phase: ScanPhase;
   discovered: string;
   processed: string;
+  phase_processed: string;
+  phase_total: string;
   content_bytes_read: string;
   errors: string;
 }

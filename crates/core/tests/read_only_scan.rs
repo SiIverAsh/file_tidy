@@ -376,6 +376,64 @@ fn cancellation_before_and_during_content_returns_partial_report() -> TestResult
 }
 
 #[test]
+fn magic_progress_allows_cancelling_before_the_rest_of_a_batch_is_opened() -> TestResult {
+    let dir = fixture()?;
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        fs::write(dir.path().join(name), b"")?;
+    }
+    let mut opts = options(dir.path());
+    opts.threads = 1;
+    let cancel = CancellationToken::default();
+    let reached = AtomicBool::new(false);
+    let report = scan(opts, &cancel, |event| {
+        if event.phase == ScanPhase::Magic && event.phase_processed == 1 {
+            assert_eq!(event.phase_total, 4);
+            // Empty files cannot advance a byte counter; file progress must still advance.
+            assert_eq!(event.bytes_read, 0);
+            reached.store(true, Ordering::Relaxed);
+            cancel.cancel();
+        }
+    })?;
+    assert!(reached.load(Ordering::Relaxed));
+    assert!(report.summary.cancelled);
+    assert_eq!(report.summary.content_open_operations, 1);
+    assert_eq!(
+        report
+            .entries
+            .iter()
+            .filter(|e| e.content_inspected)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn prefix_hash_progress_allows_cancelling_within_a_candidate_group() -> TestResult {
+    let dir = fixture()?;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(dir.path().join(name), b"same contents")?;
+    }
+    let mut opts = options(dir.path());
+    opts.threads = 1;
+    let cancel = CancellationToken::default();
+    let reached = AtomicBool::new(false);
+    let report = scan(opts, &cancel, |event| {
+        if event.phase == ScanPhase::PrefixHash && event.phase_processed == 1 {
+            assert_eq!(event.phase_total, 3);
+            reached.store(true, Ordering::Relaxed);
+            cancel.cancel();
+        }
+    })?;
+    assert!(reached.load(Ordering::Relaxed));
+    assert!(report.summary.cancelled);
+    // Three magic reads, then just one prefix read; the other candidates stay unopened.
+    assert_eq!(report.summary.content_open_operations, 4);
+    assert!(report.duplicates.is_empty());
+    Ok(())
+}
+
+#[test]
 fn mutation_between_magic_and_hash_is_visible_and_not_a_duplicate() -> TestResult {
     let dir = fixture()?;
     let a = dir.path().join("a.bin");

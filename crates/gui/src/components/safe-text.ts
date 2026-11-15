@@ -67,6 +67,15 @@ export function formatBytesWithExact(decimal: string | null | undefined): string
   return `${formatBytes(decimal)} (${decimal} B)`;
 }
 
+/** Keep exact byte counts available without overwhelming the default interface. */
+export function createSizeLabel(decimal: string | null | undefined): HTMLElement {
+  const label = el("span", "", formatBytes(decimal));
+  if (decimal !== null && decimal !== undefined) {
+    label.appendChild(el("span", "technical-detail", ` (${decimal} B)`));
+  }
+  return label;
+}
+
 export function formatUnixTime(unixSeconds: string | null | undefined): string {
   if (!unixSeconds || !/^-?\d+$/.test(unixSeconds)) {
     return "未知";

@@ -6,6 +6,7 @@ import { ReviewDrawer } from "../src/components/review-drawer.ts";
 import { TreemapPanel } from "../src/components/treemap.ts";
 import { VirtualEntryList } from "../src/components/virtual-list.ts";
 import { AppStore } from "../src/state/store.ts";
+import { ExploreView } from "../src/views/explore.ts";
 
 class FakeClassList {
   private set = new Set<string>();
@@ -26,6 +27,8 @@ class FakeClassList {
   }
 }
 
+let onFakeFocus: ((element: FakeElement) => void) | null = null;
+
 class FakeElement {
   readonly tagName: string;
   className = "";
@@ -42,6 +45,7 @@ class FakeElement {
   inputMode = "";
   disabled = false;
   checked = false;
+  hidden = false;
   id = "";
   title = "";
   tabIndex = -1;
@@ -96,7 +100,7 @@ class FakeElement {
     this.attributes.delete(name);
   }
 
-  focus(): void {}
+  focus(): void { onFakeFocus?.(this); }
 
   addEventListener(type: string, cb: (ev: unknown) => void): void {
     const list = this.listeners.get(type) ?? [];
@@ -128,6 +132,7 @@ class FakeElement {
 
 function installFakeDom(): { setActive(el: FakeElement | null): void } {
   let activeEl: FakeElement | null = null;
+  onFakeFocus = (element) => { activeEl = element; };
   const fakeDoc = {
     createElement(tag: string): FakeElement {
       return new FakeElement(tag);
@@ -188,6 +193,72 @@ function samplePreview(overrides: Partial<PlanPreviewDto> = {}): PlanPreviewDto 
     ...overrides,
   };
 }
+
+test("ExploreView preserves stop button across progress updates and shows phase counts", () => {
+  installFakeDom();
+  const store = new AppStore();
+  let cancellations = 0;
+  const view = new ExploreView({
+    onPickRoots: async () => {},
+    onPickRules: async () => {},
+    onStartScan: async () => {},
+    onCancelScan: async () => { cancellations += 1; },
+    onUpdateOptions: () => {},
+    onFilterChange: async () => {},
+    onSortChange: async () => {},
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchSkipped: async () => [],
+    onSelectionChange: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: async () => {},
+    onTriggerAction: async () => {},
+    onQuickAuthorizeSelected: async () => {},
+  });
+  store.state.scanning = true;
+  store.state.scanProgress = {
+    scan_generation: "1",
+    phase: "discovering",
+    discovered: "100",
+    processed: "80",
+    phase_processed: "80",
+    phase_total: "0",
+    content_bytes_read: "0",
+    errors: "0",
+  };
+  view.render(store.state);
+  const rootEl = view.root as unknown as FakeElement;
+  const stopButton = rootEl.findAll((el) => el.textContent === "停止扫描")[0];
+  const progressText = rootEl.findAll((el) => el.className === "scan-progress__text")[0];
+  if (!stopButton || !progressText) {
+    throw new Error("expected scan progress controls");
+  }
+  assert.match(progressText.textContent ?? "", /发现 100 项 · 已处理 80 项/);
+  stopButton.dispatch("mousedown");
+
+  store.state.scanProgress = {
+    ...store.state.scanProgress,
+    phase: "duplicates",
+    phase_processed: "3",
+    phase_total: "8",
+    content_bytes_read: "2048",
+  };
+  view.render(store.state);
+  assert.equal(rootEl.findAll((el) => el.textContent === "停止扫描")[0], stopButton);
+  assert.equal(rootEl.findAll((el) => el.className === "scan-progress__text")[0], progressText);
+  assert.match(progressText.textContent ?? "", /查找重复文件 · 当前组 3\/8 项 · 已读 2\.00 KiB$/);
+  stopButton.dispatch("mouseup");
+  stopButton.dispatch("click");
+  assert.equal(cancellations, 1);
+
+  store.state.scanning = false;
+  view.render(store.state);
+  assert.equal(stopButton.parentNode?.parentNode?.hidden, true);
+  store.state.scanning = true;
+  view.render(store.state);
+  assert.equal(stopButton.parentNode?.parentNode?.hidden, false);
+  assert.equal(rootEl.findAll((el) => el.textContent === "停止扫描")[0], stopButton);
+  view.virtualList.destroy();
+});
 
 test("ReviewDrawer preserves itemCountInput focus across keystrokes and blocks B-zone writes", () => {
   const dom = installFakeDom();
@@ -358,6 +429,59 @@ test("VirtualEntryList drops stale in-flight query results after resetAndLoad", 
     .findAll((el) => el.className === "vlist__name")
     .map((el) => el.textContent);
   assert.deepEqual(names, ["file-2.txt"]);
+  vlist.destroy();
+});
+
+test("VirtualEntryList restores checkbox focus by entry ID after selection rerenders", async () => {
+  installFakeDom();
+  const selection = { mode: "ids" as const, scan_generation: "1", ids: [] as string[] };
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async () => ({ totalCount: 2, entries: [treeEntry("a", "a.txt", "file"), treeEntry("b", "b.txt", "file")] }),
+    onToggleSelect: (id) => { selection.ids = [id]; vlist.updateSelection(selection, "1"); },
+    onInspectEntry: () => {},
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", selection);
+  const root = vlist.root as unknown as FakeElement;
+  const original = root.findAll((node) => node.getAttribute("aria-label") === "选择 b.txt")[0];
+  if (!original) throw new Error("expected second checkbox");
+  original.focus();
+  original.dispatch("click", { stopPropagation() {} });
+  const current = root.findAll((node) => node.getAttribute("data-vlist-entry-id") === "b")[0];
+  assert.equal(current === original, false);
+  assert.equal(document.activeElement, current as unknown as Element);
+  assert.equal(current?.checked, true);
+  assert.equal(current?.tabIndex, 0);
+  vlist.destroy();
+});
+
+test("VirtualEntryList inspects the focused entry after loading a different keyboard window", async () => {
+  installFakeDom();
+  const pending: { resolve?: (value: { totalCount: number; entries: FileEntryDto[] }) => void } = {};
+  const inspected: string[] = [];
+  let lastOffset = 0;
+  const entries = (offset: number, count: number): FileEntryDto[] =>
+    Array.from({ length: count }, (_, index) => treeEntry(String(offset + index), `file-${offset + index}`, "file"));
+  const vlist = new VirtualEntryList({
+    onFetchWindow: async (offset, limit) => {
+      if (offset === 0) return { totalCount: 150, entries: entries(0, limit) };
+      lastOffset = offset;
+      return new Promise((resolve) => { pending.resolve = resolve; });
+    },
+    onToggleSelect: () => {},
+    onInspectEntry: (entry) => { inspected.push(entry.id); },
+    onDrillDirectory: () => {},
+  });
+  await vlist.resetAndLoad("1", { mode: "ids", scan_generation: "1", ids: [] });
+  const root = vlist.root as unknown as FakeElement;
+  const viewport = root.findAll((node) => node.getAttribute("role") === "listbox")[0];
+  if (!viewport) throw new Error("expected list viewport");
+  viewport.focus();
+  viewport.dispatch("keydown", { key: "End", target: viewport, preventDefault() {} });
+  assert.equal(inspected.length, 0);
+  pending.resolve?.({ totalCount: 150, entries: entries(lastOffset, 150 - lastOffset) });
+  await settleTree();
+  assert.deepEqual(inspected, ["149"]);
   vlist.destroy();
 });
 

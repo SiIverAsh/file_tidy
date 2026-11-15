@@ -29,7 +29,7 @@ impl<'a> ContentReadPermit<'a> {
         policy: &'a Policy,
         mounts: &MountTable,
     ) -> io::Result<Self> {
-        if policy.sensitive_for_content(path) || expected.kind != NodeKind::Regular {
+        if expected.kind != NodeKind::Regular {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "content policy denied",
@@ -47,6 +47,8 @@ impl<'a> ContentReadPermit<'a> {
                 "file identity unavailable",
             ));
         }
+        // Issuing this private value does not open content. Revalidate sensitive
+        // directory identities once, at the actual open boundary below.
         Ok(Self {
             path,
             expected,

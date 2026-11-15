@@ -22,7 +22,7 @@ import type {
   WorkspaceStatusDto,
 } from "../api/types.ts";
 
-export type MainView = "explore" | "safety" | "access";
+export type MainView = "explore" | "safety" | "access" | "appearance";
 export type SafetySubTab = "quarantine" | "history" | "recovery";
 
 export interface AppStateModel {

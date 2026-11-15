@@ -45,6 +45,7 @@ export class VirtualEntryList {
   private totalCount = 0;
   private offset = 0;
   private focusedIndex = 0;
+  private focusMoveSeq = 0;
   private selection: SelectionSpec = { mode: "ids", scan_generation: "0", ids: [] };
   private cache = new Map<number, FileEntryDto>();
   private loadingSeq: number | null = null;
@@ -220,6 +221,7 @@ export class VirtualEntryList {
   }
 
   async resetAndLoad(generation: ScanGeneration, selection: SelectionSpec, treeMode = false): Promise<void> {
+    this.focusMoveSeq += 1;
     this.generation = generation;
     this.selection = selection;
     this.offset = 0;
@@ -326,6 +328,7 @@ export class VirtualEntryList {
   }
 
   private async moveFocus(nextIndex: number): Promise<void> {
+    const focusSeq = ++this.focusMoveSeq;
     let clamped = Math.max(0, Math.min(this.totalCount - 1, nextIndex));
     if (this.tree?.row(clamped)?.note) {
       const step = clamped === this.totalCount - 1 || nextIndex < this.focusedIndex ? -1 : 1;
@@ -341,12 +344,11 @@ export class VirtualEntryList {
     } else if (clamped >= this.offset + WINDOW_ROWS) {
       await this.scrollTo(clamped - WINDOW_ROWS + 1);
     } else {
-      const entry = this.entryAt(clamped);
-      if (entry) {
-        this.callbacks.onInspectEntry(entry);
-      }
       this.render();
     }
+    if (focusSeq !== this.focusMoveSeq || this.destroyed) return;
+    const entry = this.entryAt(this.focusedIndex);
+    if (entry) this.callbacks.onInspectEntry(entry);
   }
 
   async scrollTo(targetOffset: number): Promise<void> {
@@ -426,6 +428,8 @@ export class VirtualEntryList {
   }
 
   render(): void {
+    const focusedCheckboxId = this.focusedCheckboxId();
+    let focusedCheckbox: HTMLInputElement | null = null;
     clearChildren(this.rowsEl);
     this.viewport.removeAttribute("aria-activedescendant");
     if (this.totalCount <= WINDOW_ROWS) {
@@ -492,7 +496,9 @@ export class VirtualEntryList {
       const checkbox = el("input");
       checkbox.type = "checkbox";
       checkbox.checked = selected;
+      checkbox.setAttribute("data-vlist-entry-id", entry.id);
       checkbox.setAttribute("aria-label", `选择 ${entry.name_display}`);
+      if (focusedCheckboxId === entry.id) focusedCheckbox = checkbox;
       checkbox.addEventListener("click", (ev) => {
         ev.stopPropagation();
         this.focusedIndex = index;
@@ -528,7 +534,7 @@ export class VirtualEntryList {
         titleRow.appendChild(el("span", "chip-quiet", "隐藏"));
       }
       if (entry.is_stale) {
-        titleRow.appendChild(el("span", "chip-quiet chip-quiet--warn", "陈旧"));
+        titleRow.appendChild(el("span", "chip-quiet chip-quiet--warn", "久未修改"));
       }
       nameCell.appendChild(titleRow);
       row.appendChild(nameCell);
@@ -563,6 +569,7 @@ export class VirtualEntryList {
 
       this.rowsEl.appendChild(row);
     }
+    focusedCheckbox?.focus({ preventScroll: true });
 
     clearChildren(this.statusEl);
     this.statusEl.appendChild(
@@ -571,6 +578,18 @@ export class VirtualEntryList {
     this.statusEl.appendChild(
       el("span", "vlist__status-count", `${this.offset + 1}–${end} / ${this.totalCount} ${this.tree ? "行" : "项"}`),
     );
+  }
+
+  private focusedCheckboxId(): EntryId | null {
+    const active = document.activeElement;
+    const id = active?.getAttribute("data-vlist-entry-id") ?? null;
+    if (id === null) return null;
+    let node: Node | null = active;
+    while (node) {
+      if (node === this.rowsEl) return id;
+      node = node.parentNode;
+    }
+    return null;
   }
 
   private appendIndents(target: HTMLElement, depth: number): void {

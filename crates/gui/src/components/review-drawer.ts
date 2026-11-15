@@ -3,10 +3,12 @@ import type { AppStateModel } from "../state/store.ts";
 import {
   clearChildren,
   el,
-  formatBytesWithExact,
+  createSizeLabel,
   formatCountdown,
 } from "./safe-text.ts";
 import { createZoneBadge, describeSensitivityReason } from "./zone-badge.ts";
+import { MotionPresence } from "./motion.ts";
+import { fileKindLabel, labeledValue, operationLabel, statusLabel } from "./display-labels.ts";
 
 export interface ReviewDrawerCallbacks {
   onClose(): void;
@@ -21,6 +23,7 @@ export interface ReviewDrawerCallbacks {
 export class ReviewDrawer {
   readonly root: HTMLElement;
   private readonly callbacks: ReviewDrawerCallbacks;
+  private readonly presence: MotionPresence;
   private expandedManifests = new Set<string>();
   private timerId: number | null = null;
   private countdownEl: HTMLElement | null = null;
@@ -28,25 +31,42 @@ export class ReviewDrawer {
   private countInputEl: HTMLInputElement | null = null;
   private execBtnEl: HTMLButtonElement | null = null;
   private renderedPreviewKey: string | null = null;
+  private latestModel: AppStateModel | null = null;
+  private executingPreviewKey: string | null = null;
+  private execProgressEl: HTMLElement | null = null;
 
   constructor(callbacks: ReviewDrawerCallbacks) {
     this.callbacks = callbacks;
     this.root = el("aside", "drawer");
     this.root.setAttribute("role", "dialog");
+    this.root.setAttribute("aria-modal", "true");
     this.root.setAttribute("aria-label", "操作计划审阅与执行");
+    this.presence = new MotionPresence(this.root, "drawer--open");
   }
 
   render(model: AppStateModel): void {
+    this.latestModel = model;
     const drawer = model.planDrawer;
     if (!drawer.open) {
-      this.root.classList.remove("drawer--open");
       this.stopTimer();
       this.countInputEl = null;
       this.execBtnEl = null;
       this.renderedPreviewKey = null;
-      clearChildren(this.root);
+      this.latestPreview = null;
+      this.executingPreviewKey = null;
+      this.execProgressEl = null;
+      this.presence.hide(() => clearChildren(this.root));
       return;
     }
+    this.presence.show();
+    const executingKey = drawer.executing && drawer.preview
+      ? `${drawer.preview.plan_id}:${drawer.preview.plan_digest}` : null;
+    if (executingKey !== null && executingKey === this.executingPreviewKey) {
+      this.updateExecutionProgress(drawer);
+      return;
+    }
+    this.executingPreviewKey = executingKey;
+    this.execProgressEl = null;
 
     const previewKey =
       !drawer.loading && !drawer.executionReport && !drawer.executing && drawer.preview
@@ -68,7 +88,7 @@ export class ReviewDrawer {
     this.countInputEl = null;
     this.execBtnEl = null;
 
-    this.root.classList.add("drawer--open");
+    this.stopTimer();
     clearChildren(this.root);
 
     const header = el("div", "drawer__header");
@@ -109,13 +129,10 @@ export class ReviewDrawer {
     const metaBar = el("div", "plan-meta");
     const countdown = el("span", "plan-meta__timer");
     metaBar.appendChild(countdown);
-    metaBar.appendChild(
-      el(
-        "span",
-        "plan-meta__digest",
-        `摘要 ${preview.plan_digest.slice(0, 12)}… · 授权代次 #${preview.authorization_epoch}`,
-      ),
-    );
+    const metaDetails = el("span", "plan-meta__digest technical-detail");
+    metaDetails.appendChild(el("span", "", `摘要 ${preview.plan_digest.slice(0, 12)}…`));
+    metaDetails.appendChild(el("span", "", ` · 授权代次 #${preview.authorization_epoch}`));
+    metaBar.appendChild(metaDetails);
     body.appendChild(metaBar);
     this.startTimer(countdown);
 
@@ -128,9 +145,10 @@ export class ReviewDrawer {
         `待处理文件/链接：${preview.files_and_links} · 目录：${preview.directories}（空目录 ${preview.empty_directories}）`,
       ),
     );
-    stats.appendChild(
-      el("div", "plan-stats__item", `总大小：${formatBytesWithExact(preview.total_bytes)}`),
-    );
+    const size = el("div", "plan-stats__item");
+    size.appendChild(el("span", "", "总大小："));
+    size.appendChild(createSizeLabel(preview.total_bytes));
+    stats.appendChild(size);
     body.appendChild(stats);
 
     // Explicit B-zone write rejection callout (never confirmable!)
@@ -140,7 +158,7 @@ export class ReviewDrawer {
         el(
           "strong",
           "",
-          "以下 B 区条目不支持写入或删除（仅允许复制到 C 区）：",
+          "以下敏感项目不支持写入或删除，只能复制到已授权目录：",
         ),
       );
       for (const reason of preview.blocked_b_write_reasons) {
@@ -158,7 +176,7 @@ export class ReviewDrawer {
     // Operations Before / After cards
     const opsWrap = el("div", "plan-ops");
     for (const op of preview.operations) {
-      opsWrap.appendChild(this.renderOperationCard(op, preview, drawer.selectedOpIds));
+      opsWrap.appendChild(this.renderOperationCard(op, preview, drawer.selectedOpIds, drawer.executing));
     }
     body.appendChild(opsWrap);
 
@@ -177,6 +195,7 @@ export class ReviewDrawer {
         const cb = el("input");
         cb.type = "checkbox";
         cb.checked = drawer.acknowledgedContentKeys.has(ack.key);
+        cb.disabled = drawer.executing;
         cb.addEventListener("change", () => this.callbacks.onToggleAckKey(ack.key));
         label.appendChild(cb);
         label.appendChild(el("span", "ack-row__text", ack.description));
@@ -200,6 +219,7 @@ export class ReviewDrawer {
       input.inputMode = "numeric";
       input.placeholder = preview.confirmation_count;
       input.value = drawer.itemCountInput;
+      input.disabled = drawer.executing;
       input.addEventListener("input", () => this.callbacks.onItemCountInput(input.value));
       this.countInputEl = input;
       countBox.appendChild(input);
@@ -216,21 +236,15 @@ export class ReviewDrawer {
         void this.callbacks.onCancelExecution();
       });
       footer.appendChild(cancelBtn);
-      if (drawer.execProgress) {
-        footer.appendChild(
-          el(
-            "span",
-            "exec-progress-text",
-            `正在执行 ${drawer.execProgress.completed_operations}/${drawer.execProgress.total_operations}`,
-          ),
-        );
-      }
+      this.execProgressEl = el("span", "exec-progress-text");
+      footer.appendChild(this.execProgressEl);
+      this.updateExecutionProgress(drawer);
     } else {
       const execBtn = el("button", "btn btn--primary", "确认并执行计划");
       execBtn.type = "button";
       execBtn.disabled = !canExecute;
       execBtn.addEventListener("click", () => {
-        void this.callbacks.onExecute(preview);
+        if (this.canSubmit(preview, drawer)) void this.callbacks.onExecute(preview);
       });
       this.execBtnEl = execBtn;
       footer.appendChild(execBtn);
@@ -242,6 +256,7 @@ export class ReviewDrawer {
     preview: PlanPreviewDto,
     drawer: AppStateModel["planDrawer"],
   ): boolean {
+    if (!drawer.open || drawer.loading || drawer.executing) return false;
     if (preview.blocked_b_write_reasons.length > 0 || preview.executable_error !== null) {
       return false;
     }
@@ -270,6 +285,7 @@ export class ReviewDrawer {
     op: PlannedOperationDto,
     preview: PlanPreviewDto,
     selectedOpIds: Set<string>,
+    executing: boolean,
   ): HTMLElement {
     const card = el("div", "op-card");
 
@@ -278,7 +294,7 @@ export class ReviewDrawer {
     const cb = el("input");
     cb.type = "checkbox";
     cb.checked = selectedOpIds.has(op.id);
-    cb.disabled = preview.operations.length <= 1;
+    cb.disabled = preview.operations.length <= 1 || executing;
     cb.addEventListener("change", () => {
       const next = new Set(selectedOpIds);
       if (cb.checked) {
@@ -289,7 +305,7 @@ export class ReviewDrawer {
       void this.callbacks.onFilterOperations(preview.plan_id, [...next]);
     });
     checkLabel.appendChild(cb);
-    checkLabel.appendChild(el("span", "tag tag--kind", op.kind.toUpperCase()));
+    checkLabel.appendChild(labeledValue(operationLabel(op.kind), op.kind, "tag tag--kind"));
     top.appendChild(checkLabel);
     top.appendChild(createZoneBadge(op.source_policy));
     card.appendChild(top);
@@ -309,7 +325,7 @@ export class ReviewDrawer {
         diff.appendChild(
           el(
             "div",
-            "op-diff__sub",
+            "op-diff__sub technical-detail",
             `大小写中间临时名：${op.destination.spelling_temporary_display}`,
           ),
         );
@@ -318,7 +334,7 @@ export class ReviewDrawer {
         diff.appendChild(
           el(
             "div",
-            "op-diff__sub",
+            "op-diff__sub technical-detail",
             `校验暂存位置：${op.destination.copy_temporary_display}`,
           ),
         );
@@ -337,9 +353,10 @@ export class ReviewDrawer {
           el(
             "div",
             "op-diff__sub",
-            "复制策略：仅保留主数据流与修改时间（私有权限，不复制 ACL/xattr）",
+            "复制会保留文件内容和修改时间，权限及其他属性可能不同。",
           ),
         );
+        diff.appendChild(el("div", "op-diff__sub technical-detail", "复制策略：私有权限，不复制 ACL/xattr。"));
       }
     }
     card.appendChild(diff);
@@ -384,18 +401,17 @@ export class ReviewDrawer {
     const list = el("div", "manifest-list");
     for (const item of op.manifest) {
       const row = el("div", "manifest-list__item");
-      const line = el(
-        "div",
-        "manifest-list__path",
-        `[${item.kind}] ${item.path_display} (${formatBytesWithExact(item.size_bytes)})`,
-      );
+      const line = el("div", "manifest-list__path");
+      line.appendChild(labeledValue(fileKindLabel(item.kind), item.kind));
+      line.appendChild(el("span", "", ` · ${item.path_display} · `));
+      line.appendChild(createSizeLabel(item.size_bytes));
       row.appendChild(line);
       if (item.hidden) {
         row.appendChild(el("span", "tag tag--muted", "隐藏"));
       }
       if (item.sensitive) {
         const reason = describeSensitivityReason(item.sensitivity_reason) ?? "敏感受保护项";
-        row.appendChild(el("span", "tag tag--warn", `B 敏感：${reason}`));
+        row.appendChild(el("span", "tag tag--warn", `敏感：${reason}`));
       }
       if (item.link_target_display) {
         row.appendChild(
@@ -420,14 +436,17 @@ export class ReviewDrawer {
     const banner = el(
       "div",
       report.completed ? "alert alert--ok" : "alert alert--warn",
-      report.completed
-        ? `执行完成（批次 ${report.batch_id.slice(0, 12)}…）`
-        : `执行部分完成或中断（批次 ${report.batch_id.slice(0, 12)}…）`,
     );
+    banner.appendChild(el("span", "simple-detail", report.completed ? "操作完成" : "部分操作未完成，请查看结果"));
+    banner.appendChild(el("span", "technical-detail", report.completed ? "执行完成" : "执行部分完成或中断"));
+    banner.appendChild(el("span", "technical-detail", ` · 批次 ${report.batch_id.slice(0, 12)}…`));
     body.appendChild(banner);
 
     if (report.journal_error) {
-      body.appendChild(el("div", "alert alert--error", `日志告警：${report.journal_error}`));
+      const warning = el("div", "alert alert--error");
+      warning.appendChild(el("span", "", "操作记录保存异常，请核对文件状态。"));
+      warning.appendChild(el("span", "technical-detail", ` 日志告警：${report.journal_error}`));
+      body.appendChild(warning);
     }
 
     let needsRecovery = false;
@@ -437,7 +456,7 @@ export class ReviewDrawer {
         needsRecovery = true;
       }
       const item = el("div", "exec-result");
-      item.appendChild(el("span", `tag tag--status-${op.status}`, op.status));
+      item.appendChild(labeledValue(statusLabel(op.status), op.status, `tag tag--status-${op.status}`));
       item.appendChild(el("div", "exec-result__path", `源：${op.source_display}`));
       if (op.destination_display) {
         item.appendChild(el("div", "exec-result__path", `目标：${op.destination_display}`));
@@ -474,9 +493,19 @@ export class ReviewDrawer {
       if (res.expired) {
         this.countdownEl.classList.add("plan-meta__timer--expired");
       }
+      if (this.execBtnEl && this.latestModel) {
+        this.execBtnEl.disabled = !this.canSubmit(this.latestPreview, this.latestModel.planDrawer);
+      }
     };
     tick();
     this.timerId = window.setInterval(tick, 1000);
+  }
+
+  private updateExecutionProgress(drawer: AppStateModel["planDrawer"]): void {
+    if (!this.execProgressEl) return;
+    this.execProgressEl.textContent = drawer.execProgress
+      ? `正在执行 ${drawer.execProgress.completed_operations}/${drawer.execProgress.total_operations}`
+      : "正在执行…";
   }
 
   private stopTimer(): void {

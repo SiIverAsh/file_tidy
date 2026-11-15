@@ -11,3 +11,9 @@ declare module "node:assert/strict" {
   };
   export default assert;
 }
+
+declare module "node:module" {
+  export function registerHooks(hooks: {
+    load(url: string, context: unknown, nextLoad: (url: string, context: unknown) => unknown): unknown;
+  }): { deregister(): void };
+}

@@ -1,0 +1,97 @@
+/* Scan settings stay anchored to their trigger without changing the toolbar height. */
+.scan-toolbar {
+  overflow: visible;
+}
+
+.scan-toolbar .scan-toolbar__actions {
+  padding-left: 0;
+}
+
+.scan-toolbar .scan-options {
+  position: relative;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  z-index: 35;
+}
+
+.scan-toolbar .scan-options > .scan-options__summary {
+  position: static;
+  padding: 7px 11px;
+  min-height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.scan-toolbar .scan-options[open] > .scan-options__summary {
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+.scan-toolbar .scan-options > .scan-toolbar__options {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 35;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 0;
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  padding: 6px 18px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 10px 32px #14203926;
+}
+
+.scan-toolbar .scan-options:not([open]) > .scan-toolbar__options {
+  display: none;
+}
+
+.scan-toolbar__options .scan-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.scan-toolbar__options .switch.scan-option {
+  flex-direction: row-reverse;
+}
+
+.scan-toolbar__options .scan-option input[type="checkbox"] {
+  margin: 0;
+}
+
+.scan-toolbar__options .scan-option--number .input {
+  width: 82px;
+  text-align: right;
+}
+
+.scan-toolbar__options .scan-options__rules {
+  justify-content: flex-start;
+  width: 100%;
+  margin-top: 8px;
+  padding-left: 0;
+  padding-right: 0;
+  text-align: left;
+}
+
+@media (max-width: 800px) {
+  .scan-toolbar .scan-options {
+    position: static;
+  }
+
+  .scan-toolbar .scan-options > .scan-toolbar__options {
+    top: calc(100% + 8px);
+    width: min(340px, 100%);
+  }
+}

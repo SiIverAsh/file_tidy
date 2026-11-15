@@ -52,6 +52,8 @@ struct ScanProgressPayload {
     phase: String,
     discovered: String,
     processed: String,
+    phase_processed: String,
+    phase_total: String,
     content_bytes_read: String,
     errors: String,
 }
@@ -72,6 +74,27 @@ fn scan_phase_label(phase: file_tidy_core::ScanPhase) -> &'static str {
         file_tidy_core::ScanPhase::PrefixHash => "content",
         file_tidy_core::ScanPhase::FullHash => "duplicates",
         file_tidy_core::ScanPhase::Complete => "complete",
+    }
+}
+
+#[derive(Default)]
+struct ScanProgressThrottle {
+    last_emit: Option<(file_tidy_core::ScanPhase, Instant)>,
+}
+
+impl ScanProgressThrottle {
+    fn should_emit(&mut self, phase: file_tidy_core::ScanPhase, now: Instant) -> bool {
+        let emit = self
+            .last_emit
+            .is_none_or(|(previous_phase, previous_time)| {
+                phase != previous_phase
+                    || phase == file_tidy_core::ScanPhase::Complete
+                    || now.duration_since(previous_time).as_millis() >= 120
+            });
+        if emit {
+            self.last_emit = Some((phase, now));
+        }
+        emit
     }
 }
 
@@ -243,20 +266,15 @@ pub async fn start_scan_inner(
     let gen_str = generation.to_string();
     let app_clone = app.cloned();
     let gen_for_emit = gen_str.clone();
-    let last_emit = Arc::new(Mutex::new(Instant::now()));
+    let last_emit = Mutex::new(ScanProgressThrottle::default());
 
     let scan_result = tauri::async_runtime::spawn_blocking(move || {
         scan(options, &token, |progress| {
             let Some(app_handle) = app_clone.as_ref() else {
                 return;
             };
-            let should_emit = if let Ok(mut prev) = last_emit.lock() {
-                if prev.elapsed().as_millis() >= 120 {
-                    *prev = Instant::now();
-                    true
-                } else {
-                    false
-                }
+            let should_emit = if let Ok(mut throttle) = last_emit.lock() {
+                throttle.should_emit(progress.phase, Instant::now())
             } else {
                 false
             };
@@ -269,6 +287,8 @@ pub async fn start_scan_inner(
                         phase,
                         discovered: progress.discovered.to_string(),
                         processed: progress.processed.to_string(),
+                        phase_processed: progress.phase_processed.to_string(),
+                        phase_total: progress.phase_total.to_string(),
                         content_bytes_read: progress.bytes_read.to_string(),
                         errors: "0".to_owned(),
                     },
@@ -1472,4 +1492,24 @@ pub async fn get_recovery_report(state: State<'_, AppState>) -> GuiResult<Recove
     })
     .await
     .map_err(|_| GuiError::Rejected("运行恢复诊断失败".to_owned()))?
+}
+
+#[cfg(test)]
+mod scan_progress_tests {
+    use super::ScanProgressThrottle;
+    use file_tidy_core::ScanPhase;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn throttle_preserves_phase_changes_and_completion() {
+        let mut throttle = ScanProgressThrottle::default();
+        let start = Instant::now();
+        assert!(throttle.should_emit(ScanPhase::Discover, start));
+        assert!(!throttle.should_emit(ScanPhase::Discover, start + Duration::from_millis(10)));
+        assert!(throttle.should_emit(ScanPhase::Magic, start + Duration::from_millis(20)));
+        assert!(!throttle.should_emit(ScanPhase::Magic, start + Duration::from_millis(100)));
+        assert!(throttle.should_emit(ScanPhase::Magic, start + Duration::from_millis(140)));
+        assert!(throttle.should_emit(ScanPhase::Complete, start + Duration::from_millis(141)));
+        assert!(throttle.should_emit(ScanPhase::Complete, start + Duration::from_millis(142)));
+    }
 }

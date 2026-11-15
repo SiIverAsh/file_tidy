@@ -1,0 +1,217 @@
+/* AppearanceController resolves system mode before mounting the interface. */
+
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-alt: #f3f5f9;
+  --sidebar-bg: #f5f6f9;
+  --row-alt: #fafbfd;
+  --row-selected: #edf0ff;
+  --border: #e7eaf1;
+  --border-strong: #dce1eb;
+  --text: #262e40;
+  --text-muted: #626c80;
+  --primary: #4c60ce;
+  --primary-hover: #3f51b5;
+  --danger: #bc4349;
+  --danger-bg: #fff1f2;
+  --warn: #94631b;
+  --warn-bg: #fffaeb;
+  --ok: #287459;
+  --ok-bg: #edf7f2;
+  --focus-color: #5268dc55;
+  --on-accent: #ffffff;
+  --tree-folder: #e9bb62;
+  --tree-folder-edge: #c89232;
+  --tree-file: #8a9caf;
+}
+
+:root[data-color-mode="dark"] {
+  color-scheme: dark;
+  --bg: #1d222d;
+  --surface: #1d222d;
+  --surface-alt: #2a3040;
+  --sidebar-bg: #191e28;
+  --row-alt: #242a38;
+  --row-selected: #333e65;
+  --border: #31394a;
+  --border-strong: #424d62;
+  --text: #e6eaf3;
+  --text-muted: #9aa5bc;
+  --primary: #95a5ff;
+  --primary-hover: #adbbff;
+  --danger: #f28b91;
+  --danger-bg: #412c36;
+  --warn: #dfb66e;
+  --warn-bg: #3d3529;
+  --ok: #7fc9ae;
+  --ok-bg: #263b37;
+  --focus-color: #95a5ff65;
+  --on-accent: var(--bg);
+  --tree-folder: #c99946;
+  --tree-folder-edge: #e0b467;
+  --tree-file: #8e9eaf;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-color-mode]) {
+    color-scheme: dark;
+    --bg: #1d222d;
+    --surface: #1d222d;
+    --surface-alt: #2a3040;
+    --sidebar-bg: #191e28;
+    --row-alt: #242a38;
+    --row-selected: #333e65;
+    --border: #31394a;
+    --border-strong: #424d62;
+    --text: #e6eaf3;
+    --text-muted: #9aa5bc;
+    --primary: #95a5ff;
+    --primary-hover: #adbbff;
+    --danger: #f28b91;
+    --danger-bg: #412c36;
+    --warn: #dfb66e;
+    --warn-bg: #3d3529;
+    --ok: #7fc9ae;
+    --ok-bg: #263b37;
+    --focus-color: #95a5ff65;
+    --on-accent: var(--bg);
+    --tree-folder: #c99946;
+    --tree-folder-edge: #e0b467;
+    --tree-file: #8e9eaf;
+  }
+}
+
+:root[data-color-mode="light"][data-theme-preset="forest"] {
+  --bg: #fcfefd;
+  --surface-alt: #f0f5f2;
+  --sidebar-bg: #edf4f0;
+  --row-alt: #f7faf8;
+  --row-selected: #e3f1e8;
+  --border: #e0e9e3;
+  --border-strong: #cddbd2;
+  --text: #243c31;
+  --text-muted: #536e5e;
+  --primary: #337657;
+  --primary-hover: #286246;
+  --surface: #fcfefd;
+  --focus-color: #33765755;
+}
+
+:root[data-color-mode="light"][data-theme-preset="sand"] {
+  --bg: #fffdf8;
+  --surface-alt: #f5f0e6;
+  --sidebar-bg: #f7f2e9;
+  --row-alt: #fcf9f2;
+  --row-selected: #f3e8d2;
+  --border: #e9e1d2;
+  --border-strong: #dbcfba;
+  --text: #443a2a;
+  --text-muted: #7c6b50;
+  --primary: #875c20;
+  --primary-hover: #714c19;
+  --surface: #fffdf8;
+  --focus-color: #92672755;
+}
+
+:root[data-color-mode="light"][data-theme-preset="rose"] {
+  --bg: #fffcfd;
+  --surface-alt: #f8f0f3;
+  --sidebar-bg: #f8f0f2;
+  --row-alt: #fdf7f9;
+  --row-selected: #f5e5ec;
+  --border: #eedee5;
+  --border-strong: #e0c8d2;
+  --text: #49333f;
+  --text-muted: #826271;
+  --primary: #a34c72;
+  --primary-hover: #8a3b60;
+  --surface: #fffcfd;
+  --focus-color: #a34c7255;
+}
+
+:root[data-color-mode="light"][data-theme-preset="violet"] {
+  --bg: #fefcfe;
+  --surface-alt: #f3eff9;
+  --sidebar-bg: #f3eff8;
+  --row-alt: #faf7fd;
+  --row-selected: #ede5f8;
+  --border: #e6dff0;
+  --border-strong: #d5c8e4;
+  --text: #393149;
+  --text-muted: #776686;
+  --primary: #7855a6;
+  --primary-hover: #63438e;
+  --surface: #fefcfe;
+  --focus-color: #7855a655;
+}
+
+:root[data-color-mode="dark"][data-theme-preset="forest"] {
+  --bg: #19241f;
+  --surface-alt: #24382d;
+  --sidebar-bg: #152019;
+  --row-alt: #1e2c24;
+  --row-selected: #2b4b38;
+  --border: #2d4035;
+  --border-strong: #425a4b;
+  --text: #e0ece3;
+  --text-muted: #a0b4a6;
+  --primary: #8fcfa6;
+  --primary-hover: #a4dfba;
+  --surface: #19241f;
+  --focus-color: #8fcfa665;
+}
+
+:root[data-color-mode="dark"][data-theme-preset="sand"] {
+  --bg: #28221a;
+  --surface-alt: #393022;
+  --sidebar-bg: #211c15;
+  --row-alt: #2e271c;
+  --row-selected: #4c3d26;
+  --border: #423829;
+  --border-strong: #594a35;
+  --text: #eee6d8;
+  --text-muted: #bead90;
+  --primary: #dbba7a;
+  --primary-hover: #ebcc92;
+  --surface: #28221a;
+  --focus-color: #dbba7a65;
+}
+
+:root[data-color-mode="dark"][data-theme-preset="rose"] {
+  --bg: #291e25;
+  --surface-alt: #3b2b35;
+  --sidebar-bg: #23191f;
+  --row-alt: #30232c;
+  --row-selected: #513346;
+  --border: #49313f;
+  --border-strong: #654557;
+  --text: #f0e3eb;
+  --text-muted: #bfa4b3;
+  --primary: #dfa1bf;
+  --primary-hover: #edb7d1;
+  --surface: #291e25;
+  --focus-color: #dfa1bf65;
+}
+
+:root[data-color-mode="dark"][data-theme-preset="violet"] {
+  --bg: #231f2d;
+  --surface-alt: #332b41;
+  --sidebar-bg: #1c1925;
+  --row-alt: #292334;
+  --row-selected: #45355f;
+  --border: #3c314d;
+  --border-strong: #544368;
+  --text: #eae3f3;
+  --text-muted: #b5a5c7;
+  --primary: #c3a5eb;
+  --primary-hover: #d1b9f4;
+  --surface: #231f2d;
+  --focus-color: #c3a5eb65;
+}
+
+/* Color transitions leave file positions and overlay presence unchanged. */
+body, .sidebar, .main-canvas, .vlist__header, .vlist__status {
+  transition: background-color var(--motion) ease, border-color var(--motion) ease, color var(--motion) ease;
+}

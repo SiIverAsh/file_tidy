@@ -3,9 +3,11 @@ import type { AppStateModel } from "../state/store.ts";
 import {
   clearChildren,
   el,
-  formatBytesWithExact,
+  createSizeLabel,
   formatCountdown,
 } from "./safe-text.ts";
+import { MotionPresence } from "./motion.ts";
+import { fileKindLabel, labeledValue, statusLabel } from "./display-labels.ts";
 
 export interface PermanentModalCallbacks {
   onClose(): void;
@@ -23,13 +25,19 @@ export interface PermanentModalCallbacks {
 export class PermanentDeleteModal {
   readonly root: HTMLElement;
   private readonly callbacks: PermanentModalCallbacks;
+  private readonly card: HTMLElement;
+  private readonly presence: MotionPresence;
   private timerId: number | null = null;
   private challengeTimerEl: HTMLElement | null = null;
   private latestExpiresAt: string | null = null;
   private phraseInputEl: HTMLInputElement | null = null;
   private countInputEl: HTMLInputElement | null = null;
   private submitBtnEl: HTMLButtonElement | null = null;
+  private requestBtnEl: HTMLButtonElement | null = null;
   private renderedModalKey: string | null = null;
+  private latestModel: AppStateModel | null = null;
+  private requestingChallenge = false;
+  private challengeRequestSeq = 0;
 
   constructor(callbacks: PermanentModalCallbacks) {
     this.callbacks = callbacks;
@@ -37,20 +45,28 @@ export class PermanentDeleteModal {
     this.root.setAttribute("role", "alertdialog");
     this.root.setAttribute("aria-modal", "true");
     this.root.setAttribute("aria-label", "永久删除不可撤销确认");
+    this.card = el("div", "danger-modal");
+    this.root.appendChild(this.card);
+    this.presence = new MotionPresence(this.root, "modal-backdrop--open");
   }
 
   render(model: AppStateModel): void {
+    this.latestModel = model;
     const modal = model.permanentModal;
     if (!modal.open) {
-      this.root.classList.remove("modal-backdrop--open");
       this.stopTimer();
       this.phraseInputEl = null;
       this.countInputEl = null;
       this.submitBtnEl = null;
+      this.requestBtnEl = null;
       this.renderedModalKey = null;
-      clearChildren(this.root);
+      this.latestExpiresAt = null;
+      this.requestingChallenge = false;
+      this.challengeRequestSeq += 1;
+      this.presence.hide(() => clearChildren(this.card));
       return;
     }
+    this.presence.show();
 
     const modalKey =
       !modal.loading && !modal.executionReport && !modal.executing && modal.preview && modal.challenge
@@ -71,12 +87,11 @@ export class PermanentDeleteModal {
     this.phraseInputEl = null;
     this.countInputEl = null;
     this.submitBtnEl = null;
+    this.requestBtnEl = null;
 
-    this.root.classList.add("modal-backdrop--open");
-    clearChildren(this.root);
-
-    const card = el("div", "danger-modal");
-    this.root.appendChild(card);
+    this.stopTimer();
+    const card = this.card;
+    clearChildren(card);
 
     const header = el("div", "danger-modal__header");
     header.appendChild(el("span", "danger-badge", "永久删除"));
@@ -100,21 +115,17 @@ export class PermanentDeleteModal {
 
     if (modal.executionReport) {
       const done = modal.executionReport;
-      body.appendChild(
-        el(
-          "div",
-          done.completed ? "alert alert--warn" : "alert alert--error",
-          `删除完成（批次 ${done.batch_id.slice(0, 12)}…）`,
-        ),
-      );
+      const banner = el("div", done.completed ? "alert alert--warn" : "alert alert--error");
+      banner.appendChild(el("span", "simple-detail", done.completed ? "删除完成" : "删除未全部完成，请核对结果"));
+      banner.appendChild(el("span", "technical-detail", done.completed ? "删除完成" : "删除部分完成或中断"));
+      banner.appendChild(el("span", "technical-detail", ` · 批次 ${done.batch_id.slice(0, 12)}…`));
+      body.appendChild(banner);
       for (const op of done.operations) {
-        body.appendChild(
-          el(
-            "div",
-            "exec-result",
-            `[${op.status}] ${op.source_display}${op.reason ? " — " + op.reason : ""}`,
-          ),
-        );
+        const result = el("div", "exec-result");
+        result.appendChild(labeledValue(statusLabel(op.status), op.status, "tag"));
+        result.appendChild(el("div", "exec-result__path", op.source_display));
+        if (op.reason) result.appendChild(el("div", "exec-result__reason", op.reason));
+        body.appendChild(result);
       }
       return;
     }
@@ -130,7 +141,7 @@ export class PermanentDeleteModal {
         el(
           "strong",
           "",
-          "包含 B 区敏感项目，不支持永久删除：",
+          "包含敏感项目，不支持永久删除：",
         ),
       );
       for (const r of preview.blocked_b_write_reasons) {
@@ -147,13 +158,11 @@ export class PermanentDeleteModal {
       return;
     }
 
-    body.appendChild(
-      el(
-        "p",
-        "danger-modal__lead",
-        `将永久删除 ${preview.files_and_links} 个文件、${preview.directories} 个目录（共 ${formatBytesWithExact(preview.total_bytes)}），删除后不可恢复。`,
-      ),
-    );
+    const lead = el("p", "danger-modal__lead");
+    lead.appendChild(el("span", "", `将永久删除 ${preview.files_and_links} 个文件、${preview.directories} 个目录（共 `));
+    lead.appendChild(createSizeLabel(preview.total_bytes));
+    lead.appendChild(el("span", "", "），删除后不可恢复。"));
+    body.appendChild(lead);
 
     // Complete leaf manifest (mandatory review)
     const manifestBox = el("div", "danger-manifest");
@@ -163,13 +172,12 @@ export class PermanentDeleteModal {
     const ul = el("ul", "danger-manifest__list");
     for (const op of preview.operations) {
       for (const entry of op.manifest) {
-        ul.appendChild(
-          el(
-            "li",
-            "danger-manifest__item",
-            `[${entry.kind}] ${entry.path_display} — ${formatBytesWithExact(entry.size_bytes)}${entry.hidden ? " [隐藏]" : ""}`,
-          ),
-        );
+        const item = el("li", "danger-manifest__item");
+        item.appendChild(labeledValue(fileKindLabel(entry.kind), entry.kind));
+        item.appendChild(el("span", "", ` · ${entry.path_display} · `));
+        item.appendChild(createSizeLabel(entry.size_bytes));
+        if (entry.hidden) item.appendChild(el("span", "", " [隐藏]"));
+        ul.appendChild(item);
       }
     }
     manifestBox.appendChild(ul);
@@ -177,13 +185,26 @@ export class PermanentDeleteModal {
 
     // Challenge section bound to (plan_id, plan_digest) with short expiration
     const challengeBox = el("div", "danger-challenge");
-    if (!modal.challenge) {
-      const reqBtn = el("button", "btn btn--danger-outline", "生成确认码");
-      reqBtn.type = "button";
-      reqBtn.addEventListener("click", () => {
-        void this.callbacks.onRequestChallenge(preview.plan_id, preview.plan_digest);
+    const reqBtn = el("button", "btn btn--secondary", modal.challenge ? "重新生成确认码" : "生成确认码");
+    reqBtn.type = "button";
+    this.requestBtnEl = reqBtn;
+    reqBtn.disabled = modal.executing || this.requestingChallenge ||
+      Number(preview.expires_at_unix) <= Math.floor(Date.now() / 1000);
+    reqBtn.addEventListener("click", () => {
+      if (modal.executing || this.requestingChallenge) return;
+      const seq = ++this.challengeRequestSeq;
+      this.requestingChallenge = true;
+      reqBtn.disabled = true;
+      if (this.submitBtnEl) this.submitBtnEl.disabled = true;
+      void this.callbacks.onRequestChallenge(preview.plan_id, preview.plan_digest).finally(() => {
+        if (seq !== this.challengeRequestSeq) return;
+        this.requestingChallenge = false;
+        if (this.requestBtnEl) this.requestBtnEl.disabled = modal.executing;
+        if (this.submitBtnEl && this.latestModel) this.submitBtnEl.disabled = !this.canSubmit(this.latestModel);
       });
-      challengeBox.appendChild(reqBtn);
+    });
+    challengeBox.appendChild(reqBtn);
+    if (!modal.challenge) {
       this.stopTimer();
     } else {
       const ch = modal.challenge;
@@ -206,6 +227,7 @@ export class PermanentDeleteModal {
       phraseInput.type = "text";
       phraseInput.placeholder = expected;
       phraseInput.value = modal.phraseInput;
+      phraseInput.disabled = modal.executing;
       phraseInput.addEventListener("input", () =>
         this.callbacks.onPhraseInput(phraseInput.value),
       );
@@ -224,6 +246,7 @@ export class PermanentDeleteModal {
         countInput.type = "text";
         countInput.inputMode = "numeric";
         countInput.value = modal.countInput;
+        countInput.disabled = modal.executing;
         countInput.addEventListener("input", () =>
           this.callbacks.onCountInput(countInput.value),
         );
@@ -238,7 +261,7 @@ export class PermanentDeleteModal {
     submitBtn.type = "button";
     submitBtn.disabled = !this.canSubmit(model);
     submitBtn.addEventListener("click", () => {
-      void this.callbacks.onExecutePermanent(preview);
+      if (this.canSubmit(model)) void this.callbacks.onExecutePermanent(preview);
     });
     this.submitBtnEl = submitBtn;
     footer.appendChild(submitBtn);
@@ -249,11 +272,13 @@ export class PermanentDeleteModal {
     const modal = model.permanentModal;
     const preview = modal.preview;
     const ch = modal.challenge;
-    if (!preview || !ch || modal.executing) {
+    if (!modal.open || modal.loading || !preview || !ch || modal.executing || this.requestingChallenge) {
       return false;
     }
     const nowSec = Math.floor(Date.now() / 1000);
-    if (Number(ch.expires_at_unix) <= nowSec) {
+    if (Number(ch.expires_at_unix) <= nowSec || Number(preview.expires_at_unix) <= nowSec ||
+      ch.plan_id !== preview.plan_id || ch.plan_digest !== preview.plan_digest ||
+      preview.blocked_b_write_reasons.length > 0 || preview.executable_error !== null || preview.operations.length === 0) {
       return false;
     }
     const expected = `${ch.expected_prefix} ${ch.confirmation_count} ${ch.challenge_code}`;
@@ -280,6 +305,11 @@ export class PermanentDeleteModal {
       this.challengeTimerEl.textContent = res.expired
         ? `⏰ 挑战码已过期，请重新生成`
         : `⏳ 挑战码剩余有效期 ${res.label}`;
+      if (this.submitBtnEl && this.latestModel) this.submitBtnEl.disabled = !this.canSubmit(this.latestModel);
+      if (this.requestBtnEl && this.latestModel) {
+        this.requestBtnEl.disabled = this.latestModel.permanentModal.executing || this.requestingChallenge ||
+          Number(this.latestModel.permanentModal.preview?.expires_at_unix ?? "0") <= Math.floor(Date.now() / 1000);
+      }
     };
     tick();
     this.timerId = window.setInterval(tick, 1000);

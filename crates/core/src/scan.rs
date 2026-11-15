@@ -28,7 +28,7 @@ impl CancellationToken {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanPhase {
     Discover,
     Magic,
@@ -43,6 +43,10 @@ pub struct Progress {
     pub processed: u64,
     pub bytes_read: u64,
     pub phase: ScanPhase,
+    /// Completed files in the current content phase or hash candidate group.
+    pub phase_processed: u64,
+    /// Files in the current content phase or hash candidate group; 0 during discovery.
+    pub phase_total: u64,
 }
 
 pub struct ScanOptions {
@@ -200,6 +204,8 @@ struct Scanner<'a, F> {
     counters: ReadCounters,
     discovered: AtomicU64,
     processed: AtomicU64,
+    phase_processed: AtomicU64,
+    phase_total: AtomicU64,
 }
 
 impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
@@ -209,7 +215,20 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
             processed: self.processed.load(Ordering::Relaxed),
             bytes_read: self.counters.bytes.load(Ordering::Relaxed),
             phase,
+            phase_processed: self.phase_processed.load(Ordering::Relaxed),
+            phase_total: self.phase_total.load(Ordering::Relaxed),
         });
+    }
+
+    fn begin_phase(&self, phase: ScanPhase, total: usize) {
+        self.phase_processed.store(0, Ordering::Relaxed);
+        self.phase_total.store(total as u64, Ordering::Relaxed);
+        self.notify(phase);
+    }
+
+    fn finish_file(&self, phase: ScanPhase) {
+        self.phase_processed.fetch_add(1, Ordering::Relaxed);
+        self.notify(phase);
     }
 
     fn entry(&self, path: &Path, volume: Option<u64>) -> Result<Option<FileEntry>, SkippedEntry> {
@@ -268,7 +287,11 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
         let outcomes: Vec<_> = pool.install(|| {
             paths
                 .par_iter()
-                .map(|(p, volume)| self.entry(p, *volume))
+                .map(|(p, volume)| {
+                    let result = self.entry(p, *volume);
+                    self.notify(ScanPhase::Discover);
+                    result
+                })
                 .collect()
         });
         let mut entries = Vec::new();
@@ -302,15 +325,27 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
                 entry.policy.sensitive = true;
             }
         }
+        self.begin_phase(
+            ScanPhase::Magic,
+            report
+                .entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::File)
+                .count(),
+        );
         for batch in report.entries.chunks_mut(256) {
+            if self.cancel.is_cancelled() {
+                break;
+            }
             let notices: Vec<_> = pool.install(|| {
                 batch
                     .par_iter_mut()
                     .filter_map(|entry| {
-                        if entry.kind != EntryKind::File {
+                        if entry.kind != EntryKind::File || self.cancel.is_cancelled() {
                             return None;
                         }
                         if entry.policy.sensitive {
+                            self.finish_file(ScanPhase::Magic);
                             return Some(skipped(
                                 entry.path.clone(),
                                 SkipReason::SensitiveContent,
@@ -318,7 +353,8 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
                                 false,
                             ));
                         }
-                        if self.options.metadata_only || self.cancel.is_cancelled() {
+                        if self.options.metadata_only {
+                            self.finish_file(ScanPhase::Magic);
                             return None;
                         }
                         let result = ContentReadPermit::issue(
@@ -330,7 +366,7 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
                         .and_then(|permit| {
                             read_prefix(&permit, 16 * 1024, self.cancel, &self.counters)
                         });
-                        match result {
+                        let notice = match result {
                             Ok(prefix) => {
                                 entry.content_inspected = true;
                                 let mime = infer::get(&prefix).map(|kind| kind.mime_type());
@@ -348,7 +384,11 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
                                 None
                             }
                             Err(error) => Some(io_skip(entry.path.clone(), &error)),
+                        };
+                        if !self.cancel.is_cancelled() {
+                            self.finish_file(ScanPhase::Magic);
                         }
+                        notice
                     })
                     .collect()
             });
@@ -370,7 +410,7 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
         } else {
             ScanPhase::FullHash
         };
-        self.notify(phase);
+        self.begin_phase(phase, indices.len());
         let hashes: Vec<_> = pool.install(|| {
             indices
                 .par_iter()
@@ -394,6 +434,9 @@ impl<F: Fn(Progress) + Sync> Scanner<'_, F> {
                             &|| self.notify(phase),
                         )
                     });
+                    if !self.cancel.is_cancelled() {
+                        self.finish_file(phase);
+                    }
                     (index, Some(result))
                 })
                 .collect()
@@ -516,6 +559,8 @@ pub fn scan(
         counters: ReadCounters::default(),
         discovered: AtomicU64::new(0),
         processed: AtomicU64::new(0),
+        phase_processed: AtomicU64::new(0),
+        phase_total: AtomicU64::new(0),
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)

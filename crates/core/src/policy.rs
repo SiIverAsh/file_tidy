@@ -198,7 +198,7 @@ impl Policy {
             || self.sensitive_path(lexical)
             || canonical.is_some_and(|path| self.sensitive_path(path))
             || canonical.is_some_and(|path| self.sensitive_ancestor_identity(path, cached))
-            || self.sensitive_ancestor_identity(lexical, cached)
+            || (canonical != Some(lexical) && self.sensitive_ancestor_identity(lexical, cached))
     }
 
     fn sensitive_ancestor_identity(&self, path: &Path, cached: bool) -> bool {
@@ -762,6 +762,8 @@ mod tests {
         let displaced = fixture.join("displaced-public");
         std::fs::create_dir(&private)?;
         std::fs::create_dir(&public)?;
+        let file = public.join("ordinary.txt");
+        std::fs::write(&file, b"fixture")?;
         let Some(identity) = file_tidy_platform::inspect(&private)?.identity else {
             return Err(io::Error::other("test fixture has no directory identity"));
         };
@@ -773,9 +775,23 @@ mod tests {
         policy.sensitive_directory_ids.clear();
         policy.sensitive_directory_ids.insert(identity);
         assert!(!policy.labels(&public).sensitive);
+        let expected = file_tidy_platform::inspect(&file)?;
+        let mounts = MountTable::read()?;
+        let permit = crate::content::ContentReadPermit::issue(&file, &expected, &policy, &mounts)?;
         std::fs::rename(&public, &displaced)?;
         std::fs::rename(&private, &public)?;
+        // Keep the file itself unchanged, so only the sensitive identity of its
+        // new ancestor can deny this previously issued permit.
+        std::fs::rename(displaced.join("ordinary.txt"), &file)?;
+        assert!(expected.matches(&file_tidy_platform::inspect(&file)?));
         assert!(policy.sensitive_for_content(&public));
+        let counters = crate::content::ReadCounters::default();
+        let error = permit
+            .open(&counters)
+            .err()
+            .ok_or_else(|| io::Error::other("sensitive ancestor must deny content"))?;
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(counters.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
         Ok(())
     }
 
