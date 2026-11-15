@@ -3,6 +3,8 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.33.0"
+# CLI packaging must not build the separate Tauri GUI workspace member.
+precise-builds = true
 ci = ["github"]
 hosting = ["github"]
 targets = [

@@ -72,4 +72,4 @@ macOS 安装包暂使用临时签名，尚未经过 Apple Developer ID 签名和
 
 ## CI 与发布
 
-GitHub Actions 在 Linux、Windows 和 macOS 上运行构建与测试，并定期检查依赖安全与许可证。在 Actions 中手动运行 Release，工作流自动读取项目版本，检查和全部构建通过后自动创建版本标签，统一发布 CLI 下载包、GUI 安装包及校验文件，无需填写或手动推送 tag；配置与操作见 [CI 与发布说明](docs/ci-cd.md)。
+GitHub Actions 在 Linux、Windows 和 macOS 上运行构建与测试，并定期检查依赖安全与许可证。在 Actions 中运行 Release，选择大版本（`major`）、小版本（`minor`）或补丁版本（`patch`，默认），工作流自动递增并同步所有项目版本号、提交到 main，检查和全部构建通过后自动创建版本标签并发布 CLI 下载包、GUI 安装包及校验文件。无需手动修改版本文件或推送 tag；配置与操作见 [CI 与发布说明](docs/ci-cd.md)。
