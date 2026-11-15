@@ -4,15 +4,15 @@ members = ["crates/core", "crates/platform", "crates/cli", "crates/gui/src-tauri
 default-members = ["crates/core", "crates/cli"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.99"
 repository = "https://github.com/SiIverAsh/file_tidy"
 
 [workspace.dependencies]
-file-tidy-core = { version = "0.2.1", path = "crates/core" }
-file-tidy-platform = { version = "0.2.1", path = "crates/platform" }
+file-tidy-core = { version = "0.3.0", path = "crates/core" }
+file-tidy-platform = { version = "0.3.0", path = "crates/platform" }
 walkdir = "2.5.0"
 rayon = "1.12.0"
 blake3 = "1.8.7"
