@@ -1,4 +1,20 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Tauri embeds its manifest in binary targets. Integration tests need
+        // their own Common Controls v6 dependency to load TaskDialogIndirect.
+        // https://github.com/tauri-apps/tauri/issues/13419
+        let manifest =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/windows.manifest");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
+    }
+
     let manifest = tauri_build::AppManifest::new().commands(&[
         "pick_scan_roots",
         "pick_rules_file",
