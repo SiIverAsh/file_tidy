@@ -1,78 +1,40 @@
 name: Release
-run-name: Release ${{ inputs.tag }}
+run-name: Release from ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing version tag containing CLI and GUI (for example v0.2.0)
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   resolve:
-    name: Resolve release tag
+    name: Resolve version and release commit
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Validate version tag format
-        shell: bash
-        run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo 'Expected a version tag such as v0.1.0 or v0.2.0-rc.1' >&2
-            exit 1
-          fi
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Record immutable release commit
         id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Validate GUI sources and release version
+      - name: Derive tag and validate release versions
         id: version
         shell: bash
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import tomllib
-
-          expected = os.environ["RELEASE_TAG"][1:]
-          versions = {
-              "Cargo.toml": tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"],
-          }
-          for name in ("tauri.conf.json", "package.json", "package-lock.json"):
-              path = pathlib.Path("crates/gui") / ("src-tauri" if name == "tauri.conf.json" else "") / name
-              if not path.is_file():
-                  raise SystemExit("Selected tag has no GUI release sources. Create a new version tag containing the GUI and release configuration.")
-              data = json.loads(path.read_text(encoding="utf-8"))
-              versions[str(path)] = data["version"]
-              if name == "package-lock.json":
-                  versions[f"{path} packages[root]"] = data["packages"][""]["version"]
-              if name == "tauri.conf.json" and not data.get("bundle", {}).get("active"):
-                  raise SystemExit("GUI bundling is disabled in the selected tag. Tag the updated release configuration.")
-          for manifest, version in versions.items():
-              if version != expected:
-                  raise SystemExit(f"{manifest}: version {version!r} does not match tag version {expected!r}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"version={expected}\n")
-          PY
+        run: python3 scripts/resolve_release.py --github-output "$GITHUB_OUTPUT"
 
   ci:
     name: Release checks
@@ -97,6 +59,9 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       commit: ${{ needs.resolve.outputs.commit }}
       version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -126,6 +91,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     defaults:
       run:
         shell: bash
@@ -255,6 +222,8 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -294,6 +263,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -349,10 +320,10 @@ jobs:
             echo 'No release assets found' >&2
             exit 1
           fi
-          # The tag already identifies the release commit. Passing --target for an
-          # older commit with workflow differences requires Workflows: write,
-          # which GITHUB_TOKEN cannot receive.
+          # Create the tag only after every check and build succeeds. Existing
+          # tags must resolve to this exact commit and are never moved.
           python3 scripts/verify_release_commit.py \
-            --repository "$GH_REPO" --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+            --repository "$GH_REPO" --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" \
+            --create-if-missing
           gh release create "$RELEASE_TAG" --verify-tag \
             --title "$title" --notes-file release-notes.md "${args[@]}" "${assets[@]}"

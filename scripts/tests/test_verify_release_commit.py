@@ -1,6 +1,7 @@
 """Verify the immutable release commit guard without making network requests."""
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -14,6 +15,7 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 verify_release_commit = MODULE.verify_release_commit
+ensure_release_tag = MODULE.ensure_release_tag
 
 REPOSITORY = "SiIverAsh/file_tidy"
 COMMIT = "a" * 40
@@ -145,6 +147,125 @@ class VerifyReleaseCommitTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     verify_release_commit(repository, tag, commit, read_json=reader)
                 reader.assert_not_called()
+
+
+class EnsureReleaseTagTests(unittest.TestCase):
+    def test_new_tag_is_created_and_verified(self):
+        creator = Mock()
+        reader = Mock(return_value=target("commit", COMMIT))
+        self.assertEqual(
+            ensure_release_tag(
+                REPOSITORY, "v0.2.0", COMMIT, create_ref=creator, read_json=reader
+            ),
+            COMMIT,
+        )
+        creator.assert_called_once_with(REPOSITORY, "v0.2.0", COMMIT)
+        reader.assert_called_once_with(REFERENCE)
+
+    def test_existing_and_concurrently_created_tags_are_verified(self):
+        for reason in ("reference already exists", "concurrent creation"):
+            with self.subTest(reason=reason):
+                creator = Mock(side_effect=ValueError(reason))
+                reader = Mock(return_value=target("commit", COMMIT))
+                self.assertEqual(
+                    ensure_release_tag(
+                        REPOSITORY, "v0.2.0", COMMIT,
+                        create_ref=creator, read_json=reader,
+                    ),
+                    COMMIT,
+                )
+                creator.assert_called_once_with(REPOSITORY, "v0.2.0", COMMIT)
+                reader.assert_called_once_with(REFERENCE)
+
+    def test_existing_annotated_tag_at_the_built_commit_is_reused(self):
+        creator = Mock(side_effect=ValueError("reference already exists"))
+        reader = Mock(side_effect=[target("tag", TAG_SHA), target("commit", COMMIT)])
+        self.assertEqual(
+            ensure_release_tag(
+                REPOSITORY, "v0.2.0", COMMIT, create_ref=creator, read_json=reader
+            ),
+            COMMIT,
+        )
+        self.assertEqual(reader.call_count, 2)
+
+    def test_conflicting_or_moved_tag_is_rejected_even_after_successful_creation(self):
+        for creation_error in (None, ValueError("reference already exists")):
+            with self.subTest(creation_error=creation_error):
+                creator = Mock(side_effect=creation_error)
+                reader = Mock(return_value=target("commit", OTHER_COMMIT))
+                with self.assertRaisesRegex(ValueError, "no longer"):
+                    ensure_release_tag(
+                        REPOSITORY, "v0.2.0", COMMIT,
+                        create_ref=creator, read_json=reader,
+                    )
+                creator.assert_called_once_with(REPOSITORY, "v0.2.0", COMMIT)
+
+    def test_failed_creation_and_unverifiable_tag_fail_closed(self):
+        for reason in ("network failure", "permission denied"):
+            with self.subTest(reason=reason):
+                creator = Mock(side_effect=ValueError(reason))
+                reader = Mock(side_effect=ValueError("unable to read tag"))
+                with self.assertRaisesRegex(ValueError, "unable to read tag"):
+                    ensure_release_tag(
+                        REPOSITORY, "v0.2.0", COMMIT,
+                        create_ref=creator, read_json=reader,
+                    )
+                reader.assert_called_once_with(REFERENCE)
+
+    def test_invalid_identity_never_reads_or_creates_a_ref(self):
+        for repository, tag, commit in (
+            ("owner/../repository", "v0.2.0", COMMIT),
+            (REPOSITORY, "", COMMIT),
+            (REPOSITORY, "v0.2.0\n", COMMIT),
+            (REPOSITORY, "v0.2.0", "short"),
+        ):
+            with self.subTest(repository=repository, tag=tag, commit=commit):
+                creator = Mock()
+                reader = Mock()
+                with self.assertRaises(ValueError):
+                    ensure_release_tag(
+                        repository, tag, commit, create_ref=creator, read_json=reader
+                    )
+                creator.assert_not_called()
+                reader.assert_not_called()
+
+    def test_creation_uses_post_without_force_or_a_shell(self):
+        with patch.object(MODULE.subprocess, "run") as run:
+            MODULE.create_github_tag(REPOSITORY, "v0.2.0", COMMIT)
+        run.assert_called_once_with(
+            [
+                "gh", "api", "--method", "POST", f"repos/{REPOSITORY}/git/refs",
+                "-f", "ref=refs/tags/v0.2.0", "-f", f"sha={COMMIT}",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+
+    def test_creation_normalizes_command_and_os_errors(self):
+        for error in (OSError("gh unavailable"), subprocess.CalledProcessError(1, ["gh"])):
+            with self.subTest(error=error):
+                with patch.object(MODULE.subprocess, "run", side_effect=error):
+                    with self.assertRaisesRegex(ValueError, "creating the release tag"):
+                        MODULE.create_github_tag(REPOSITORY, "v0.2.0", COMMIT)
+
+    def test_cli_only_creates_when_explicitly_requested(self):
+        for create in (False, True):
+            with self.subTest(create=create):
+                arguments = [
+                    "verify_release_commit.py", "--repository", REPOSITORY,
+                    "--tag", "v0.2.0", "--commit", COMMIT,
+                ]
+                if create:
+                    arguments.append("--create-if-missing")
+                with (
+                    patch.object(MODULE.sys, "argv", arguments),
+                    patch.object(MODULE, "ensure_release_tag", return_value=COMMIT) as ensure,
+                    patch.object(MODULE, "verify_release_commit", return_value=COMMIT) as verify,
+                    patch.object(MODULE.sys, "stdout", io.StringIO()),
+                ):
+                    self.assertEqual(MODULE.main(), 0)
+                called, untouched = (ensure, verify) if create else (verify, ensure)
+                called.assert_called_once_with(REPOSITORY, "v0.2.0", COMMIT)
+                untouched.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ npm run tauri -- build --bundles app -- --locked
 | Windows x64 | `file-tidy-gui-<version>-x86_64-pc-windows-msvc-setup.exe` |
 | Linux x64 | `file-tidy-gui-<version>-x86_64-unknown-linux-gnu.deb` |
 
-Release 工作流在标签提交通过 CI、安全检查以及 CLI / GUI 全部构建后，统一创建同一个 GitHub Release。标签必须包含 GUI 和相应发布配置。已有的 `v0.1.0` Release 仅提供 CLI，不会因更新工作流而自动增加 GUI 附件；新版本发布步骤见 [CI 与发布说明](../../docs/ci-cd.md)。
+Release 工作流自动从运行提交的项目版本生成 tag，在该提交通过 CI、安全检查以及 CLI / GUI 全部构建后，自动创建标签并统一发布到同一个 GitHub Release，无需手动填写或推送 tag。运行提交必须包含 GUI 和相应发布配置。已有的 `v0.1.0` Release 仅提供 CLI，不会因更新工作流而自动增加 GUI 附件；新版本发布步骤见 [CI 与发布说明](../../docs/ci-cd.md)。
 
 macOS 安装包暂使用临时签名（ad-hoc），尚未配置 Apple Developer ID 签名和公证。确认下载来源可信后，可在“系统设置 → 隐私与安全性”中选择“仍要打开”。
 
