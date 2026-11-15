@@ -157,12 +157,18 @@ fn app_manifest_and_capabilities_stay_in_sync() -> TestResult {
         .as_array()
         .ok_or("permissions must be an array")?;
 
-    for line in build_rs.lines() {
+    let commands = build_rs
+        .split_once(".commands(&[")
+        .and_then(|(_, remainder)| remainder.split_once("]);").map(|(commands, _)| commands))
+        .ok_or("app command manifest missing in build.rs")?;
+    let mut command_count = 0;
+    for line in commands.lines() {
         let trimmed = line.trim();
         if let Some(cmd) = trimmed
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix("\","))
         {
+            command_count += 1;
             let expected_perm = format!("allow-{}", cmd.replace('_', "-"));
             assert!(
                 perms.iter().any(|p| p.as_str() == Some(&expected_perm)),
@@ -170,6 +176,7 @@ fn app_manifest_and_capabilities_stay_in_sync() -> TestResult {
             );
         }
     }
+    assert!(command_count > 0, "app command manifest must not be empty");
     Ok(())
 }
 
