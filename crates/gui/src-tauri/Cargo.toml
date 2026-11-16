@@ -14,7 +14,7 @@ dist = false
 file-tidy-core.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
-rfd = "0.16"
+rfd = "0.18"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.12", features = [] }
