@@ -123,7 +123,7 @@ export class VirtualEntryList {
       }
       ev.preventDefault();
       this.wheelAccumulator += ev.deltaY;
-      const stepPx = 36;
+      const stepPx = 42;
       const deltaRows = Math.trunc(this.wheelAccumulator / stepPx);
       if (deltaRows !== 0) {
         this.wheelAccumulator -= deltaRows * stepPx;

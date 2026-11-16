@@ -42,7 +42,8 @@ export class FileTidyApp {
   private readonly noticesEl = el("div", "app-notices");
   private readonly errorToast = el("div", "error-toast");
   private readonly errorPresence = new MotionPresence(this.errorToast, "error-toast--open");
-  private readonly navEl = el("nav", "sidebar");
+  private readonly navDockEl = el("div", "topbar-dock");
+  private readonly navEl = el("nav", "sidebar topbar");
   private readonly mainSlot = el("main", "main-canvas");
   private readonly bodyEl = el("div", "app-body");
   private readonly renameOverlay = el("div", "modal-backdrop");
@@ -70,6 +71,10 @@ export class FileTidyApp {
   private safetyRefreshSeq = 0;
   private batchDetailSeq = 0;
   private workspaceSeq = 0;
+  private scanContextSeq = 0;
+  private scanRequestSeq = 0;
+  private activeScanContextSeq: number | null = null;
+  private pickingRoots = false;
 
   constructor(root: HTMLElement, api: ApiClient = tauriApi) {
     this.root = root;
@@ -88,12 +93,25 @@ export class FileTidyApp {
 
     this.exploreView = new ExploreView({
       onPickRoots: async () => {
+        if (this.pickingRoots || this.store.state.planDrawer.executing || this.store.state.permanentModal.executing) return;
+        this.pickingRoots = true;
+        const workspaceSeq = this.workspaceSeq;
         try {
           this.store.state.globalError = null;
-          this.store.state.pendingRoots = await this.api.pickScanRoots();
+          const picked = await this.api.pickScanRoots();
+          if (workspaceSeq !== this.workspaceSeq || picked.cancelled || picked.roots_display.length === 0) return;
+          const previous = this.store.state.pendingRoots?.roots_display ?? this.store.state.scanSummary?.root_displays ?? [];
+          const changed = this.store.state.scanOptions.all_volumes ||
+            JSON.stringify([...previous].sort()) !== JSON.stringify([...picked.roots_display].sort());
+          this.store.state.pendingRoots = picked;
+          this.store.state.scanOptions.all_volumes = false;
+          if (changed) this.invalidateScanResults();
           this.store.notify();
+          if (changed && this.store.state.scanning) await this.api.cancelScan();
         } catch (err) {
-          this.reportError(err);
+          if (workspaceSeq === this.workspaceSeq) this.reportError(err);
+        } finally {
+          this.pickingRoots = false;
         }
       },
       onPickRules: async () => {
@@ -116,7 +134,12 @@ export class FileTidyApp {
         }
       },
       onUpdateOptions: (patch) => {
+        const scopeChanged = patch.all_volumes !== undefined && patch.all_volumes !== this.store.state.scanOptions.all_volumes;
         Object.assign(this.store.state.scanOptions, patch);
+        if (scopeChanged) {
+          this.invalidateScanResults();
+          if (this.store.state.scanning) void this.api.cancelScan().catch((err: unknown) => this.reportError(err));
+        }
         this.store.notify();
       },
       onFilterChange: async (patch, reloadTreemap = false) => {
@@ -449,11 +472,10 @@ export class FileTidyApp {
     this.store.subscribe(() => this.render());
     this.appearance.subscribe(() => {
       this.appearanceView.render(this.appearance.preference, this.appearancePersisted);
-      this.exploreView.treemap.refreshTheme();
     });
 
     await this.api.onScanProgress((ev) => {
-      if (this.store.state.scanning) {
+      if (this.store.state.scanning && this.activeScanContextSeq === this.scanContextSeq) {
         this.store.state.scanProgress = ev;
         this.store.notify();
       }
@@ -478,8 +500,15 @@ export class FileTidyApp {
     this.errorToast.setAttribute("role", "alert");
     this.errorToast.setAttribute("aria-atomic", "true");
 
+    clearChildren(this.navDockEl);
+    const handle = el("div", "topbar-dock__handle");
+    handle.setAttribute("aria-hidden", "true");
+    handle.appendChild(el("span", "topbar-dock__pill"));
+    this.navDockEl.appendChild(handle);
+    this.navDockEl.appendChild(this.navEl);
+
     const body = this.bodyEl;
-    body.appendChild(this.navEl);
+    body.appendChild(this.navDockEl);
     body.appendChild(this.mainSlot);
     app.appendChild(body);
     app.appendChild(this.reviewDrawer.root);
@@ -497,6 +526,7 @@ export class FileTidyApp {
     this.renderSidebar(model);
 
     if (this.activeViewMounted !== model.view) {
+      model.inspectedEntry = null;
       this.exploreView.closeFloatingPanels(false);
       clearChildren(this.mainSlot);
       this.mainSlot.appendChild(this.noticesEl);
@@ -591,16 +621,10 @@ export class FileTidyApp {
     const initial = createInitialState();
     this.store.state.planDrawer = initial.planDrawer;
     this.store.state.permanentModal = initial.permanentModal;
-    this.store.state.scanSummary = null;
-    this.store.state.scanProgress = null;
+    this.scanRequestSeq += 1;
+    this.activeScanContextSeq = null;
+    this.invalidateScanResults();
     this.store.state.scanning = false;
-    this.store.state.scanFilter = defaultFilter();
-    this.store.state.selection = clearSelection("0");
-    this.store.state.totalFilteredCount = 0;
-    this.store.state.treemap = null;
-    this.store.state.inspectedEntry = null;
-    this.exploreReloadSeq += 1;
-    if (this.renameResolver) this.closeRenamePrompt(null);
     this.store.notify();
   }
 
@@ -762,16 +786,20 @@ export class FileTidyApp {
   }
 
   private async startScan(): Promise<void> {
-    if (this.store.state.scanning) return;
+    if (this.store.state.scanning || this.pickingRoots) return;
     const workspaceSeq = this.workspaceSeq;
+    const requestSeq = ++this.scanRequestSeq;
+    this.invalidateScanResults();
+    const contextSeq = this.scanContextSeq;
+    this.activeScanContextSeq = contextSeq;
     try {
       this.store.state.globalError = null;
       this.store.state.scanning = true;
       this.store.state.scanProgress = null;
       this.store.notify();
 
-      const summary = await this.api.startScan(this.store.state.scanOptions);
-      if (workspaceSeq !== this.workspaceSeq) return;
+      const summary = await this.api.startScan({ ...this.store.state.scanOptions });
+      if (workspaceSeq !== this.workspaceSeq || contextSeq !== this.scanContextSeq) return;
       this.store.state.scanning = false;
       this.store.state.scanSummary = summary;
       this.store.state.scanFilter = defaultFilter();
@@ -781,13 +809,31 @@ export class FileTidyApp {
 
       await this.reloadExploreData(true);
     } catch (err) {
-      if (workspaceSeq !== this.workspaceSeq) return;
-      this.store.state.scanning = false;
+      if (workspaceSeq !== this.workspaceSeq || contextSeq !== this.scanContextSeq) return;
       this.reportError(err);
+    } finally {
+      if (workspaceSeq === this.workspaceSeq && requestSeq === this.scanRequestSeq) {
+        this.store.state.scanning = false;
+        this.activeScanContextSeq = null;
+        this.store.notify();
+      }
     }
   }
 
-  private async reloadExploreData(reloadTreemap: boolean): Promise<void> {
+  private invalidateScanResults(): void {
+    this.scanContextSeq += 1;
+    this.exploreReloadSeq += 1;
+    this.drawerRequestSeq += 1;
+    this.permanentRequestSeq += 1;
+    this.challengeRequestSeq += 1;
+    this.store.clearScanResults();
+    const initial = createInitialState();
+    if (!this.store.state.planDrawer.executing) this.store.state.planDrawer = initial.planDrawer;
+    if (!this.store.state.permanentModal.executing) this.store.state.permanentModal = initial.permanentModal;
+    if (this.renameResolver) this.closeRenamePrompt(null);
+  }
+
+  private async reloadExploreData(_reloadTreemap = false): Promise<void> {
     const seq = ++this.exploreReloadSeq;
     const gen = this.store.state.scanSummary?.scan_generation;
     if (!gen) {
@@ -795,20 +841,12 @@ export class FileTidyApp {
     }
     try {
       const filter = { ...this.store.state.scanFilter };
-      // Invalidate the old list immediately, before any treemap request can yield.
-      const listLoad = this.exploreView.virtualList.resetAndLoad(
+      await this.exploreView.virtualList.resetAndLoad(
         gen,
         this.store.state.selection,
         isTreeBrowseFilter(filter),
       );
-      const [, treemap] = await Promise.all([
-        listLoad,
-        reloadTreemap && filter.tab === "browse"
-          ? this.api.getTreemapNodes(gen, filter.parent_entry_id, 40)
-          : Promise.resolve(null),
-      ]);
       if (seq !== this.exploreReloadSeq || this.store.state.scanSummary?.scan_generation !== gen) return;
-      if (treemap) this.store.state.treemap = treemap;
       this.store.notify();
     } catch (err) {
       if (seq === this.exploreReloadSeq) this.reportError(err);
@@ -829,6 +867,7 @@ export class FileTidyApp {
     kind: BuildPlanRequest["kind"],
     pickDestination: boolean,
   ): Promise<void> {
+    this.store.state.inspectedEntry = null;
     this.exploreView.closeFloatingPanels();
     const workspaceSeq = this.workspaceSeq;
     let destinationGrantId: string | null = null;
@@ -842,10 +881,8 @@ export class FileTidyApp {
           return;
         }
         if (picked.needs_grant || !picked.grant_id) {
-          this.store.state.globalError = `目标目录尚未获得授权（${picked.path_display}）。请先在“授权与规则”中授予目录写入权限。`;
-          this.store.state.view = "access";
+          this.store.state.globalError = picked.policy.blocked_reason ?? `目标目录无法用于写入（${picked.path_display}），请选择其他本地目录。`;
           this.store.notify();
-          await this.refreshAccessData();
           return;
         }
         destinationGrantId = picked.grant_id;
@@ -904,7 +941,7 @@ export class FileTidyApp {
         return;
       }
       if (!picked.grant_id || picked.needs_grant) {
-        this.reportError("目标目录尚未获得写入授权，请先在“授权与规则”授权该目录。");
+        this.reportError(picked.policy.blocked_reason ?? "目标目录无法用于恢复，请选择其他本地目录。");
         return;
       }
       grantId = picked.grant_id;
@@ -929,6 +966,7 @@ export class FileTidyApp {
   ): Promise<void> {
     const d = this.store.state.planDrawer;
     if (d.executing || this.store.state.permanentModal.executing) return;
+    this.store.state.inspectedEntry = null;
     this.exploreView.closeFloatingPanels();
     const seq = ++this.drawerRequestSeq;
     d.open = true;
@@ -999,6 +1037,7 @@ export class FileTidyApp {
   ): Promise<void> {
     const m = this.store.state.permanentModal;
     if (m.executing || this.store.state.planDrawer.executing) return;
+    this.store.state.inspectedEntry = null;
     this.exploreView.closeFloatingPanels();
     const seq = ++this.permanentRequestSeq;
     this.challengeRequestSeq += 1;
@@ -1040,7 +1079,6 @@ export class FileTidyApp {
         ...(preview.requires_count_confirmation
           ? { item_count: m.countInput.trim() }
           : {}),
-        // Permanent delete never accepts B-zone sensitive acknowledgements.
         sensitive_acknowledgements: [],
         permanent_challenge_input: m.phraseInput.trim(),
       });
@@ -1060,6 +1098,7 @@ export class FileTidyApp {
   }
 
   private promptNewFilename(): Promise<string | null> {
+    this.store.state.inspectedEntry = null;
     this.exploreView.closeFloatingPanels();
     if (this.renameResolver) this.closeRenamePrompt(null);
     return new Promise((resolve) => {

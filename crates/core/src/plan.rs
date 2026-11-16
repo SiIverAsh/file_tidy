@@ -799,7 +799,11 @@ impl Session {
                 return Err(E::ProtectedZone);
             }
             self.grant_for(source, policy)?;
-            for grant in self.grants.values().filter(|grant| !grant.revoked) {
+            for grant in self
+                .grants
+                .values()
+                .filter(|grant| !grant.revoked && !grant.automatic)
+            {
                 if grant.root.to_path()?.starts_with(source) {
                     return Err(E::ProtectedRoot);
                 }

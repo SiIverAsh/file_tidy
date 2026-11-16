@@ -136,6 +136,105 @@ fn initialization_requires_exact_review_and_persists_only_durable_grants() -> Te
     any(target_os = "macos", windows),
     ignore = "requires independent FILE_TIDY_TEST_ROOT"
 )]
+fn default_access_covers_descendants_and_explicit_promotion_persists_only_reviewed_root()
+-> TestResult {
+    let dir = fixture()?;
+    let root = dir.path();
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested)?;
+    std::fs::write(nested.join("source"), "payload")?;
+    let other = fixture()?;
+    let mut session = Session::new()?;
+    let automatic = session.grant_default_access(root)?;
+    assert_eq!(session.grant_default_access(&nested)?, automatic);
+    assert!(
+        session
+            .grants()
+            .next()
+            .ok_or("missing default grant")?
+            .is_automatic()
+    );
+    let plan = session.build_plan(
+        vec![request(
+            OperationKind::Move,
+            &nested.join("source"),
+            Some(&nested.join("destination")),
+        )],
+        PlanOptions::default(),
+    )?;
+    assert_eq!(
+        plan.preview().operations[0].source_grant.as_ref(),
+        Some(&automatic)
+    );
+
+    assert_eq!(session.grant(root, false)?, automatic);
+    assert!(
+        !session
+            .grants()
+            .next()
+            .ok_or("missing promoted grant")?
+            .is_automatic()
+    );
+    let transient = session.grant_default_access(other.path())?;
+    let storage = session.storage_plan(&automatic)?;
+    let digest = storage.digest().to_owned();
+    session.initialize_storage(storage, &digest)?;
+    assert!(
+        session
+            .grants()
+            .any(|grant| grant.id() == &transient && !grant.is_persistent())
+    );
+    drop(session);
+
+    let loaded = Session::open(root)?;
+    assert_eq!(loaded.grants().count(), 1);
+    let persisted = loaded.grants().next().ok_or("missing persistent root")?;
+    assert_eq!(persisted.id(), &automatic);
+    assert!(persisted.is_persistent());
+    assert!(!persisted.is_automatic());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(
+    any(target_os = "macos", windows),
+    ignore = "requires independent FILE_TIDY_TEST_ROOT"
+)]
+fn stale_ancestor_grant_does_not_mask_a_valid_child_grant() -> TestResult {
+    let dir = fixture()?;
+    let parent = dir.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child)?;
+    std::fs::write(child.join("source"), "payload")?;
+    let mut session = Session::new()?;
+    session.grant(&parent, false)?;
+    let child_grant = session.grant(&child, false)?;
+
+    let old_parent = dir.path().join("old-parent");
+    std::fs::rename(&parent, &old_parent)?;
+    std::fs::create_dir(&parent)?;
+    std::fs::rename(old_parent.join("child"), &child)?;
+    let plan = session.build_plan(
+        vec![request(
+            OperationKind::Move,
+            &child.join("source"),
+            Some(&child.join("destination")),
+        )],
+        PlanOptions::default(),
+    )?;
+    assert_eq!(
+        plan.preview().operations[0].source_grant.as_ref(),
+        Some(&child_grant)
+    );
+    session.validate_plan(&plan)?;
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(
+    any(target_os = "macos", windows),
+    ignore = "requires independent FILE_TIDY_TEST_ROOT"
+)]
 fn stale_plan_cannot_be_confirmed_after_source_or_directory_changes() -> TestResult {
     let dir = fixture()?;
     let root = dir.path();

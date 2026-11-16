@@ -4,6 +4,7 @@ export type ScanGeneration = string;
 export type ZoneKind =
   | "A_Protected"
   | "B_Sensitive"
+  | "C_DefaultAllowed"
   | "C_GrantedSession"
   | "C_GrantedPersistent"
   | "Unauthenticated";
@@ -53,6 +54,19 @@ export interface ExecutionProgressEvent {
   status: string;
 }
 
+export interface ExtensionCountDto {
+  extension: string;
+  count: number;
+  logical_bytes: string;
+}
+
+export interface CategoryCountDto {
+  category: string;
+  count: number;
+  logical_bytes: string;
+  extensions?: ExtensionCountDto[];
+}
+
 export interface ScanSummaryDto {
   scan_generation: ScanGeneration;
   scanned_at_unix: string;
@@ -71,6 +85,7 @@ export interface ScanSummaryDto {
   top_entry_ids: EntryId[];
   stale_entry_ids: EntryId[];
   duplicates: DuplicateGroupDto[];
+  category_counts?: CategoryCountDto[];
   notices: string[];
   root_displays: string[];
 }
@@ -117,6 +132,7 @@ export interface ScanFilter {
   search_text: string;
   zone_filter: ZoneKind | "all";
   category_filter: string;
+  extension_filter: string;
   hide_hidden: boolean;
   duplicate_group_id: string | null;
   skip_reason_filter: string;
@@ -384,6 +400,7 @@ export interface RecoveryReportDto {
 export interface PickedScanRootsDto {
   roots_display: string[];
   policies: EntryPolicyView[];
+  cancelled?: boolean;
 }
 
 export interface PickedRulesFileDto {

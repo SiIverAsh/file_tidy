@@ -125,7 +125,9 @@ pub async fn pick_scan_roots(state: State<'_, AppState>) -> GuiResult<PickedScan
             .lock()
             .map_err(|_| GuiError::Rejected("目录选择锁不可用".to_owned()))?
             .clone();
-        return build_picked_roots_dto(&existing, &state.session).await;
+        let mut picked = build_picked_roots_dto(&existing, &state.session).await?;
+        picked.cancelled = true;
+        return Ok(picked);
     }
 
     {
@@ -156,6 +158,7 @@ async fn build_picked_roots_dto(
     Ok(PickedScanRootsDto {
         roots_display,
         policies,
+        cancelled: false,
     })
 }
 
@@ -365,6 +368,23 @@ pub async fn query_scan_entries_inner(
         let grant_refs: Vec<&Grant> = grants_owned.iter().collect();
         let sensitive_dirs = compute_sensitive_parent_dirs(&report);
         let stale_set: BTreeSet<u64> = report.stale_entry_ids.iter().copied().collect();
+        let directory_sizes: BTreeMap<&Path, u64> = report
+            .directory_usage
+            .iter()
+            .map(|usage| (usage.path.as_path(), usage.logical_bytes))
+            .collect();
+        // Directory entries have no file payload of their own. Display and sort
+        // by their recursive file totals, matching the space distribution view.
+        let display_size = |entry: &file_tidy_core::FileEntry| {
+            if entry.kind == EntryKind::Directory {
+                directory_sizes
+                    .get(entry.path.as_path())
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                entry.size_bytes
+            }
+        };
 
         let skipped: Vec<_> = report
             .skipped
@@ -394,7 +414,8 @@ pub async fn query_scan_entries_inner(
         }
         match request.sort {
             SortField::SizeDesc => {
-                filtered.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes).then(a.id.cmp(&b.id)));
+                filtered
+                    .sort_by(|a, b| display_size(b).cmp(&display_size(a)).then(a.id.cmp(&b.id)));
             }
             SortField::NameAsc => {
                 filtered.sort_by(|a, b| a.path.cmp(&b.path));
@@ -414,7 +435,9 @@ pub async fn query_scan_entries_inner(
             .into_iter()
             .skip(request.offset)
             .take(limit)
-            .map(|e| to_file_entry_dto(e, &grant_refs, &stale_set, &sensitive_dirs))
+            .map(|e| {
+                to_file_entry_dto(e, display_size(e), &grant_refs, &stale_set, &sensitive_dirs)
+            })
             .collect();
 
         Ok(QueryScanEntriesResponse {
@@ -611,6 +634,7 @@ async fn build_workspace_status(state: &AppState) -> GuiResult<WorkspaceStatusDt
     let session = state.session.lock().await;
     let grants: Vec<GrantDto> = session
         .grants()
+        .filter(|g| !g.is_automatic())
         .map(|g| GrantDto {
             id: g.id().to_string(),
             root_display: g.root().display.clone(),
@@ -661,7 +685,7 @@ pub async fn get_suggested_directories(
         return Ok(SuggestedDirectoriesResponse {
             requires_private_config_consent: true,
             consent_reason: Some(
-                "在 Linux 上发现常见个人目录需单次只读读取 ~/.config/user-dirs.dirs（该文件位于 B 敏感保护区）。未经明确同意不会自动读取。".to_owned(),
+                "在 Linux 上发现常见个人目录需单次只读读取个人目录配置 ~/.config/user-dirs.dirs。未经明确同意不会自动读取。".to_owned(),
             ),
             items: Vec::new(),
         });
@@ -879,7 +903,7 @@ pub async fn pick_destination_directory(
     state: State<'_, AppState>,
 ) -> GuiResult<Option<PickedDestinationDto>> {
     let folder = rfd::AsyncFileDialog::new()
-        .set_title("选择目标目录（需在已授权的 C 区内）")
+        .set_title("选择目标目录")
         .pick_folder()
         .await;
     let Some(handle) = folder else {
@@ -891,33 +915,23 @@ pub async fn pick_destination_directory(
         .await
         .map_err(|_| GuiError::Rejected("策略检查失败".to_owned()))?;
 
-    let session = state.session.lock().await;
+    let mut session = state.session.lock().await;
+    let directory_id = session.grant_default_access(&path)?;
+    state
+        .known_epoch
+        .store(session.authorization_epoch(), Ordering::SeqCst);
     let pv = policy_view_for_path(&path_for_policy, &policy, &session);
-    let matching_grant = session
-        .grants()
-        .find(|g| {
-            !g.is_revoked()
-                && g.root()
-                    .to_path()
-                    .map(|r| path_for_policy.starts_with(&r))
-                    .unwrap_or(false)
-        })
-        .map(|g| g.id().to_string());
-
-    if let Some(ref gid) = matching_grant
-        && let Ok(mut map) = state.picked_destinations.lock()
-    {
-        map.insert(gid.clone(), path.clone());
-    }
+    let directory_id = directory_id.to_string();
+    state
+        .picked_destinations
+        .lock()
+        .map_err(|_| GuiError::Rejected("目标目录缓存锁不可用".to_owned()))?
+        .insert(directory_id.clone(), path.clone());
 
     Ok(Some(PickedDestinationDto {
-        grant_id: matching_grant.clone(),
+        grant_id: Some(directory_id),
         path_display: display_path(&path),
-        needs_grant: matching_grant.is_none()
-            || matches!(
-                pv.zone,
-                crate::dto::ZoneKind::AProtected | crate::dto::ZoneKind::BSensitive
-            ),
+        needs_grant: pv.protected,
         policy: pv,
     }))
 }
@@ -981,9 +995,9 @@ pub async fn build_plan_from_selection_inner(
     for source in selected_paths {
         let destination = match op_kind {
             OperationKind::Copy | OperationKind::Move => {
-                let base_dir = picked_dest_path.as_ref().ok_or_else(|| {
-                    GuiError::Rejected("请先通过原生选择器选择已授权目标目录".to_owned())
-                })?;
+                let base_dir = picked_dest_path
+                    .as_ref()
+                    .ok_or_else(|| GuiError::Rejected("请先选择目标目录".to_owned()))?;
                 let leaf = source
                     .file_name()
                     .ok_or_else(|| GuiError::Rejected("源路径缺少文件名".to_owned()))?;
@@ -1022,7 +1036,27 @@ pub async fn build_plan_from_selection_inner(
         ..PlanOptions::default()
     };
 
-    let session = state.session.lock().await;
+    let mut session = state.session.lock().await;
+    // Selecting an operation supplies application access for its source and
+    // destination. Parent scopes cover all descendants, including sensitive names.
+    for operation in &requests {
+        if operation.kind != OperationKind::Copy {
+            let parent = operation
+                .source
+                .parent()
+                .ok_or_else(|| GuiError::Rejected("无法定位源文件父目录".to_owned()))?;
+            session.grant_default_access(parent)?;
+        }
+        if let Some(destination) = &operation.destination {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| GuiError::Rejected("无法定位目标父目录".to_owned()))?;
+            session.grant_default_access(parent)?;
+        }
+    }
+    state
+        .known_epoch
+        .store(session.authorization_epoch(), Ordering::SeqCst);
     let plan = session.build_plan(requests, options)?;
     let dto = to_plan_preview_dto(&plan, &session);
     store_active_plan(state, plan, &dto)?;
@@ -1211,17 +1245,6 @@ pub async fn confirm_and_execute_inner(
         cancel_slot: state.exec_cancel.clone(),
     };
 
-    // Strict B-zone rule: confirm_and_execute only permits `:content` acknowledgements for copying out of B.
-    if input
-        .sensitive_acknowledgements
-        .iter()
-        .any(|k| !k.ends_with(":content"))
-    {
-        return Err(GuiError::Rejected(
-            "安全拒绝：sensitive_acknowledgements 仅用于 B 区文件复制出（:content），触及 B 区的任何写操作不可确认放行。".to_owned(),
-        ));
-    }
-
     let item_count = match &input.item_count {
         Some(s) => Some(
             s.parse::<u64>()
@@ -1291,10 +1314,13 @@ pub async fn confirm_and_execute_inner(
         return Err(GuiError::Rejected(err));
     }
 
+    // The reviewed native plan is authoritative. Default access includes the
+    // content and write scopes needed by that plan, without per-file dialogs.
+    let sensitive_acknowledgements = plan.preview().sensitive_acknowledgements.clone();
     let confirmation = Confirmation {
         digest: input.plan_digest,
         item_count,
-        sensitive_acknowledgements: input.sensitive_acknowledgements,
+        sensitive_acknowledgements,
         permanent_phrase,
     };
 
@@ -1397,7 +1423,14 @@ pub async fn build_restore_plan(
         include_hidden,
         ..PlanOptions::default()
     };
-    let session = state.session.lock().await;
+    let mut session = state.session.lock().await;
+    grant_quarantine_access(&mut session, &ids, dest_path.is_none())?;
+    if let Some(destination) = &dest_path {
+        session.grant_default_access(destination)?;
+    }
+    state
+        .known_epoch
+        .store(session.authorization_epoch(), Ordering::SeqCst);
     let plan = session.build_restore_plan(&ids, dest_path.as_deref(), options)?;
     let dto = to_plan_preview_dto(&plan, &session);
     store_active_plan(&state, plan, &dto)?;
@@ -1418,7 +1451,11 @@ pub async fn build_purge_plan(
         include_hidden,
         ..PlanOptions::default()
     };
-    let session = state.session.lock().await;
+    let mut session = state.session.lock().await;
+    grant_quarantine_access(&mut session, &ids, false)?;
+    state
+        .known_epoch
+        .store(session.authorization_epoch(), Ordering::SeqCst);
     let plan = session.build_purge_plan(&ids, options)?;
     let dto = to_plan_preview_dto(&plan, &session);
     store_active_plan(&state, plan, &dto)?;
@@ -1475,11 +1512,59 @@ pub async fn build_undo_plan(
         quarantine_retention_days: retain_days.clamp(1, 36500),
         ..PlanOptions::default()
     };
-    let session = state.session.lock().await;
+    let mut session = state.session.lock().await;
+    let history = session.batch_history(&batch)?;
+    for operation in &history.operations {
+        if operation.state != file_tidy_core::journal::OperationState::Done
+            || (!ops.is_empty() && !ops.iter().any(|id| id.as_str() == operation.id))
+        {
+            continue;
+        }
+        let source =
+            (operation.kind != "copy" && operation.kind != "restore").then_some(&operation.source);
+        for path in source.into_iter().chain(operation.destination.iter()) {
+            grant_history_path_access(&mut session, &path.to_path()?)?;
+        }
+    }
+    state
+        .known_epoch
+        .store(session.authorization_epoch(), Ordering::SeqCst);
     let plan = session.build_undo_plan(&batch, &ops, options)?;
     let dto = to_plan_preview_dto(&plan, &session);
     store_active_plan(&state, plan, &dto)?;
     Ok(dto)
+}
+
+fn grant_history_path_access(session: &mut Session, path: &Path) -> GuiResult<()> {
+    // Managed payloads are accessed through their recorded container root, never
+    // by granting arbitrary writes inside the application's private storage.
+    let directory = path
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".file-tidy"))
+        })
+        .and_then(Path::parent)
+        .or_else(|| path.parent())
+        .ok_or_else(|| GuiError::Rejected("无法定位操作目录".to_owned()))?;
+    session.grant_default_access(directory)?;
+    Ok(())
+}
+
+fn grant_quarantine_access(
+    session: &mut Session,
+    ids: &[Id],
+    restore_original: bool,
+) -> GuiResult<()> {
+    let items = session.quarantine_items(1000, false)?;
+    for item in items.iter().filter(|item| ids.contains(&item.id)) {
+        grant_history_path_access(session, &item.storage_path.to_path()?)?;
+        if restore_original {
+            grant_history_path_access(session, &item.original_path.to_path()?)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

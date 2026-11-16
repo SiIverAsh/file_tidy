@@ -26,12 +26,17 @@ const RECOVERY_LABELS: Readonly<Record<string, string>> = {
 const DIRECTORY_LABELS: Readonly<Record<string, string>> = {
   downloads: "下载", desktop: "桌面", documents: "文档",
 };
+const CATEGORY_LABELS: Readonly<Record<string, string>> = {
+  document: "文档", image: "图片", video: "视频", audio: "音频",
+  archive: "压缩包", code: "代码", installer: "安装包", other: "其他",
+};
 
 export const operationLabel = (value: string): string => OPERATION_LABELS[value.toLowerCase()] ?? "未知操作";
 export const statusLabel = (value: string): string => STATUS_LABELS[value.toLowerCase()] ?? "未知状态";
 export const fileKindLabel = (value: string): string => FILE_LABELS[value.toLowerCase()] ?? "未知类型";
 export const recoveryLabel = (value: string): string => RECOVERY_LABELS[value.toLowerCase()] ?? "未知状态";
 export const directoryPurposeLabel = (value: string): string => DIRECTORY_LABELS[value.toLowerCase()] ?? "其他目录";
+export const categoryLabel = (value: string): string => CATEGORY_LABELS[value.toLowerCase()] ?? "其他";
 
 /** Keep the original protocol value available only in detailed mode. */
 export function labeledValue(label: string, raw: string, className = ""): HTMLElement {

@@ -17,15 +17,15 @@
 
 .scan-toolbar .scan-options > .scan-options__summary {
   position: static;
-  padding: 7px 11px;
-  min-height: 34px;
+  padding: 7px 12px;
+  min-height: 36px;
   border: 1px solid var(--border-strong);
-  border-radius: 7px;
+  border-radius: 8px;
   background: var(--surface);
   white-space: nowrap;
 }
 
-.scan-toolbar .scan-options[open] > .scan-options__summary {
+.scan-toolbar .scan-options[data-open="true"] > .scan-options__summary {
   color: var(--primary);
   border-color: var(--primary);
 }
@@ -48,7 +48,7 @@
   box-shadow: 0 10px 32px #14203926;
 }
 
-.scan-toolbar .scan-options:not([open]) > .scan-toolbar__options {
+.scan-toolbar .scan-options:not([data-open="true"]) > .scan-toolbar__options {
   display: none;
 }
 

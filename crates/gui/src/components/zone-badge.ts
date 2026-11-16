@@ -10,13 +10,15 @@ export function describeZoneLabel(zone: ZoneKind): {
     case "A_Protected":
       return { icon: "●", text: "系统保护", cssClass: "zone-badge zone-a" };
     case "B_Sensitive":
-      return { icon: "●", text: "敏感文件", cssClass: "zone-badge zone-b" };
+      return { icon: "●", text: "敏感提示", cssClass: "zone-badge zone-b" };
+    case "C_DefaultAllowed":
+      return { icon: "●", text: "默认允许", cssClass: "zone-badge zone-c" };
     case "C_GrantedPersistent":
       return { icon: "●", text: "持久授权", cssClass: "zone-badge zone-c" };
     case "C_GrantedSession":
       return { icon: "●", text: "本次授权", cssClass: "zone-badge zone-c" };
     case "Unauthenticated":
-      return { icon: "○", text: "未授权", cssClass: "zone-badge zone-u" };
+      return { icon: "○", text: "访问受限", cssClass: "zone-badge zone-u" };
   }
 }
 
@@ -27,11 +29,11 @@ export function describeSensitivityReason(reason: SensitivityReason | null): str
     case "sensitive_filename":
       return "匹配密钥或凭据文件名规则（如 .env*、*.pem、*.key）";
     case "hardlink_alias_propagated":
-      return "硬链接别名传播：与敏感文件共享实体，按 B 区保护";
+      return "硬链接别名：与敏感文件共享同一实体";
     case "contains_sensitive_child":
-      return "级联拒绝原因：包含敏感子项，禁止目录写入操作";
+      return "包含敏感子项，整理操作无需逐项授权";
     case "conservative_unknown":
-      return "目录上下文未知，按敏感项处理";
+      return "目录上下文尚未确认";
     case null:
       return null;
   }
@@ -69,18 +71,14 @@ export function createPolicyExplanationBox(policy: EntryPolicyView): HTMLElement
   const title = el(
     "div",
     "policy-callout__title",
-    policy.zone === "B_Sensitive" ? "敏感文件限制" : "操作限制",
+    hasBlocked || hasAtomic ? "操作限制" : "敏感文件提示",
   );
   box.appendChild(title);
 
   if (policy.blocked_reason) {
     const message = policy.zone === "A_Protected"
-      ? "这是系统保护文件，仅允许复制到已授权目录。"
-      : policy.zone === "B_Sensitive"
-        ? "这是敏感文件，不能移动、重命名、隔离或删除。复制需要单独确认。"
-        : policy.zone === "Unauthenticated"
-          ? "此目录尚未授权，整理前请先添加目录授权。"
-          : policy.blocked_reason;
+      ? "这是系统保护文件，仅允许复制到普通本地目录。"
+      : policy.blocked_reason;
     box.appendChild(el("p", "policy-callout__line simple-detail", message));
     box.appendChild(el("p", "policy-callout__line technical-detail", policy.blocked_reason));
   }
@@ -96,12 +94,12 @@ export function createPolicyExplanationBox(policy: EntryPolicyView): HTMLElement
       ),
     );
   }
-  if (policy.zone === "B_Sensitive" && policy.allowed_actions.includes("copy_out")) {
+  if (policy.sensitive && !hasBlocked) {
     box.appendChild(
       el(
         "p",
         "policy-callout__hint",
-        "可确认后复制到已授权目录",
+        "敏感标记仅作提示，操作权限默认允许。",
       ),
     );
   }

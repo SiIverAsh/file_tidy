@@ -58,7 +58,7 @@ export class AccessRulesView {
 
     const header = el("header", "page-header");
     header.appendChild(el("h1", "page-header__title", "授权与规则"));
-    header.appendChild(el("p", "page-header__description", "管理工作区和目录权限，让每次整理都有清晰边界。"));
+    header.appendChild(el("p", "page-header__description", "本地目录默认允许整理，无需逐层添加授权。"));
     this.root.appendChild(header);
 
     const grid = el("div", "settings-grid");
@@ -143,8 +143,8 @@ export class AccessRulesView {
     const grantsHeading = el("div", "section-heading");
     const grants = ws?.grants ?? [];
     const activeGrants = grants.filter((grant) => !grant.revoked);
-    grantsHeading.appendChild(el("h2", "section-heading__title", "目录授权"));
-    grantsHeading.appendChild(el("p", "section-heading__description", "授权目录允许移动、隔离和删除；操作仍需预览确认。"));
+    grantsHeading.appendChild(el("h2", "section-heading__title", "目录授权记录"));
+    grantsHeading.appendChild(el("p", "section-heading__description", "整理时自动处理目录权限。手动授权为可选记录，父目录授权覆盖所有子目录；操作仍需预览确认。"));
     grantsCard.appendChild(grantsHeading);
 
     const addGrantBtn = this.focusable(el("button", "btn btn--primary", "添加授权目录…"), "grant:add");
@@ -191,8 +191,8 @@ export class AccessRulesView {
     const grantList = el("div", "card-list");
     if (grants.length === 0) {
       const empty = el("div", "status-empty");
-      empty.appendChild(el("div", "status-empty__title", "还没有授权目录"));
-      empty.appendChild(el("p", "status-empty__description", "浏览和扫描无需授权，整理文件前再添加即可。"));
+      empty.appendChild(el("div", "status-empty__title", "已默认允许整理"));
+      empty.appendChild(el("p", "status-empty__description", "可直接选择文件进行整理，无需添加目录授权。敏感标记仅作提示。"));
       grantList.appendChild(empty);
     }
     for (const g of grants) {

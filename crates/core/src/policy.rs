@@ -29,9 +29,11 @@ pub struct PolicyLabels {
 pub struct Policy {
     protected_roots: Vec<PathBuf>,
     protected_directory_ids: HashSet<FileIdentity>,
+    protection_context_known: bool,
     sensitive_roots: Vec<PathBuf>,
     sensitive_directory_ids: HashSet<FileIdentity>,
     sensitivity_context_known: bool,
+    label_unknown_paths: bool,
     mounts: Option<MountTable>,
     warnings: Vec<String>,
     atomic_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
@@ -55,11 +57,15 @@ impl Policy {
                 None
             }
         };
+        let mut protection_context_known = mounts.is_some();
         match file_tidy_platform::protected_system_roots() {
             Ok(roots) => protected_roots.extend(roots),
-            Err(error) => warnings.push(format!(
-                "could not resolve additional system protection roots: {error}; these labels must not authorize writes"
-            )),
+            Err(error) => {
+                protection_context_known = false;
+                warnings.push(format!(
+                    "could not resolve additional system protection roots: {error}; these labels must not authorize writes"
+                ));
+            }
         }
         include_existing_canonical_aliases(&mut protected_roots, mounts.as_ref());
         let protected_directory_ids = mounts
@@ -125,9 +131,11 @@ impl Policy {
         Self {
             protected_roots,
             protected_directory_ids,
+            protection_context_known,
             sensitive_roots,
             sensitive_directory_ids,
             sensitivity_context_known,
+            label_unknown_paths: false,
             mounts,
             warnings,
             atomic_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -138,6 +146,19 @@ impl Policy {
     /// Initialization issues that the caller must retain in its report.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Operations validate each selected path and review sensitive content
+    /// scopes, so an unrelated inaccessible private root must not disable them.
+    /// Unknown state on a selected path still becomes a sensitive manifest item.
+    pub(crate) fn for_planning() -> Option<Self> {
+        let mut policy = Self::new();
+        if !policy.protection_context_known {
+            return None;
+        }
+        policy.sensitivity_context_known = true;
+        policy.label_unknown_paths = true;
+        Some(policy)
     }
 
     /// Record sensitive directory objects discovered in the inventory, including
@@ -167,7 +188,12 @@ impl Policy {
             || canonical.as_deref().is_some_and(|real| {
                 self.in_roots(real, &self.protected_roots) || protected_volume_directory(real)
             });
-        let sensitive = self.sensitivity(&lexical, canonical.as_deref(), true);
+        let sensitive = self.sensitivity(
+            &lexical,
+            canonical.as_deref(),
+            true,
+            self.label_unknown_paths,
+        );
         PolicyLabels {
             protected,
             sensitive,
@@ -185,23 +211,30 @@ impl Policy {
     pub(crate) fn sensitive_for_content(&self, path: &Path) -> bool {
         let lexical = absolute_lexical(path);
         let canonical = self.canonicalize(&lexical);
-        self.sensitivity(&lexical, canonical.as_deref(), false)
+        self.sensitivity(&lexical, canonical.as_deref(), false, true)
     }
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         canonicalize_local(path, self.mounts.as_ref()?).ok()
     }
 
-    fn sensitivity(&self, lexical: &Path, canonical: Option<&Path>, cached: bool) -> bool {
-        !self.sensitivity_context_known
-            || canonical.is_none()
+    fn sensitivity(
+        &self,
+        lexical: &Path,
+        canonical: Option<&Path>,
+        cached: bool,
+        deny_unknown: bool,
+    ) -> bool {
+        (deny_unknown && (!self.sensitivity_context_known || canonical.is_none()))
             || self.sensitive_path(lexical)
             || canonical.is_some_and(|path| self.sensitive_path(path))
-            || canonical.is_some_and(|path| self.sensitive_ancestor_identity(path, cached))
-            || (canonical != Some(lexical) && self.sensitive_ancestor_identity(lexical, cached))
+            || canonical
+                .is_some_and(|path| self.sensitive_ancestor_identity(path, cached, deny_unknown))
+            || (canonical != Some(lexical)
+                && self.sensitive_ancestor_identity(lexical, cached, deny_unknown))
     }
 
-    fn sensitive_ancestor_identity(&self, path: &Path, cached: bool) -> bool {
+    fn sensitive_ancestor_identity(&self, path: &Path, cached: bool, deny_unknown: bool) -> bool {
         let mut visited = Vec::new();
         let mut sensitive = false;
         for ancestor in path.ancestors() {
@@ -220,13 +253,13 @@ impl Policy {
                 .as_ref()
                 .is_some_and(|mounts| mounts.classify(ancestor).kind == LocationKind::Local);
             if !local {
-                sensitive = true;
+                sensitive = deny_unknown;
                 break;
             }
             match file_tidy_platform::inspect(ancestor) {
                 Ok(node) if node.kind == NodeKind::Directory => {
                     let Some(identity) = node.identity else {
-                        sensitive = true;
+                        sensitive = deny_unknown;
                         break;
                     };
                     visited.push(ancestor.to_path_buf());
@@ -237,7 +270,7 @@ impl Policy {
                 }
                 Ok(node) if node.kind == NodeKind::Regular => {}
                 Ok(_) | Err(_) => {
-                    sensitive = true;
+                    sensitive = deny_unknown;
                     break;
                 }
             }
@@ -731,6 +764,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unknown_private_context_does_not_label_ordinary_paths_sensitive() -> io::Result<()> {
+        // Use a path outside Windows' AppData temp directory, whose name is
+        // independently sensitive even after synthetic private roots are cleared.
+        let base = std::env::var_os("FILE_TIDY_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-test-fixtures")
+            });
+        std::fs::create_dir_all(&base)?;
+        let temp = tempfile::tempdir_in(base)?;
+        let fixture = temp.path().canonicalize()?;
+        let ordinary = fixture.join("ordinary.txt");
+        let sensitive = fixture.join(".env");
+        std::fs::write(&ordinary, b"fixture")?;
+        std::fs::write(&sensitive, b"fixture")?;
+        let mut policy = Policy::new();
+        policy.sensitivity_context_known = false;
+        policy.sensitive_roots.clear();
+        policy.sensitive_directory_ids.clear();
+
+        assert!(!policy.labels(&ordinary).sensitive);
+        assert!(policy.labels(&sensitive).sensitive);
+        assert!(policy.sensitive_for_content(&ordinary));
+        assert!(policy.sensitive_for_content(&sensitive));
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn canonicalization_accepts_complete_verbatim_drive_roots() -> io::Result<()> {
@@ -889,12 +950,12 @@ mod tests {
                 .identity
                 .is_some_and(|id| policy.sensitive_directory_ids.contains(&id))
         );
-        assert!(policy.sensitive_ancestor_identity(&alternate, true));
+        assert!(policy.sensitive_ancestor_identity(&alternate, true, false));
         assert!(policy.labels(&alternate).sensitive);
         assert!(policy.sensitive_for_content(&alternate));
         let preferences = alternate.join("Preferences");
         if file_tidy_platform::inspect(&preferences).is_ok() {
-            assert!(policy.sensitive_ancestor_identity(&preferences, true));
+            assert!(policy.sensitive_ancestor_identity(&preferences, true, false));
             assert!(policy.sensitive_for_content(&preferences));
         }
         Ok(())

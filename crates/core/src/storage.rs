@@ -136,10 +136,9 @@ impl Session {
             return Err(E::ChangedSincePlan);
         }
         let mut grants = self.grants.clone();
-        grants
-            .get_mut(&plan.preview.grant)
-            .ok_or(E::OutsideGrant)?
-            .persistent = true;
+        let storage_grant = grants.get_mut(&plan.preview.grant).ok_or(E::OutsideGrant)?;
+        storage_grant.persistent = true;
+        storage_grant.automatic = false;
         let epoch = self.epoch.checked_add(1).ok_or(E::Overflow)?;
         let store = StateStore::create(&root, &plan.preview.grant, &grants, epoch)?;
         self.grants = grants;

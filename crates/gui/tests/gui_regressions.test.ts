@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
 import type { ApiClient } from "../src/api/tauri.ts";
-import type { BatchHistoryDetailDto, PlanPreviewDto, QuarantineItemDto, ScanSummaryDto, WorkspaceStatusDto } from "../src/api/types.ts";
+import type { BatchHistoryDetailDto, FileEntryDto, PlanPreviewDto, QuarantineItemDto, ScanSummaryDto, TreemapResponse, WorkspaceStatusDto } from "../src/api/types.ts";
 import { OverlayFocus } from "../src/components/overlay-focus.ts";
 import { PermanentDeleteModal } from "../src/components/permanent-modal.ts";
 import { ReviewDrawer } from "../src/components/review-drawer.ts";
+import { VirtualEntryList } from "../src/components/virtual-list.ts";
 import { AppStore } from "../src/state/store.ts";
 import { ExploreView, type ExploreViewCallbacks } from "../src/views/explore.ts";
 import type { SafetyHistoryCallbacks } from "../src/views/safety-history.ts";
@@ -98,6 +99,7 @@ function batch(id: string): BatchHistoryDetailDto {
 
 interface Harness {
   store: AppStore;
+  startScan(): Promise<void>;
   openDrawerWithLoader(loader: () => Promise<PlanPreviewDto>): Promise<void>;
   openPermanentModalWithLoader(loader: () => Promise<PlanPreviewDto>): Promise<void>;
   closeDrawer(): void;
@@ -108,6 +110,7 @@ interface Harness {
   safetyView: { callbacks: SafetyHistoryCallbacks };
   accessView: { callbacks: AccessRulesCallbacks };
   reviewDrawer: { callbacks: ReviewDrawerCallbacks };
+  exploreView: { callbacks: ExploreViewCallbacks; virtualList: VirtualEntryList };
 }
 
 async function appHarness(api: Partial<ApiClient>): Promise<Harness> {
@@ -121,6 +124,87 @@ async function appHarness(api: Partial<ApiClient>): Promise<Harness> {
     return new FileTidyApp(new FakeNode("div") as unknown as HTMLElement, api as ApiClient) as unknown as Harness;
   } finally { hooks.deregister(); }
 }
+
+function scanSummary(generation: string, root: string): ScanSummaryDto {
+  return {
+    scan_generation: generation, scanned_at_unix: "1", entries: "3", files: "2", directories: "1", skipped: "0",
+    logical_bytes: "20", unique_file_logical_bytes: "20", unique_allocated_bytes: null,
+    content_bytes_read: "20", content_open_operations: "2", complete: true, cancelled: false, limit_reached: false,
+    top_entry_ids: ["large"], stale_entry_ids: [], notices: [], root_displays: [root],
+    duplicates: [{ group_id: "dup-0", entry_ids: ["first", "second"], size_bytes: "10", duplicate_logical_bytes: "10", blake3_prefix: "abc" }],
+  };
+}
+
+test("Changing scan folders clears old analysis and ignores the previous scan's late response", async () => {
+  const oldScan = deferred<ScanSummaryDto>();
+  let scanCalls = 0;
+  let cancelCalls = 0;
+  const app = await appHarness({
+    pickScanRoots: async () => ({ roots_display: ["/new"], policies: [] }),
+    startScan: () => ++scanCalls === 1 ? oldScan.promise : Promise.resolve(scanSummary("2", "/new")),
+    cancelScan: async () => { cancelCalls += 1; },
+    queryScanEntries: async (request) => ({ scan_generation: request.scan_generation, total_count: 0, offset: request.offset, entries: [], skipped: [] }),
+    getTreemapNodes: async (generation) => ({ scan_generation: generation, parent_entry_id: null, breadcrumbs: [], total_bytes: "20", nodes: [] }),
+  });
+  const state = app.store.state;
+  state.pendingRoots = { roots_display: ["/old"], policies: [] };
+  state.scanSummary = scanSummary("0", "/old");
+  const scanning = app.startScan();
+  assert.equal(state.scanSummary, null, "starting another scan must remove stale counts immediately");
+  state.scanFilter.tab = "duplicates";
+  state.scanFilter.duplicate_group_id = "dup-0";
+  state.selection = { mode: "ids", scan_generation: "0", ids: ["old-entry"] };
+  state.totalFilteredCount = 3;
+  state.treemap = { scan_generation: "0" } as TreemapResponse;
+  state.inspectedEntry = { id: "old-entry" } as FileEntryDto;
+  state.scanProgress = { scan_generation: "1" } as NonNullable<typeof state.scanProgress>;
+  state.scanOptions.all_volumes = true;
+
+  await app.exploreView.callbacks.onPickRoots();
+  assert.deepEqual(state.pendingRoots?.roots_display, ["/new"]);
+  assert.equal(state.scanOptions.all_volumes, false, "choosing folders leaves the all-volumes scope");
+  assert.equal(state.scanSummary, null);
+  assert.equal(state.scanProgress, null);
+  assert.equal(state.treemap, null);
+  assert.equal(state.inspectedEntry, null);
+  assert.equal(state.scanFilter.tab, "browse");
+  assert.equal(state.scanFilter.duplicate_group_id, null);
+  assert.equal(state.totalFilteredCount, 0);
+  assert.deepEqual(state.selection, { mode: "ids", scan_generation: "0", ids: [] });
+  assert.equal(cancelCalls, 1);
+  assert.equal(state.scanning, true, "wait for the previous backend scan to release its slot");
+
+  oldScan.resolve(scanSummary("1", "/old"));
+  await scanning;
+  assert.equal(state.scanSummary, null, "the previous folder's response cannot refill the cleared screen");
+  assert.equal(state.scanning, false);
+  await app.startScan();
+  assert.equal(state.scanSummary?.scan_generation, "2");
+  assert.deepEqual(state.scanSummary?.root_displays, ["/new"]);
+  app.exploreView.virtualList.destroy();
+});
+
+test("Canceling the folder picker or choosing the same folders preserves current results", async () => {
+  let picks = 0;
+  const app = await appHarness({ pickScanRoots: async () => ({
+    roots_display: ++picks === 1 ? ["/b", "/a"] : ["/a", "/b"], policies: [], cancelled: picks === 3,
+  }) });
+  const summary = scanSummary("1", "/a");
+  const state = app.store.state;
+  state.pendingRoots = { roots_display: ["/a", "/b"], policies: [] };
+  state.scanSummary = summary;
+  state.selection = { mode: "ids", scan_generation: "1", ids: ["selected"] };
+  for (let pick = 0; pick < 2; pick += 1) {
+    await app.exploreView.callbacks.onPickRoots();
+    assert.equal(state.scanSummary, summary);
+    assert.deepEqual(state.selection, { mode: "ids", scan_generation: "1", ids: ["selected"] });
+  }
+  state.scanOptions.all_volumes = true;
+  await app.exploreView.callbacks.onPickRoots();
+  assert.equal(state.scanSummary, summary, "canceling preserves the all-volumes results");
+  assert.equal(state.scanOptions.all_volumes, true);
+  app.exploreView.virtualList.destroy();
+});
 
 test("Closing and replacing operation previews ignores slow responses from an older plan", async () => {
   const filtered = deferred<PlanPreviewDto>();
@@ -221,18 +305,144 @@ test("Closing floating panels releases document capture listeners before another
   const view = new ExploreView(callbacks);
   view.render(new AppStore().state);
   const root = view.root as unknown as FakeNode;
-  const details = root.find((node) => node.className === "scan-options");
-  if (!details) throw new Error("scan options not found");
-  details.open = true; details.dispatch("toggle");
+  const scanBox = root.find((node) => node.className === "scan-options");
+  if (!scanBox) throw new Error("scan options not found");
+  const trigger = scanBox.children[0];
+  const panel = scanBox.children[1];
+  if (!trigger || !panel) throw new Error("scan options parts missing");
+  trigger.dispatch("click", { preventDefault() {} });
+  assert.equal(panel.hidden, false);
+  assert.equal(scanBox.getAttribute("data-open"), "true");
   assert.equal(doc.listeners.get("keydown")?.length, 1);
   view.closeFloatingPanels(false);
   assert.equal(doc.listeners.get("keydown")?.length, 0);
   assert.equal(doc.listeners.get("pointerdown")?.length, 0);
-  assert.equal(details.open, false);
-  details.open = true; details.dispatch("toggle");
-  details.children[1]?.children[0]?.children[0]?.focus();
+  assert.equal(panel.hidden, true);
+  assert.equal(scanBox.getAttribute("data-open"), null);
+  trigger.dispatch("click", { preventDefault() {} });
+  panel.children[0]?.children[0]?.focus();
   view.closeFloatingPanels();
-  assert.equal(document.activeElement, details.children[0] as unknown as Element);
+  assert.equal(document.activeElement, trigger as unknown as Element);
+  view.virtualList.destroy();
+});
+
+test("Restored filter disclosure and floating inspector dismiss when clicking blank space", () => {
+  const doc = installDOM();
+  const store = new AppStore();
+  store.state.scanSummary = scanSummary("1", "/work");
+  const view = new ExploreView({
+    onPickRoots: async () => {},
+    onPickRules: async () => {},
+    onStartScan: async () => {},
+    onCancelScan: async () => {},
+    onUpdateOptions: () => {},
+    onFilterChange: async (patch) => {
+      store.updateScanFilter(patch);
+      view.render(store.state);
+    },
+    onSortChange: async () => {},
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchSkipped: async () => [],
+    onSelectionChange: () => {},
+    onInspectEntry: (entry) => {
+      store.state.inspectedEntry = entry;
+      view.render(store.state);
+    },
+    onDrillDirectory: async () => {},
+    onTriggerAction: async () => {},
+    onQuickAuthorizeSelected: async () => {},
+  });
+  view.render(store.state);
+  const root = view.root as unknown as FakeNode;
+
+  // 1. Open filter disclosure, trigger filter re-render while open, then click blank space.
+  const filterBox = root.find((node) => node.className === "filter-disclosure");
+  if (!filterBox) throw new Error("filter disclosure not found");
+  filterBox.children[0]?.dispatch("click", { preventDefault() {} });
+  const zoneSelect = filterBox.find((node) => node.tagName === "SELECT");
+  if (!zoneSelect) throw new Error("zone select not found");
+  zoneSelect.value = "C_DefaultAllowed";
+  zoneSelect.dispatch("change");
+
+  const rebuiltFilter = root.find((node) => node.className === "filter-disclosure");
+  if (!rebuiltFilter) throw new Error("rebuilt filter disclosure not found");
+  assert.equal(rebuiltFilter.getAttribute("data-open"), "true");
+  assert.equal(rebuiltFilter.children[1]?.hidden, false);
+  assert.equal((doc.listeners.get("pointerdown")?.length ?? 0) >= 1, true);
+  doc.dispatch("pointerdown", { target: new FakeNode("div") });
+  assert.equal(rebuiltFilter.getAttribute("data-open"), null);
+  assert.equal(rebuiltFilter.children[1]?.hidden, true);
+  assert.equal(doc.listeners.get("pointerdown")?.length ?? 0, 0);
+
+  // 2. Open folder inspector, simulate panel reset + re-render, then click blank space.
+  const folderEntry: FileEntryDto = {
+    id: "dir-1",
+    path_display: "/work/docs",
+    name_display: "docs",
+    kind: "directory",
+    size_bytes: "4096",
+    allocated_bytes: "4096",
+    modified_unix: "1",
+    hidden: false,
+    category: null,
+    type_evidence: null,
+    content_inspected: false,
+    is_stale: false,
+    policy: {
+      zone: "C_DefaultAllowed",
+      protected: false,
+      sensitive: false,
+      atomic_root_display: null,
+      sensitivity_reason: null,
+      allowed_actions: [],
+      blocked_reason: null,
+    },
+  };
+  store.state.inspectedEntry = folderEntry;
+  view.render(store.state);
+  view.closeFloatingPanels(false);
+  store.state.inspectedEntry = folderEntry;
+  view.render(store.state);
+  assert.equal((doc.listeners.get("pointerdown")?.length ?? 0) >= 1, true);
+
+  doc.dispatch("pointerdown", { target: new FakeNode("div") });
+  assert.equal(store.state.inspectedEntry, null);
+  assert.equal(doc.listeners.get("pointerdown")?.length ?? 0, 0);
+
+  // 3. Scan options dropdown opens on trigger click, stays open on inner clicks,
+  // and closes on outside pointerdown / mousedown / click / Escape.
+  const scanBox = root.find((node) => node.className === "scan-options");
+  if (!scanBox) throw new Error("scan options not found");
+  const scanTrigger = scanBox.children[0];
+  const scanPanel = scanBox.children[1];
+  if (!scanTrigger || !scanPanel) throw new Error("scan options parts missing");
+
+  assert.equal(scanPanel.hidden, true);
+  scanTrigger.dispatch("click", { preventDefault() {} });
+  assert.equal(scanPanel.hidden, false);
+  assert.equal(scanBox.getAttribute("data-open"), "true");
+  assert.equal(scanTrigger.getAttribute("aria-expanded"), "true");
+  doc.dispatch("pointerdown", { target: scanPanel });
+  assert.equal(scanPanel.hidden, false);
+  doc.dispatch("click", { target: new FakeNode("div") });
+  assert.equal(scanPanel.hidden, true);
+  assert.equal(scanBox.getAttribute("data-open"), null);
+  assert.equal(scanTrigger.getAttribute("aria-expanded"), "false");
+  assert.equal(doc.listeners.get("pointerdown")?.length ?? 0, 0);
+  assert.equal(doc.listeners.get("mousedown")?.length ?? 0, 0);
+  assert.equal(doc.listeners.get("click")?.length ?? 0, 0);
+
+  scanTrigger.dispatch("click", { preventDefault() {} });
+  assert.equal(scanPanel.hidden, false);
+  doc.dispatch("mousedown", { target: new FakeNode("div") });
+  assert.equal(scanPanel.hidden, true);
+
+  scanTrigger.dispatch("click", { preventDefault() {} });
+  assert.equal(scanPanel.hidden, false);
+  doc.dispatch("keydown", { key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assert.equal(scanPanel.hidden, true);
+  assert.equal(document.activeElement, scanTrigger as unknown as Element);
+
   view.virtualList.destroy();
 });
 

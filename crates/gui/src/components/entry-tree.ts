@@ -3,7 +3,7 @@ import type { EntryId, FileEntryDto, ScanFilter } from "../api/types.ts";
 export function isTreeBrowseFilter(filter: ScanFilter): boolean {
   return filter.tab === "browse" && filter.parent_entry_id === null &&
     filter.search_text.trim() === "" && filter.zone_filter === "all" &&
-    filter.category_filter === "all";
+    filter.category_filter === "all" && filter.extension_filter === "all";
 }
 
 export interface EntryBranch {

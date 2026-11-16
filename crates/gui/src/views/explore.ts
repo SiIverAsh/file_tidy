@@ -6,7 +6,6 @@ import type {
   ScanTab,
   SkippedEntryDto,
   SortField,
-  TreemapNodeDto,
   ZoneKind,
 } from "../api/types.ts";
 import {
@@ -16,10 +15,10 @@ import {
   formatBytes,
   setText,
 } from "../components/safe-text.ts";
-import { TreemapPanel } from "../components/treemap.ts";
 import { VirtualEntryList } from "../components/virtual-list.ts";
 import { createPolicyExplanationBox, createZoneBadge } from "../components/zone-badge.ts";
 import { containsNode } from "../components/overlay-focus.ts";
+import { categoryLabel } from "../components/display-labels.ts";
 import {
   clearSelection,
   selectAllCurrentFilter,
@@ -27,6 +26,10 @@ import {
   toggleEntrySelection,
   type AppStateModel,
 } from "../state/store.ts";
+
+function extensionDisplayLabel(extension: string): string {
+  return extension === "" || extension === "__none__" ? "无后缀" : `.${extension}`;
+}
 
 export interface ExploreViewCallbacks {
   onPickRoots(): Promise<void>;
@@ -56,41 +59,49 @@ export interface ExploreViewCallbacks {
 }
 
 function bindFloatingDisclosure(
-  disclosure: HTMLDetailsElement,
+  container: HTMLElement,
   trigger: HTMLElement,
-): { close(restoreFocus?: boolean): void; dispose(): void } {
+  panel: HTMLElement,
+  initialOpen = false,
+  onToggle?: (open: boolean) => void,
+): { isOpen(): boolean; setOpen(next: boolean): void; close(restoreFocus?: boolean): void; dispose(): void } {
   const doc = document;
+  const win = typeof window !== "undefined" &&
+    typeof (window as unknown as { addEventListener?: unknown }).addEventListener === "function" &&
+    typeof (window as unknown as { removeEventListener?: unknown }).removeEventListener === "function" &&
+    (window as unknown) !== (doc as unknown)
+    ? window
+    : null;
+  let openState = initialOpen;
   let listening = false;
   const canListen = typeof doc.addEventListener === "function" &&
     typeof doc.removeEventListener === "function";
 
-  const stopListening = (): void => {
-    if (!listening) return;
-    doc.removeEventListener("pointerdown", onPointerDown, true);
-    doc.removeEventListener("keydown", onKeyDown, true);
-    listening = false;
-  };
-
-  const close = (restoreFocus = false): void => {
-    const wasOpen = disclosure.open;
-    disclosure.open = false;
-    trigger.setAttribute("aria-expanded", "false");
-    stopListening();
-    if (wasOpen && restoreFocus) trigger.focus();
-  };
-
-  const onPointerDown = (event: PointerEvent): void => {
+  const isTargetInside = (event: Event): boolean => {
+    const withPath = event as { composedPath?: () => EventTarget[] };
+    if (typeof withPath.composedPath === "function" && withPath.composedPath().includes(container)) {
+      return true;
+    }
     let target = event.target as Node | null;
     while (target) {
-      if (target === disclosure) return;
+      if (target === container) return true;
       target = target.parentNode;
     }
+    return false;
+  };
+
+  const onOutsidePointer = (event: Event): void => {
+    if (!openState) {
+      stopListening();
+      return;
+    }
+    if (isTargetInside(event)) return;
     close();
   };
 
   const onKeyDown = (event: KeyboardEvent): void => {
-    if (event.key !== "Escape" || !disclosure.open) return;
-    if (disclosure.isConnected === false) {
+    if (event.key !== "Escape" || !openState) return;
+    if (container.isConnected === false) {
       close();
       return;
     }
@@ -99,31 +110,81 @@ function bindFloatingDisclosure(
     close(true);
   };
 
-  trigger.setAttribute("aria-expanded", "false");
-  disclosure.addEventListener("keydown", onKeyDown);
-  disclosure.addEventListener("toggle", () => {
-    trigger.setAttribute("aria-expanded", String(disclosure.open));
-    if (!disclosure.open) {
+  const startListening = (): void => {
+    if (!canListen || listening) return;
+    win?.addEventListener("pointerdown", onOutsidePointer, true);
+    win?.addEventListener("mousedown", onOutsidePointer, true);
+    win?.addEventListener("click", onOutsidePointer, true);
+    win?.addEventListener("keydown", onKeyDown, true);
+    doc.addEventListener("pointerdown", onOutsidePointer, true);
+    doc.addEventListener("mousedown", onOutsidePointer, true);
+    doc.addEventListener("click", onOutsidePointer, true);
+    doc.addEventListener("keydown", onKeyDown, true);
+    listening = true;
+  };
+
+  const stopListening = (): void => {
+    if (!listening) return;
+    win?.removeEventListener("pointerdown", onOutsidePointer, true);
+    win?.removeEventListener("mousedown", onOutsidePointer, true);
+    win?.removeEventListener("click", onOutsidePointer, true);
+    win?.removeEventListener("keydown", onKeyDown, true);
+    doc.removeEventListener("pointerdown", onOutsidePointer, true);
+    doc.removeEventListener("mousedown", onOutsidePointer, true);
+    doc.removeEventListener("click", onOutsidePointer, true);
+    doc.removeEventListener("keydown", onKeyDown, true);
+    listening = false;
+  };
+
+  const applyState = (): void => {
+    panel.hidden = !openState;
+    trigger.setAttribute("aria-expanded", String(openState));
+    if (openState) {
+      container.setAttribute("data-open", "true");
+      container.classList.add("disclosure--open");
+      startListening();
+    } else {
+      container.removeAttribute("data-open");
+      container.classList.remove("disclosure--open");
       stopListening();
-    } else if (canListen && !listening) {
-      doc.addEventListener("pointerdown", onPointerDown, true);
-      doc.addEventListener("keydown", onKeyDown, true);
-      listening = true;
     }
+  };
+
+  const close = (restoreFocus = false): void => {
+    const wasOpen = openState;
+    openState = false;
+    applyState();
+    if (wasOpen) onToggle?.(false);
+    if (wasOpen && restoreFocus) trigger.focus();
+  };
+
+  const setOpen = (next: boolean): void => {
+    if (openState === next) return;
+    openState = next;
+    applyState();
+    onToggle?.(openState);
+  };
+
+  trigger.addEventListener("click", (event) => {
+    event.preventDefault();
+    setOpen(!openState);
   });
-  return { close, dispose: () => close() };
+  container.addEventListener("keydown", onKeyDown);
+  applyState();
+  return { isOpen: () => openState, setOpen, close, dispose: () => stopListening() };
 }
 
 export class ExploreView {
   readonly root: HTMLElement;
   readonly virtualList: VirtualEntryList;
-  readonly treemap: TreemapPanel;
 
   private readonly callbacks: ExploreViewCallbacks;
   private readonly splitEl: HTMLElement;
   private readonly inspectorEl: HTMLElement;
   private readonly progressSlot: HTMLElement;
   private readonly progressText: HTMLElement;
+  private readonly sideDockEl: HTMLElement;
+  private readonly sideHandleEl: HTMLButtonElement;
   private readonly summarySlot: HTMLElement;
   private readonly contentSlot: HTMLElement;
   private readonly actionBar: HTMLElement;
@@ -145,21 +206,25 @@ export class ExploreView {
     });
     progressBar.appendChild(cancelBtn);
     this.progressSlot.appendChild(progressBar);
-    this.summarySlot = el("div", "slot");
+    this.sideDockEl = el("div", "explore-side-dock");
+    this.sideDockEl.hidden = true;
+    this.sideHandleEl = el("button", "explore-side-dock__handle");
+    this.sideHandleEl.type = "button";
+    this.sideHandleEl.setAttribute("aria-label", "展开文件类型与后缀筛选");
+    this.sideHandleEl.appendChild(el("span", "explore-side-dock__dot"));
+    this.sideHandleEl.appendChild(el("span", "explore-side-dock__label", "类型"));
+    this.summarySlot = el("section", "explore-side");
+    this.summarySlot.hidden = true;
+    this.summarySlot.setAttribute("aria-label", "文件类型分布");
+    this.sideDockEl.appendChild(this.sideHandleEl);
+    this.sideDockEl.appendChild(this.summarySlot);
     this.filterBar = el("div", "filter-bar");
     this.contentSlot = el("div", "explore-content");
-    this.inspectorEl = el("div", "inspector inspector--hidden");
+    this.inspectorEl = el("aside", "inspector inspector--hidden");
+    this.inspectorEl.setAttribute("role", "dialog");
+    this.inspectorEl.setAttribute("aria-label", "文件夹与项目详情");
     this.splitEl = el("div", "explore-split explore-split--single");
     this.actionBar = el("div", "action-bar");
-
-    this.treemap = new TreemapPanel({
-      onDrillDown: (parentId) => {
-        void this.callbacks.onDrillDirectory(parentId);
-      },
-      onHighlightNode: (node) => {
-        this.renderTreemapInspector(node);
-      },
-    });
 
     this.virtualList = new VirtualEntryList({
       onFetchWindow: (offset, limit) => this.callbacks.onFetchWindow(offset, limit),
@@ -201,15 +266,64 @@ export class ExploreView {
   private staleInput: HTMLInputElement | null = null;
   private emptyStateKey: string | null = null;
   private summaryRendered: AppStateModel["scanSummary"] = null;
+  private summaryCategoryRendered: string | null = null;
+  private summaryExtensionRendered: string | null = null;
+  private summaryExpandedVersion = 0;
+  private summaryRenderedExpandedVersion = -1;
+  private readonly expandedCategories = new Set<string>();
+  private renderedInspectorKey: string | null = null;
+  private inspectorListening = false;
   private filterDisclosureOpen = false;
   private renderedFilterKey: string | null = null;
   private renderedActionKey: string | null = null;
   private scanOptionsDismissal: ReturnType<typeof bindFloatingDisclosure> | null = null;
-  private scanOptionsEl: HTMLDetailsElement | null = null;
+  private scanOptionsEl: HTMLElement | null = null;
   private filterDismissal: ReturnType<typeof bindFloatingDisclosure> | null = null;
   private actionDismissal: ReturnType<typeof bindFloatingDisclosure> | null = null;
-  private filterDisclosureEl: HTMLDetailsElement | null = null;
-  private actionDisclosureEl: HTMLDetailsElement | null = null;
+  private filterDisclosureEl: HTMLElement | null = null;
+  private actionDisclosureEl: HTMLElement | null = null;
+
+  private readonly onInspectorKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape" || !this.lastModel?.inspectedEntry) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.callbacks.onInspectEntry(null);
+  };
+
+  private readonly onInspectorPointerDown = (event: Event): void => {
+    if (!this.lastModel?.inspectedEntry) return;
+    let target = event.target as HTMLElement | null;
+    while (target) {
+      if (
+        target === this.inspectorEl ||
+        target.classList?.contains("vlist__row") ||
+        target.classList?.contains("action-bar") ||
+        target.classList?.contains("drawer") ||
+        target.classList?.contains("modal-backdrop")
+      ) {
+        return;
+      }
+      target = target.parentNode as HTMLElement | null;
+    }
+    this.callbacks.onInspectEntry(null);
+  };
+
+  private setInspectorListeners(active: boolean): void {
+    const canListen = typeof document.addEventListener === "function" &&
+      typeof document.removeEventListener === "function";
+    if (!canListen) return;
+    if (active && !this.inspectorListening) {
+      document.addEventListener("keydown", this.onInspectorKeyDown, true);
+      document.addEventListener("pointerdown", this.onInspectorPointerDown, true);
+      document.addEventListener("mousedown", this.onInspectorPointerDown, true);
+      this.inspectorListening = true;
+    } else if (!active && this.inspectorListening) {
+      document.removeEventListener("keydown", this.onInspectorKeyDown, true);
+      document.removeEventListener("pointerdown", this.onInspectorPointerDown, true);
+      document.removeEventListener("mousedown", this.onInspectorPointerDown, true);
+      this.inspectorListening = false;
+    }
+  }
 
   closeFloatingPanels(restoreFocus = true): void {
     const active = document.activeElement;
@@ -217,6 +331,11 @@ export class ExploreView {
     this.filterDismissal?.close(restoreFocus && containsNode(this.filterDisclosureEl ?? this.filterBar, active));
     this.actionDismissal?.close(restoreFocus && containsNode(this.actionDisclosureEl ?? this.actionBar, active));
     this.filterDisclosureOpen = false;
+    this.setInspectorListeners(false);
+    this.renderedInspectorKey = null;
+    clearChildren(this.inspectorEl);
+    this.inspectorEl.classList.add("inspector--hidden");
+    this.inspectorEl.classList.remove("inspector--open");
   }
 
   render(model: AppStateModel): void {
@@ -269,16 +388,18 @@ export class ExploreView {
     });
     this.scanBtnEl = scanBtn;
 
-    const optionsDisclosure = el("details", "scan-options");
+    const optionsDisclosure = el("div", "scan-options");
     this.scanOptionsEl = optionsDisclosure;
-    const optionsTrigger = el("summary", "scan-options__summary", "扫描选项");
+    const optionsTrigger = el("button", "scan-options__summary", "扫描选项");
+    optionsTrigger.type = "button";
+    optionsTrigger.setAttribute("aria-haspopup", "true");
     optionsTrigger.setAttribute("aria-controls", "scan-options-panel");
     optionsDisclosure.appendChild(optionsTrigger);
-    this.scanOptionsDismissal = bindFloatingDisclosure(optionsDisclosure, optionsTrigger);
     const optRow = el("div", "scan-toolbar__options");
     optRow.id = "scan-options-panel";
     optRow.setAttribute("role", "group");
     optRow.setAttribute("aria-label", "扫描选项");
+    this.scanOptionsDismissal = bindFloatingDisclosure(optionsDisclosure, optionsTrigger, optRow);
 
     const allLabel = el("label", "switch scan-option");
     const allCb = el("input");
@@ -350,12 +471,14 @@ export class ExploreView {
 
     this.root.appendChild(toolbar);
     this.root.appendChild(this.progressSlot);
-    this.root.appendChild(this.summarySlot);
-    this.root.appendChild(this.filterBar);
 
-    this.splitEl.appendChild(this.contentSlot);
-    this.splitEl.appendChild(this.inspectorEl);
+    const mainColumn = el("div", "explore-main");
+    mainColumn.appendChild(this.filterBar);
+    mainColumn.appendChild(this.contentSlot);
+    this.splitEl.appendChild(mainColumn);
+    this.splitEl.appendChild(this.sideDockEl);
     this.root.appendChild(this.splitEl);
+    this.root.appendChild(this.inspectorEl);
     this.root.appendChild(this.actionBar);
   }
 
@@ -432,13 +555,41 @@ export class ExploreView {
   }
 
   private renderSummary(model: AppStateModel): void {
-    if (this.summaryRendered === model.scanSummary) return;
+    const activeCategory = model.scanFilter.category_filter;
+    const activeExtension = model.scanFilter.extension_filter;
+    if (
+      this.summaryRendered === model.scanSummary &&
+      this.summaryCategoryRendered === activeCategory &&
+      this.summaryExtensionRendered === activeExtension &&
+      this.summaryRenderedExpandedVersion === this.summaryExpandedVersion
+    ) {
+      return;
+    }
+    if (this.summaryRendered !== model.scanSummary) {
+      this.expandedCategories.clear();
+    }
     this.summaryRendered = model.scanSummary;
+    this.summaryCategoryRendered = activeCategory;
+    this.summaryExtensionRendered = activeExtension;
+    this.summaryRenderedExpandedVersion = this.summaryExpandedVersion;
     clearChildren(this.summarySlot);
     const summary = model.scanSummary;
     if (!summary) {
+      this.sideDockEl.hidden = true;
+      this.sideDockEl.classList.remove("explore-side-dock--filtered");
+      this.summarySlot.hidden = true;
+      this.splitEl.classList.add("explore-split--single");
       return;
     }
+    const isFiltered = activeCategory !== "all" || activeExtension !== "all";
+    this.sideDockEl.hidden = false;
+    if (isFiltered) {
+      this.sideDockEl.classList.add("explore-side-dock--filtered");
+    } else {
+      this.sideDockEl.classList.remove("explore-side-dock--filtered");
+    }
+    this.summarySlot.hidden = false;
+    this.splitEl.classList.remove("explore-split--single");
 
     if (!summary.complete) {
       const reasons: string[] = [];
@@ -460,23 +611,130 @@ export class ExploreView {
       );
     }
 
-    const alloc =
-      summary.unique_allocated_bytes === null
-        ? "未知"
-        : formatBytes(summary.unique_allocated_bytes);
-    const strip = el("div", "summary-strip");
-    const metrics = [
-      ["文件", summary.files, `${summary.directories} 个目录`],
-      ["文件总大小", formatBytes(summary.logical_bytes), `去重后 ${formatBytes(summary.unique_file_logical_bytes)}`],
-      ["实际占用", alloc, `已读取 ${formatBytes(summary.content_bytes_read)}`],
-      ["重复文件组", String(summary.duplicates.length), "相同内容，集中查看"],
-    ];
-    for (const [label, value, detail] of metrics) {
-      const metric = el("div", "summary-metric");
-      metric.appendChild(el("span", "summary-metric__label", label));
-      metric.appendChild(el("strong", "summary-metric__value", value));
-      metric.appendChild(el("span", "summary-metric__detail", detail));
-      strip.appendChild(metric);
+    const strip = el("section", "category-strip");
+    strip.setAttribute("aria-label", "文件类型统计");
+    const head = el("div", "category-strip__head");
+    head.appendChild(el("span", "category-strip__title", "文件类型与后缀"));
+    if (isFiltered) {
+      const resetBtn = el("button", "btn btn--ghost btn--compact category-strip__reset", "显示全部类型");
+      resetBtn.type = "button";
+      resetBtn.addEventListener("click", () => {
+        void this.callbacks.onFilterChange({
+          category_filter: "all",
+          extension_filter: "all",
+        });
+      });
+      head.appendChild(resetBtn);
+    } else {
+      head.appendChild(el("span", "category-strip__hint", "点击类型或展开后缀筛选"));
+    }
+    strip.appendChild(head);
+
+    const categories = summary.category_counts ?? [];
+    if (categories.length === 0) {
+      strip.appendChild(el("div", "category-strip__empty", "本次扫描未发现可分类的常规文件"));
+    } else {
+      const totalFiles = categories.reduce((sum, item) => sum + item.count, 0);
+      const grid = el("div", "category-strip__list");
+      const knownCategories = new Set([
+        "document", "image", "video", "audio", "archive", "code", "installer", "other",
+      ]);
+      for (const item of categories) {
+        const safeCategory = knownCategories.has(item.category) ? item.category : "other";
+        const isCategoryActive = activeCategory === item.category;
+        const isCategoryOnlyActive = isCategoryActive && activeExtension === "all";
+        const extensions = item.extensions ?? [];
+        const isExpanded = this.expandedCategories.has(item.category);
+
+        const group = el(
+          "div",
+          `category-group category-chip--${safeCategory}${isCategoryActive ? " category-group--active" : ""}`,
+        );
+
+        const chip = el(
+          "button",
+          `category-chip category-chip--${safeCategory}${isCategoryOnlyActive ? " category-chip--active" : ""}`,
+        );
+        chip.type = "button";
+        chip.setAttribute("aria-pressed", String(isCategoryOnlyActive));
+
+        const top = el("div", "category-chip__top");
+        const nameGroup = el("span", "category-chip__name-group");
+        const dot = el("span", "category-chip__dot");
+        dot.setAttribute("aria-hidden", "true");
+        nameGroup.appendChild(dot);
+        nameGroup.appendChild(el("span", "category-chip__name", categoryLabel(item.category)));
+        top.appendChild(nameGroup);
+        top.appendChild(el("strong", "category-chip__count", `${item.count} 个`));
+        chip.appendChild(top);
+
+        const meta = el("div", "category-chip__meta");
+        meta.appendChild(el("span", "", formatBytes(item.logical_bytes)));
+        if (totalFiles > 0) {
+          const share = Math.max(1, Math.round((item.count / totalFiles) * 100));
+          meta.appendChild(el("span", "", `${share}%`));
+        }
+        chip.appendChild(meta);
+
+        chip.addEventListener("click", () => {
+          void this.callbacks.onFilterChange({
+            ...(model.scanFilter.tab === "skipped" ? { tab: "browse" as const } : {}),
+            category_filter: isCategoryOnlyActive ? "all" : item.category,
+            extension_filter: "all",
+          });
+        });
+        group.appendChild(chip);
+
+        if (extensions.length > 0) {
+          const toggleBtn = el(
+            "button",
+            "category-group__toggle",
+            `${extensions.length} 种后缀`,
+          );
+          toggleBtn.type = "button";
+          toggleBtn.setAttribute("aria-expanded", String(isExpanded));
+          toggleBtn.addEventListener("click", () => {
+            if (this.expandedCategories.has(item.category)) {
+              this.expandedCategories.delete(item.category);
+            } else {
+              this.expandedCategories.add(item.category);
+            }
+            this.summaryExpandedVersion += 1;
+            this.renderSummary(model);
+          });
+          group.appendChild(toggleBtn);
+
+          if (isExpanded) {
+            const extList = el("div", "category-ext-list");
+            for (const ext of extensions) {
+              const extKey = ext.extension === "" ? "__none__" : ext.extension;
+              const extLabel = extensionDisplayLabel(ext.extension);
+              const isExtActive = isCategoryActive && activeExtension === extKey;
+              const extBtn = el(
+                "button",
+                `ext-chip${isExtActive ? " ext-chip--active" : ""}`,
+              );
+              extBtn.type = "button";
+              extBtn.setAttribute("aria-pressed", String(isExtActive));
+              extBtn.title = `${extLabel} · ${ext.count} 个 · ${formatBytes(ext.logical_bytes)}`;
+              extBtn.appendChild(el("span", "ext-chip__name", extLabel));
+              extBtn.appendChild(el("span", "ext-chip__count", String(ext.count)));
+              extBtn.addEventListener("click", () => {
+                void this.callbacks.onFilterChange({
+                  ...(model.scanFilter.tab === "skipped" ? { tab: "browse" as const } : {}),
+                  category_filter: item.category,
+                  extension_filter: isExtActive ? "all" : extKey,
+                });
+              });
+              extList.appendChild(extBtn);
+            }
+            group.appendChild(extList);
+          }
+        }
+
+        grid.appendChild(group);
+      }
+      strip.appendChild(grid);
     }
     this.summarySlot.appendChild(strip);
 
@@ -582,29 +840,72 @@ export class ExploreView {
       this.searchInputEl = search;
       controls.appendChild(search);
 
-      const filterDisclosure = el("details", "filter-disclosure");
-      this.filterDisclosureEl = filterDisclosure;
-      filterDisclosure.open = this.filterDisclosureOpen;
-      if (this.filterDisclosureOpen) filterDisclosure.classList.add("filter-disclosure--restored");
-      filterDisclosure.addEventListener("toggle", () => {
-        if (this.filterDisclosureEl !== filterDisclosure) return;
-        this.filterDisclosureOpen = filterDisclosure.open;
-        if (!filterDisclosure.open) filterDisclosure.classList.remove("filter-disclosure--restored");
+      const showHidden = el("label", "switch");
+      showHidden.title = "目录大小包含隐藏文件；此开关只控制列表显示。";
+      const hiddenCb = el("input");
+      hiddenCb.type = "checkbox";
+      hiddenCb.setAttribute("aria-label", "显示隐藏文件");
+      hiddenCb.checked = !model.scanFilter.hide_hidden;
+      hiddenCb.addEventListener("change", () => {
+        void this.callbacks.onFilterChange({ hide_hidden: !hiddenCb.checked });
       });
-      const filterLabel = model.scanFilter.zone_filter !== "all" || !model.scanFilter.hide_hidden ? "筛选 · 已调整" : "筛选";
-      const filterTrigger = el("summary", "scan-options__summary", filterLabel);
+      showHidden.appendChild(hiddenCb);
+      showHidden.appendChild(el("span", "", "显示隐藏文件"));
+      controls.appendChild(showHidden);
+      if (model.scanFilter.hide_hidden) {
+        controls.appendChild(el("span", "item-card__sub", "目录大小包含隐藏文件"));
+      }
+      if (model.scanFilter.category_filter !== "all" || model.scanFilter.extension_filter !== "all") {
+        const parts: string[] = [];
+        if (model.scanFilter.category_filter !== "all") {
+          parts.push(categoryLabel(model.scanFilter.category_filter));
+        }
+        if (model.scanFilter.extension_filter !== "all") {
+          parts.push(extensionDisplayLabel(model.scanFilter.extension_filter));
+        }
+        const typePill = el("button", "active-type-pill", `${parts.join(" · ")} ×`);
+        typePill.type = "button";
+        typePill.title = "点击清除文件类型/后缀筛选";
+        typePill.setAttribute("aria-label", `清除筛选：${parts.join(" ")}`);
+        typePill.addEventListener("click", () => {
+          void this.callbacks.onFilterChange({
+            category_filter: "all",
+            extension_filter: "all",
+          });
+        });
+        controls.appendChild(typePill);
+      }
+
+      const filterDisclosure = el("div", "filter-disclosure");
+      this.filterDisclosureEl = filterDisclosure;
+      if (this.filterDisclosureOpen) filterDisclosure.classList.add("filter-disclosure--restored");
+      const filterLabel = model.scanFilter.zone_filter !== "all" ? "筛选 · 已调整" : "筛选";
+      const filterTrigger = el("button", "scan-options__summary", filterLabel);
+      filterTrigger.type = "button";
+      filterTrigger.setAttribute("aria-haspopup", "true");
       filterDisclosure.appendChild(filterTrigger);
-      this.filterDismissal = bindFloatingDisclosure(filterDisclosure, filterTrigger);
       const filterPanel = el("div", "filter-disclosure__panel");
+      this.filterDismissal = bindFloatingDisclosure(
+        filterDisclosure,
+        filterTrigger,
+        filterPanel,
+        this.filterDisclosureOpen,
+        (open) => {
+          if (this.filterDisclosureEl !== filterDisclosure) return;
+          this.filterDisclosureOpen = open;
+          if (!open) filterDisclosure.classList.remove("filter-disclosure--restored");
+        },
+      );
       const zoneSel = el("select", "select");
-      zoneSel.setAttribute("aria-label", "按授权区域筛选");
+      zoneSel.setAttribute("aria-label", "按访问状态筛选");
       const zones: Array<{ value: ZoneKind | "all"; label: string }> = [
         { value: "all", label: "全部区域" },
+        { value: "C_DefaultAllowed", label: "默认允许" },
         { value: "C_GrantedPersistent", label: "持久授权" },
         { value: "C_GrantedSession", label: "本次授权" },
-        { value: "B_Sensitive", label: "敏感文件" },
+        { value: "B_Sensitive", label: "敏感提示" },
         { value: "A_Protected", label: "系统保护" },
-        { value: "Unauthenticated", label: "未授权" },
+        { value: "Unauthenticated", label: "访问受限" },
       ];
       for (const z of zones) {
         const opt = el("option", "", z.label);
@@ -618,7 +919,7 @@ export class ExploreView {
         });
       });
       const zoneLabel = el("label", "inline-field");
-      zoneLabel.appendChild(el("span", "", "授权区域"));
+      zoneLabel.appendChild(el("span", "", "访问状态"));
       zoneLabel.appendChild(zoneSel);
       filterPanel.appendChild(zoneLabel);
 
@@ -639,16 +940,6 @@ export class ExploreView {
         void this.callbacks.onSortChange(sortSel.value as SortField);
       });
 
-      const hideHidden = el("label", "switch");
-      const hhCb = el("input");
-      hhCb.type = "checkbox";
-      hhCb.checked = model.scanFilter.hide_hidden;
-      hhCb.addEventListener("change", () => {
-        void this.callbacks.onFilterChange({ hide_hidden: hhCb.checked });
-      });
-      hideHidden.appendChild(hhCb);
-      hideHidden.appendChild(el("span", "", "隐藏点文件"));
-      filterPanel.appendChild(hideHidden);
       filterDisclosure.appendChild(filterPanel);
       controls.appendChild(filterDisclosure);
       controls.appendChild(sortSel);
@@ -707,13 +998,7 @@ export class ExploreView {
 
     if (structureChanged) {
       clearChildren(this.contentSlot);
-      if (tab === "browse") {
-        const treeDisclosure = el("details", "treemap-disclosure");
-        treeDisclosure.appendChild(
-          el("summary", "treemap-disclosure__summary", "空间分布（前 40 个目录）"),
-        );
-        treeDisclosure.appendChild(this.treemap.root);
-        this.contentSlot.appendChild(treeDisclosure);
+      if (tab === "browse" || tab === "top") {
         this.contentSlot.appendChild(this.virtualList.root);
       } else if (tab === "duplicates") {
         this.renderDuplicatesPanel(model);
@@ -727,16 +1012,11 @@ export class ExploreView {
           ),
         );
         this.contentSlot.appendChild(this.virtualList.root);
-      } else if (tab === "top") {
-        this.contentSlot.appendChild(this.virtualList.root);
       } else if (tab === "skipped") {
         this.renderSkippedNotice(model);
       }
     }
 
-    if (tab === "browse") {
-      this.treemap.setData(model.treemap);
-    }
     if (tab !== "skipped") {
       this.virtualList.updateSelection(model.selection, model.scanSummary.scan_generation);
     }
@@ -825,19 +1105,31 @@ export class ExploreView {
   }
 
   private renderInspector(entry: FileEntryDto | null): void {
-    clearChildren(this.inspectorEl);
     if (!entry) {
+      this.renderedInspectorKey = null;
+      this.setInspectorListeners(false);
+      clearChildren(this.inspectorEl);
       this.inspectorEl.classList.add("inspector--hidden");
-      this.splitEl.classList.add("explore-split--single");
+      this.inspectorEl.classList.remove("inspector--open");
       return;
     }
+    const key = `${entry.id}:${this.lastModel?.scanFilter.tab ?? ""}`;
+    this.setInspectorListeners(true);
+    if (this.renderedInspectorKey === key) {
+      return;
+    }
+    this.renderedInspectorKey = key;
+    clearChildren(this.inspectorEl);
     this.inspectorEl.classList.remove("inspector--hidden");
-    this.splitEl.classList.remove("explore-split--single");
+    this.inspectorEl.classList.add("inspector--open");
 
     const head = el("div", "inspector__head");
-    head.appendChild(
+    const glyphWrap = el("span", "inspector__glyph-wrap");
+    glyphWrap.setAttribute("aria-hidden", "true");
+    glyphWrap.appendChild(
       el("span", `inspector__glyph ui-icon ui-icon--${entry.kind === "directory" ? "folder" : "file"}`),
     );
+    head.appendChild(glyphWrap);
     head.appendChild(el("h3", "inspector__title", entry.name_display));
     const closeBtn = el("button", "inspector__close", "×");
     closeBtn.type = "button";
@@ -845,8 +1137,13 @@ export class ExploreView {
     closeBtn.addEventListener("click", () => this.callbacks.onInspectEntry(null));
     head.appendChild(closeBtn);
     this.inspectorEl.appendChild(head);
+
+    const badges = el("div", "inspector__badges");
+    badges.appendChild(el("span", "tag", entry.kind === "directory" ? "文件夹" : "文件"));
+    badges.appendChild(createZoneBadge(entry.policy));
+    this.inspectorEl.appendChild(badges);
+
     this.inspectorEl.appendChild(el("div", "inspector__path", entry.path_display));
-    this.inspectorEl.appendChild(createZoneBadge(entry.policy));
 
     const meta = el("dl", "inspector__kv");
     const addKv = (label: string, val: string | HTMLElement): void => {
@@ -863,11 +1160,7 @@ export class ExploreView {
       addKv("实际占用", createSizeLabel(entry.allocated_bytes));
     }
     if (entry.category) {
-      const names: Record<string, string> = {
-        document: "文档", image: "图片", video: "视频", audio: "音频",
-        archive: "压缩文件", code: "代码", installer: "安装程序", other: "其他",
-      };
-      const category = el("span", "", names[entry.category] ?? "其他");
+      const category = el("span", "", categoryLabel(entry.category));
       category.appendChild(el("span", "technical-detail", ` (${entry.category}${entry.type_evidence ? ` · ${entry.type_evidence}` : ""})`));
       addKv("类型", category);
     }
@@ -878,40 +1171,16 @@ export class ExploreView {
       this.inspectorEl.appendChild(explanation);
     }
 
-    if (entry.policy.zone === "Unauthenticated") {
-      const authBtn = el("button", "btn btn--secondary", "前往授权目录");
-      authBtn.type = "button";
-      authBtn.addEventListener("click", () => {
-        void this.callbacks.onQuickAuthorizeSelected();
+    if (entry.kind === "directory" && this.lastModel?.scanFilter.tab === "browse") {
+      const actions = el("div", "inspector__actions");
+      const drillBtn = el("button", "btn btn--primary", "进入此文件夹");
+      drillBtn.type = "button";
+      drillBtn.addEventListener("click", () => {
+        this.callbacks.onInspectEntry(null);
+        void this.callbacks.onDrillDirectory(entry.id);
       });
-      this.inspectorEl.appendChild(authBtn);
-    }
-  }
-
-  private renderTreemapInspector(node: TreemapNodeDto | null): void {
-    if (!node || !node.policy) {
-      return;
-    }
-    clearChildren(this.inspectorEl);
-    this.inspectorEl.classList.remove("inspector--hidden");
-    this.splitEl.classList.remove("explore-split--single");
-
-    const head = el("div", "inspector__head");
-    head.appendChild(el("h3", "inspector__title", node.label_display));
-    const closeBtn = el("button", "inspector__close", "×");
-    closeBtn.type = "button";
-    closeBtn.setAttribute("aria-label", "关闭详情");
-    closeBtn.addEventListener("click", () => this.callbacks.onInspectEntry(null));
-    head.appendChild(closeBtn);
-    this.inspectorEl.appendChild(head);
-    this.inspectorEl.appendChild(el("div", "inspector__path", node.path_display));
-    this.inspectorEl.appendChild(createZoneBadge(node.policy));
-    const total = el("div", "inspector__meta", "目录大小：");
-    total.appendChild(createSizeLabel(node.logical_bytes));
-    this.inspectorEl.appendChild(total);
-    const explanation = createPolicyExplanationBox(node.policy);
-    if (explanation) {
-      this.inspectorEl.appendChild(explanation);
+      actions.appendChild(drillBtn);
+      this.inspectorEl.appendChild(actions);
     }
   }
 
@@ -972,12 +1241,14 @@ export class ExploreView {
     });
     actions.appendChild(copyBtn);
 
-    const more = el("details", "action-more");
+    const more = el("div", "action-more");
     this.actionDisclosureEl = more;
-    const moreTrigger = el("summary", "btn btn--secondary", "更多操作");
+    const moreTrigger = el("button", "btn btn--secondary", "更多操作");
+    moreTrigger.type = "button";
+    moreTrigger.setAttribute("aria-haspopup", "true");
     more.appendChild(moreTrigger);
-    this.actionDismissal = bindFloatingDisclosure(more, moreTrigger);
     const menu = el("div", "action-more__menu");
+    this.actionDismissal = bindFloatingDisclosure(more, moreTrigger, menu);
 
     const renameBtn = el("button", "btn btn--secondary", "重命名…");
     renameBtn.type = "button";

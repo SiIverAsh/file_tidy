@@ -164,13 +164,13 @@ function samplePreview(overrides: Partial<PlanPreviewDto> = {}): PlanPreviewDto 
         kind: "copy",
         source_display: "/tmp/id_rsa",
         source_policy: {
-          zone: "B_Sensitive",
+          zone: "C_DefaultAllowed",
           protected: false,
           sensitive: true,
           atomic_root_display: null,
           sensitivity_reason: "sensitive_filename",
-          allowed_actions: ["copy_out"],
-          blocked_reason: "sensitive",
+          allowed_actions: [],
+          blocked_reason: null,
         },
         destination: null,
         destination_policy: null,
@@ -260,13 +260,234 @@ test("ExploreView preserves stop button across progress updates and shows phase 
   view.virtualList.destroy();
 });
 
-test("ReviewDrawer preserves itemCountInput focus across keystrokes and blocks B-zone writes", () => {
+test("ExploreView shows hidden files by default and keeps its visibility switch outside collapsed filters", () => {
+  installFakeDom();
+  const store = new AppStore();
+  store.state.scanSummary = {
+    scan_generation: "1", scanned_at_unix: "1", entries: "4", files: "2",
+    directories: "2", skipped: "0", logical_bytes: "2048",
+    unique_file_logical_bytes: "2048", unique_allocated_bytes: null,
+    content_bytes_read: "0", content_open_operations: "0", complete: true,
+    cancelled: false, limit_reached: false, top_entry_ids: [], stale_entry_ids: [],
+    duplicates: [], notices: [], root_displays: ["/work"],
+  };
+  const hiddenFilters: boolean[] = [];
+  const view = new ExploreView({
+    onPickRoots: async () => {},
+    onPickRules: async () => {},
+    onStartScan: async () => {},
+    onCancelScan: async () => {},
+    onUpdateOptions: () => {},
+    onFilterChange: async (patch) => {
+      if (patch.hide_hidden !== undefined) hiddenFilters.push(patch.hide_hidden);
+      store.updateScanFilter(patch);
+      view.render(store.state);
+    },
+    onSortChange: async () => {},
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchSkipped: async () => [],
+    onSelectionChange: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: async () => {},
+    onTriggerAction: async () => {},
+    onQuickAuthorizeSelected: async () => {},
+  });
+  view.render(store.state);
+  const root = view.root as unknown as FakeElement;
+  const checkbox = (): FakeElement => {
+    const controls = root.findAll((node) => node.getAttribute("aria-label") === "显示隐藏文件");
+    assert.equal(controls.length, 1);
+    const control = controls[0];
+    if (!control) throw new Error("expected hidden file visibility switch");
+    assert.equal(control.parentNode?.parentNode?.className, "filter-controls");
+    return control;
+  };
+  assert.equal(checkbox().checked, true);
+  checkbox().checked = false;
+  checkbox().dispatch("change");
+  assert.deepEqual(hiddenFilters, [true]);
+  assert.equal(checkbox().checked, false);
+  assert.equal(root.findAll((node) => node.textContent === "目录大小包含隐藏文件").length, 1);
+  checkbox().checked = true;
+  checkbox().dispatch("change");
+  assert.deepEqual(hiddenFilters, [true, false]);
+  assert.equal(checkbox().checked, true);
+  assert.equal(root.findAll((node) => node.textContent === "目录大小包含隐藏文件").length, 0);
+  view.virtualList.destroy();
+});
+
+test("ExploreView renders per-category file counts instead of fixed totals and filters on click", () => {
+  installFakeDom();
+  const store = new AppStore();
+  store.state.scanSummary = {
+    scan_generation: "1", scanned_at_unix: "1", entries: "15", files: "12",
+    directories: "3", skipped: "0", logical_bytes: "20480",
+    unique_file_logical_bytes: "20480", unique_allocated_bytes: null,
+    content_bytes_read: "0", content_open_operations: "0", complete: true,
+    cancelled: false, limit_reached: false, top_entry_ids: [], stale_entry_ids: [],
+    duplicates: [],
+    category_counts: [
+      {
+        category: "image",
+        count: 7,
+        logical_bytes: "14336",
+        extensions: [
+          { extension: "png", count: 5, logical_bytes: "10240" },
+          { extension: "jpg", count: 2, logical_bytes: "4096" },
+        ],
+      },
+      {
+        category: "document",
+        count: 5,
+        logical_bytes: "6144",
+        extensions: [
+          { extension: "pdf", count: 4, logical_bytes: "5120" },
+          { extension: "", count: 1, logical_bytes: "1024" },
+        ],
+      },
+    ],
+    notices: [], root_displays: ["/work"],
+  };
+  const filterPatches: Array<{ category_filter?: string; extension_filter?: string }> = [];
+  const view = new ExploreView({
+    onPickRoots: async () => {},
+    onPickRules: async () => {},
+    onStartScan: async () => {},
+    onCancelScan: async () => {},
+    onUpdateOptions: () => {},
+    onFilterChange: async (patch) => {
+      filterPatches.push({
+        ...(patch.category_filter !== undefined ? { category_filter: patch.category_filter } : {}),
+        ...(patch.extension_filter !== undefined ? { extension_filter: patch.extension_filter } : {}),
+      });
+      store.updateScanFilter(patch);
+      view.render(store.state);
+    },
+    onSortChange: async () => {},
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchSkipped: async () => [],
+    onSelectionChange: () => {},
+    onInspectEntry: () => {},
+    onDrillDirectory: async () => {},
+    onTriggerAction: async () => {},
+    onQuickAuthorizeSelected: async () => {},
+  });
+  view.render(store.state);
+  const root = view.root as unknown as FakeElement;
+
+  assert.equal(root.findAll((node) => node.className === "summary-strip").length, 0);
+  assert.equal(root.findAll((node) => node.className === "treemap-disclosure").length, 0);
+  assert.equal(root.findAll((node) => node.textContent === "文件总大小").length, 0);
+  const split = root.findAll((node) => node.className.includes("explore-split"))[0];
+  if (!split) throw new Error("expected explore-split container");
+  assert.equal(split.classList.contains("explore-split--single"), false);
+  const dock = root.findAll((node) => node.className.includes("explore-side-dock"))[0];
+  if (!dock) throw new Error("expected explore-side-dock container");
+  assert.equal(dock.parentNode, split);
+  assert.equal(dock.hidden, false);
+  const handle = root.findAll((node) => node.className === "explore-side-dock__handle")[0];
+  if (!handle) throw new Error("expected auto-hide dock handle");
+  const side = root.findAll((node) => node.className === "explore-side")[0];
+  if (!side) throw new Error("expected explore-side panel");
+  assert.equal(side.parentNode, dock);
+  assert.equal(side.hidden, false);
+  const chips = root.findAll((node) => node.className.startsWith("category-chip "));
+  assert.equal(chips.length, 2);
+  assert.equal(chips[0]?.findAll((node) => node.className === "category-chip__name")[0]?.textContent, "图片");
+  assert.equal(chips[0]?.findAll((node) => node.className === "category-chip__count")[0]?.textContent, "7 个");
+  assert.equal(root.findAll((node) => node.className.startsWith("ext-chip")).length, 0);
+
+  const toggles = root.findAll((node) => node.className === "category-group__toggle");
+  assert.equal(toggles.length, 2);
+  assert.equal(toggles[0]?.textContent, "2 种后缀");
+  toggles[0]?.dispatch("click");
+  const imgExts = root.findAll((node) => node.className.startsWith("ext-chip") && node.tagName === "BUTTON");
+  assert.equal(imgExts.length, 2);
+  assert.equal(imgExts[0]?.findAll((node) => node.className === "ext-chip__name")[0]?.textContent, ".png");
+  assert.equal(imgExts[0]?.findAll((node) => node.className === "ext-chip__count")[0]?.textContent, "5");
+
+  imgExts[0]?.dispatch("click");
+  assert.deepEqual(filterPatches[0], { category_filter: "image", extension_filter: "png" });
+  assert.equal(dock.classList.contains("explore-side-dock--filtered"), true);
+  const activePill = root.findAll((node) => node.className === "active-type-pill")[0];
+  if (!activePill) throw new Error("expected active-type-pill in filter bar");
+  assert.equal(activePill.textContent, "图片 · .png ×");
+  activePill.dispatch("click");
+  assert.deepEqual(filterPatches[1], { category_filter: "all", extension_filter: "all" });
+  assert.equal(dock.classList.contains("explore-side-dock--filtered"), false);
+
+  const docToggle = root.findAll((node) => node.className === "category-group__toggle")[1];
+  docToggle?.dispatch("click");
+  const noExtBtn = root.findAll((node) =>
+    node.className.startsWith("ext-chip") &&
+    node.tagName === "BUTTON" &&
+    node.findAll((child) => child.className === "ext-chip__name")[0]?.textContent === "无后缀"
+  )[0];
+  if (!noExtBtn) throw new Error("expected extensionless chip");
+  noExtBtn.dispatch("click");
+  assert.deepEqual(filterPatches[2], { category_filter: "document", extension_filter: "__none__" });
+
+  root.findAll((node) => node.className.startsWith("category-chip "))[0]?.dispatch("click");
+  assert.deepEqual(filterPatches[3], { category_filter: "image", extension_filter: "all" });
+  const resetBtn = root.findAll((node) => node.textContent === "显示全部类型")[0];
+  if (!resetBtn) throw new Error("expected category reset button");
+  resetBtn.dispatch("click");
+  assert.deepEqual(filterPatches[4], { category_filter: "all", extension_filter: "all" });
+  view.virtualList.destroy();
+});
+
+test("ExploreView renders inspected folder in a floating panel outside explore-split with drill action", () => {
+  installFakeDom();
+  const store = new AppStore();
+  const drilled: Array<string | null> = [];
+  const inspectedHistory: Array<FileEntryDto | null> = [];
+  const view = new ExploreView({
+    onPickRoots: async () => {},
+    onPickRules: async () => {},
+    onStartScan: async () => {},
+    onCancelScan: async () => {},
+    onUpdateOptions: () => {},
+    onFilterChange: async () => {},
+    onSortChange: async () => {},
+    onFetchWindow: async () => ({ totalCount: 0, entries: [] }),
+    onFetchSkipped: async () => [],
+    onSelectionChange: () => {},
+    onInspectEntry: (entry) => {
+      inspectedHistory.push(entry);
+      store.state.inspectedEntry = entry;
+      view.render(store.state);
+    },
+    onDrillDirectory: async (id) => {
+      drilled.push(id);
+    },
+    onTriggerAction: async () => {},
+    onQuickAuthorizeSelected: async () => {},
+  });
+
+  store.state.inspectedEntry = treeEntry("dir-1", "Photos", "directory");
+  view.render(store.state);
+
+  const root = view.root as unknown as FakeElement;
+  const inspector = root.findAll((node) => node.tagName === "ASIDE")[0];
+  if (!inspector) throw new Error("expected floating inspector aside");
+  assert.equal(inspector.parentNode, root);
+  assert.equal(inspector.classList.contains("inspector--open"), true);
+  assert.equal(inspector.classList.contains("inspector--hidden"), false);
+
+  const drillBtn = inspector.findAll((node) => node.textContent === "进入此文件夹")[0];
+  if (!drillBtn) throw new Error("expected drill-down button inside folder inspector");
+  drillBtn.dispatch("click");
+  assert.deepEqual(drilled, ["dir-1"]);
+  assert.equal(inspectedHistory[inspectedHistory.length - 1], null);
+  assert.equal(inspector.classList.contains("inspector--hidden"), true);
+  view.virtualList.destroy();
+});
+
+test("ReviewDrawer preserves count input focus and allows sensitive operations after plan confirmation", () => {
   const dom = installFakeDom();
   const store = new AppStore();
   store.state.planDrawer.open = true;
-  store.state.planDrawer.preview = samplePreview({
-    blocked_b_write_reasons: ["B 区禁止写操作"],
-  });
+  store.state.planDrawer.preview = samplePreview();
   store.state.planDrawer.selectedOpIds = new Set(["op-1"]);
 
   const drawer = new ReviewDrawer({
@@ -301,11 +522,11 @@ test("ReviewDrawer preserves itemCountInput focus across keystrokes and blocks B
   const inputsAfter = rootEl.findAll((el) => el.tagName === "INPUT" && el.type === "text");
   assert.equal(inputsAfter[0], countInput);
 
-  // Even after typing exact confirmation count, blocked_b_write_reasons keeps execute button disabled.
+  // A sensitive source does not require a separate permission step.
   const execBtns = rootEl.findAll(
     (el) => el.tagName === "BUTTON" && el.textContent === "确认并执行计划",
   );
-  assert.equal(execBtns[0]?.disabled, true);
+  assert.equal(execBtns[0]?.disabled, false);
 
   store.state.planDrawer.open = false;
   drawer.render(store.state);

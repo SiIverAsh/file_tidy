@@ -275,12 +275,29 @@ impl Session {
         scope: &QuarantineScope,
         changed: &BTreeMap<PathBuf, Stamp>,
     ) -> Result<Vec<platform::PinnedDirectory>> {
-        let root = scope.root.to_path()?;
+        let root = checked_existing(&scope.root.to_path()?, false)?;
         let policy = planning_policy()?;
-        let grant = self.grant_for(&root, &policy)?;
-        if grant.root != scope.root
-            || grant.identity != scope.identity
-            || scope.directories.len() != 4
+        // A later parent grant must not hide an existing scope's exact root.
+        // After restarting, a new covering grant may authorize that same root;
+        // the retained root identity is still independently revalidated below.
+        let exact_grant = self.grants.values().find(|grant| {
+            !grant.revoked
+                && grant.root == scope.root
+                && grant.identity == scope.identity
+                && grant.validate(&policy).is_ok()
+        });
+        if exact_grant.is_none() {
+            self.grant_for(&root, &policy)?;
+        }
+        if platform::inspect(&root)?
+            .identity
+            .map(Identity::from)
+            .as_ref()
+            != Some(&scope.identity)
+        {
+            return Err(E::ChangedSincePlan);
+        }
+        if scope.directories.len() != 4
             || policy.labels(&root).protected
             || policy.labels(&root).sensitive
             || policy.labels(&root).atomic_root.is_some()
@@ -1203,6 +1220,76 @@ mod faults {
             ..Default::default()
         };
         session.confirm(plan, confirmation)
+    }
+    #[test]
+    #[ignore = "requires independent FILE_TIDY_TEST_ROOT"]
+    fn broader_default_access_preserves_quarantine_restore_across_restart() -> TestResult {
+        let base = std::env::var_os("FILE_TIDY_TEST_ROOT").ok_or("FILE_TIDY_TEST_ROOT required")?;
+        let directory = tempfile::tempdir_in(base)?;
+        let root = directory.path().canonicalize()?;
+        let state_root = root.join("state");
+        let source_root = root.join("work/nested");
+        std::fs::create_dir_all(&state_root)?;
+        std::fs::create_dir_all(&source_root)?;
+        let mut session = Session::new()?;
+        let state_grant = session.grant(&state_root, false)?;
+        let storage_plan = session.storage_plan(&state_grant)?;
+        let digest = storage_plan.digest().to_owned();
+        session.initialize_storage(storage_plan, &digest)?;
+        let nested_grant = session.grant_default_access(&source_root)?;
+        let paths = [
+            source_root.join("first.txt"),
+            source_root.join("second.txt"),
+        ];
+        for path in &paths {
+            std::fs::write(path, b"retained fixture")?;
+        }
+        let execute = |session: &mut Session, plan: Plan| -> TestResult {
+            let confirmation = crate::approval::Confirmation {
+                digest: plan.digest().into(),
+                sensitive_acknowledgements: plan.preview().sensitive_acknowledgements.clone(),
+                ..Default::default()
+            };
+            let approved = session.confirm(plan, confirmation)?;
+            let report = session.execute_approved(approved, &CancellationToken::new())?;
+            assert!(report.completed(), "{report:?}");
+            Ok(())
+        };
+        let plan = session.build_plan(
+            paths
+                .iter()
+                .map(|path| OperationRequest {
+                    kind: OperationKind::Quarantine,
+                    source: path.clone(),
+                    destination: None,
+                })
+                .collect(),
+            PlanOptions::default(),
+        )?;
+        let items: Vec<_> = plan
+            .preview()
+            .operations
+            .iter()
+            .map(|op| op.id.clone())
+            .collect();
+        execute(&mut session, plan)?;
+        assert!(paths.iter().all(|path| !path.exists()));
+
+        let parent_grant = session.grant_default_access(&root)?;
+        assert_ne!(nested_grant, parent_grant);
+        assert!(session.grants().any(|grant| grant.id == nested_grant));
+        let restore = session.build_restore_plan(&items[..1], None, PlanOptions::default())?;
+        execute(&mut session, restore)?;
+        assert_eq!(std::fs::read(&paths[0])?, b"retained fixture");
+
+        drop(session);
+        let mut session = Session::open_writable(&state_root)?;
+        assert!(session.grants().all(|grant| !grant.is_automatic()));
+        session.grant_default_access(&root)?;
+        let restore = session.build_restore_plan(&items[1..], None, PlanOptions::default())?;
+        execute(&mut session, restore)?;
+        assert_eq!(std::fs::read(&paths[1])?, b"retained fixture");
+        Ok(())
     }
     #[test]
     #[ignore = "requires independent FILE_TIDY_TEST_ROOT"]

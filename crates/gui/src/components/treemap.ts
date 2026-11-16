@@ -193,6 +193,7 @@ export class TreemapPanel {
         return colors.danger;
       case "B_Sensitive":
         return colors.warn;
+      case "C_DefaultAllowed":
       case "C_GrantedPersistent":
       case "C_GrantedSession":
         return active ? colors.primaryHover : colors.primary;
@@ -242,16 +243,16 @@ export class TreemapPanel {
 
       if (r.w > 54 && r.h > 28) {
         ctx.fillStyle = foreground;
-        ctx.font = "12px sans-serif";
+        ctx.font = "13px sans-serif";
         const label =
           r.node.label_display.length > 16
             ? r.node.label_display.slice(0, 15) + "…"
             : r.node.label_display;
-        ctx.fillText(label, r.x + 6, r.y + 16);
+        ctx.fillText(label, r.x + 6, r.y + 17);
         if (r.h > 42) {
           ctx.fillStyle = foreground;
-          ctx.font = "11px sans-serif";
-          ctx.fillText(formatBytes(r.node.logical_bytes), r.x + 6, r.y + 32);
+          ctx.font = "12px sans-serif";
+          ctx.fillText(formatBytes(r.node.logical_bytes), r.x + 6, r.y + 34);
         }
       }
     }

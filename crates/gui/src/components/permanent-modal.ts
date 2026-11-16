@@ -135,22 +135,6 @@ export class PermanentDeleteModal {
       return;
     }
 
-    if (preview.blocked_b_write_reasons.length > 0) {
-      const err = el("div", "alert alert--error");
-      err.appendChild(
-        el(
-          "strong",
-          "",
-          "包含敏感项目，不支持永久删除：",
-        ),
-      );
-      for (const r of preview.blocked_b_write_reasons) {
-        err.appendChild(el("p", "alert__line", r));
-      }
-      body.appendChild(err);
-      return;
-    }
-
     if (preview.executable_error) {
       body.appendChild(
         el("div", "alert alert--error", preview.executable_error),
@@ -278,7 +262,7 @@ export class PermanentDeleteModal {
     const nowSec = Math.floor(Date.now() / 1000);
     if (Number(ch.expires_at_unix) <= nowSec || Number(preview.expires_at_unix) <= nowSec ||
       ch.plan_id !== preview.plan_id || ch.plan_digest !== preview.plan_digest ||
-      preview.blocked_b_write_reasons.length > 0 || preview.executable_error !== null || preview.operations.length === 0) {
+      preview.executable_error !== null || preview.operations.length === 0) {
       return false;
     }
     const expected = `${ch.expected_prefix} ${ch.confirmation_count} ${ch.challenge_code}`;

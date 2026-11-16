@@ -66,6 +66,8 @@ cargo run --locked -p file-tidy-cli -- scan --all --metadata-only
 
 Tauri 2 图形界面位于 [`crates/gui`](crates/gui/README.md)，提供文件浏览与空间分析、操作计划审核、目录授权、隔离区与执行历史。开发运行及检查命令见该目录说明。
 
+图形界面默认允许整理本地目录，子目录无需重复授权；敏感标记仅作提示，不再逐文件请求许可。执行仍需审阅计划，并在需要时核对数量或输入永久删除确认词。CLI 保留显式目录授权与敏感项许可。
+
 在 [Releases](https://github.com/SiIverAsh/file_tidy/releases) 中，图形界面安装包以 `file-tidy-gui-` 开头：macOS 下载对应芯片的 `.dmg`，Windows 下载 `-setup.exe`，Linux 下载 `.deb`。`file-tidy-cli-` 开头的压缩包和安装脚本供终端使用。已有的 `v0.1.0` Release 仅包含 CLI；GUI 安装包将在使用新发布流程的版本中提供。
 
 macOS 安装包暂使用临时签名，尚未经过 Apple Developer ID 签名和公证。确认来源可信后，可在“系统设置 → 隐私与安全性”中选择“仍要打开”。

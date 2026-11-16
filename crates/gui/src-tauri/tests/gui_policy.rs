@@ -10,7 +10,7 @@ use file_tidy_gui::commands::{
 };
 use file_tidy_gui::dto::{
     BuildPlanRequest, ConfirmAndExecuteInput, PlanActionKindDto, QueryScanEntriesRequest,
-    ScanFilter, ScanTab, SelectionSpec, SortField, to_plan_preview_dto,
+    ScanFilter, ScanTab, SelectionSpec, SortField, ZoneKind, to_plan_preview_dto,
 };
 use file_tidy_gui::error::GuiError;
 use file_tidy_gui::state::{AppState, PERMANENT_CHALLENGE_TTL_SECS, generate_challenge_code};
@@ -58,7 +58,7 @@ fn tauri_csp_forbids_inline_styles_and_unsafe_directives() -> TestResult {
     any(target_os = "macos", windows),
     ignore = "requires independent FILE_TIDY_TEST_ROOT"
 )]
-fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult {
+fn sensitivity_is_advisory_inside_parent_directory_grants() -> TestResult {
     let tmp_root = match std::env::var_os("FILE_TIDY_TEST_ROOT") {
         Some(root) => PathBuf::from(root),
         None => std::env::temp_dir(),
@@ -74,7 +74,8 @@ fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult 
     std::fs::create_dir_all(&src_dir)?;
     std::fs::create_dir_all(&dst_dir)?;
 
-    let secret = src_dir.join(".env");
+    std::fs::create_dir_all(src_dir.join("nested"))?;
+    let secret = src_dir.join("nested").join(".env");
     std::fs::write(&secret, b"SECRET=1")?;
     let public = src_dir.join("public.txt");
     std::fs::write(&public, b"ordinary file")?;
@@ -83,7 +84,7 @@ fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult 
     session.grant(&dst_dir, false)?;
     session.grant(&src_dir, false)?;
 
-    // 1) Copy out from B -> non-B C: exposes :content ack and zero blocked_b_write_reasons
+    // Parent authorization covers sensitive descendants without extra prompts.
     let copy_plan = session.build_plan(
         vec![OperationRequest {
             kind: OperationKind::Copy,
@@ -97,13 +98,19 @@ fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult 
     )?;
     let copy_dto = to_plan_preview_dto(&copy_plan, &session);
     assert!(copy_dto.blocked_b_write_reasons.is_empty());
-    assert_eq!(copy_dto.sensitive_acknowledgements.len(), 1);
+    assert!(copy_dto.sensitive_acknowledgements.is_empty());
     assert_eq!(
-        copy_dto.sensitive_acknowledgements[0].kind,
-        "copy_out_content"
+        copy_dto.operations[0].source_policy.zone,
+        ZoneKind::CGrantedSession
+    );
+    assert!(
+        copy_dto.operations[0]
+            .source_policy
+            .blocked_reason
+            .is_none()
     );
 
-    // 2) Move touching B: core allows inside C with :write, GUI policy MUST block it
+    // Sensitivity remains visible without preventing a reviewed move.
     let move_plan = session.build_plan(
         vec![OperationRequest {
             kind: OperationKind::Move,
@@ -116,12 +123,17 @@ fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult 
         },
     )?;
     let move_dto = to_plan_preview_dto(&move_plan, &session);
+    assert!(move_dto.blocked_b_write_reasons.is_empty());
+    assert!(move_dto.sensitive_acknowledgements.is_empty());
+    assert!(move_dto.operations[0].source_policy.sensitive);
     assert!(
-        !move_dto.blocked_b_write_reasons.is_empty(),
-        "B-zone write must be blocked in GUI policy"
+        move_dto.operations[0]
+            .source_policy
+            .blocked_reason
+            .is_none()
     );
 
-    // 3) An ordinary source still cannot be copied to a new sensitive target name.
+    // A new sensitive target name is also advisory.
     let sensitive_target = dst_dir.join("credentials.json");
     assert!(!sensitive_target.exists());
     let sensitive_target_plan = session.build_plan(
@@ -133,10 +145,8 @@ fn b_zone_copy_out_exposes_content_ack_while_b_write_is_blocked() -> TestResult 
         PlanOptions::default(),
     )?;
     let sensitive_target_dto = to_plan_preview_dto(&sensitive_target_plan, &session);
-    assert!(
-        !sensitive_target_dto.blocked_b_write_reasons.is_empty(),
-        "a missing sensitive destination must remain blocked"
-    );
+    assert!(sensitive_target_dto.blocked_b_write_reasons.is_empty());
+    assert!(sensitive_target_dto.sensitive_acknowledgements.is_empty());
     assert!(
         sensitive_target_dto.operations[0]
             .destination_policy
@@ -181,7 +191,7 @@ fn app_manifest_and_capabilities_stay_in_sync() -> TestResult {
 }
 
 #[test]
-fn confirm_and_execute_rejects_write_acknowledgements_directly() -> TestResult {
+fn confirm_and_execute_requires_an_active_reviewed_plan() -> TestResult {
     let state = AppState::new()?;
     let input = ConfirmAndExecuteInput {
         plan_id: "01".to_owned(),
@@ -191,7 +201,7 @@ fn confirm_and_execute_rejects_write_acknowledgements_directly() -> TestResult {
         permanent_challenge_input: None,
     };
     let res = tauri::async_runtime::block_on(confirm_and_execute_inner(&state, input, None));
-    assert!(matches!(res, Err(GuiError::Rejected(_))));
+    assert!(matches!(res, Err(GuiError::PlanMismatch)));
     assert!(
         !state.exec_in_flight.load(Ordering::SeqCst),
         "exec_in_flight slot guard must reset on rejection"
@@ -208,6 +218,7 @@ fn query_and_treemap_reject_stale_scan_generation() -> TestResult {
         search_text: String::new(),
         zone_filter: "all".to_owned(),
         category_filter: String::new(),
+        extension_filter: "all".to_owned(),
         hide_hidden: false,
         duplicate_group_id: None,
         skip_reason_filter: String::new(),
@@ -252,7 +263,11 @@ fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -
     std::fs::create_dir_all(base_raw.join("beta"))?;
     std::fs::write(nested_raw.join("nested.txt"), b"nested")?;
     std::fs::write(base_raw.join("alpha").join("direct.txt"), b"direct")?;
-    std::fs::write(base_raw.join("beta").join("other.txt"), b"other")?;
+    std::fs::write(
+        base_raw.join("beta").join("other.txt"),
+        b"other file with data",
+    )?;
+    std::fs::create_dir_all(base_raw.join("beta").join("empty"))?;
     let base = std::fs::canonicalize(&base_raw)?;
     let state = AppState::new()?;
     *state.pending_roots.lock().map_err(|_| "lock poisoned")? = vec![
@@ -291,8 +306,24 @@ fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -
     assert!(!flat_request.tree_roots_only, "legacy requests remain flat");
     let flat = tauri::async_runtime::block_on(query_scan_entries_inner(&state, flat_request))?;
     assert_eq!(
-        flat.total_count, 6,
+        flat.total_count, 7,
         "all scanned entries stay in flat queries"
+    );
+    assert_eq!(
+        flat.entries
+            .iter()
+            .find(|entry| entry.name_display == "empty")
+            .ok_or("empty directory missing")?
+            .size_bytes,
+        "0"
+    );
+    assert_eq!(
+        flat.entries
+            .iter()
+            .find(|entry| entry.name_display == "other.txt")
+            .ok_or("ordinary file missing")?
+            .size_bytes,
+        "20"
     );
 
     let mut root_request: QueryScanEntriesRequest = serde_json::from_value(request_json.clone())?;
@@ -303,6 +334,10 @@ fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -
     assert_eq!(first_page.total_count, 2);
     assert_eq!(first_page.entries.len(), 1);
     assert_eq!(first_page.entries[0].name_display, "alpha");
+    assert_eq!(
+        first_page.entries[0].size_bytes, "12",
+        "nested scan roots must not double-count files"
+    );
 
     let mut second_request: QueryScanEntriesRequest = serde_json::from_value(request_json.clone())?;
     second_request.tree_roots_only = true;
@@ -312,6 +347,20 @@ fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -
         tauri::async_runtime::block_on(query_scan_entries_inner(&state, second_request))?;
     assert_eq!(second_page.total_count, 2);
     assert_eq!(second_page.entries[0].name_display, "beta");
+    assert_eq!(second_page.entries[0].size_bytes, "20");
+
+    for (offset, expected_name, expected_size) in [(0, "beta", "20"), (1, "alpha", "12")] {
+        let mut sorted_request: QueryScanEntriesRequest =
+            serde_json::from_value(request_json.clone())?;
+        sorted_request.tree_roots_only = true;
+        sorted_request.sort = SortField::SizeDesc;
+        sorted_request.offset = offset;
+        sorted_request.limit = 1;
+        let page =
+            tauri::async_runtime::block_on(query_scan_entries_inner(&state, sorted_request))?;
+        assert_eq!(page.entries[0].name_display, expected_name);
+        assert_eq!(page.entries[0].size_bytes, expected_size);
+    }
 
     let mut child_request: QueryScanEntriesRequest = serde_json::from_value(request_json)?;
     child_request.tree_roots_only = true;
@@ -326,6 +375,7 @@ fn tree_queries_page_roots_and_expand_children_without_changing_flat_queries() -
             .collect::<Vec<_>>(),
         vec!["direct.txt", "nested"]
     );
+    assert!(children.entries.iter().all(|entry| entry.size_bytes == "6"));
     let treemap = tauri::async_runtime::block_on(get_treemap_nodes_inner(
         &state,
         summary.scan_generation,
@@ -410,6 +460,7 @@ fn hidden_directory_descendants_are_excluded_from_flat_and_child_queries() -> Te
                     search_text: String::new(),
                     zone_filter: "all".to_owned(),
                     category_filter: "all".to_owned(),
+                    extension_filter: "all".to_owned(),
                     hide_hidden,
                     duplicate_group_id: None,
                     skip_reason_filter: "all".to_owned(),
@@ -469,18 +520,21 @@ fn multi_selection_copy_and_move_keep_names_inside_selected_destination() -> Tes
         std::fs::create_dir_all(&state_root)?;
         std::fs::write(scan_root.join("first.txt"), b"first file")?;
         std::fs::write(scan_root.join("second.txt"), b"second file")?;
+        let tree = scan_root.join("tree");
+        std::fs::create_dir_all(tree.join("nested"))?;
+        std::fs::write(tree.join("nested").join("child.txt"), b"nested file")?;
+        std::fs::write(tree.join(".env"), b"TREE_SECRET=1")?;
 
         let state = AppState::new()?;
-        let dst_grant_id = tauri::async_runtime::block_on(async {
+        tauri::async_runtime::block_on(async {
             let mut session = state.session.lock().await;
             let state_gid = session.grant(&state_root, false)?;
             let storage_plan = session.storage_plan(&state_gid)?;
             let digest = storage_plan.digest().to_owned();
             session.initialize_storage(storage_plan, &digest)?;
-            session.grant(&scan_root, false)?;
-            let dst_gid = session.grant(&dst_root, false)?;
-            Ok::<String, GuiError>(dst_gid.to_string())
+            Ok::<(), GuiError>(())
         })?;
+        let dst_grant_id = format!("picked-{case}-destination");
         *state.pending_roots.lock().map_err(|_| "lock poisoned")? = vec![scan_root.clone()];
         state
             .picked_destinations
@@ -500,6 +554,89 @@ fn multi_selection_copy_and_move_keep_names_inside_selected_destination() -> Tes
             None,
         ))?;
         let (_, report) = state.snapshot_scan(&summary.scan_generation)?;
+
+        if case == "move" {
+            let child_id = report
+                .entries
+                .iter()
+                .find(|entry| entry.path == tree.join("nested").join("child.txt"))
+                .ok_or("nested child missing")?
+                .id
+                .to_string();
+            let tree_id = report
+                .entries
+                .iter()
+                .find(|entry| entry.path == tree)
+                .ok_or("parent tree missing")?
+                .id
+                .to_string();
+            // A child operation creates a narrow automatic scope. A subsequent
+            // parent move must cover the entire tree without another grant.
+            let rename = tauri::async_runtime::block_on(build_plan_from_selection_inner(
+                &state,
+                BuildPlanRequest {
+                    kind: PlanActionKindDto::Rename,
+                    selection: SelectionSpec::Ids {
+                        scan_generation: summary.scan_generation.clone(),
+                        ids: vec![child_id],
+                    },
+                    destination_grant_id: None,
+                    destination_relative_name: Some("renamed.txt".to_owned()),
+                    include_hidden: true,
+                    quarantine_retention_days: 30,
+                },
+            ))?;
+            let renamed = tauri::async_runtime::block_on(confirm_and_execute_inner(
+                &state,
+                ConfirmAndExecuteInput {
+                    plan_id: rename.plan_id,
+                    plan_digest: rename.plan_digest,
+                    item_count: None,
+                    sensitive_acknowledgements: Vec::new(),
+                    permanent_challenge_input: None,
+                },
+                None,
+            ))?;
+            assert!(renamed.completed);
+            let parent_move = tauri::async_runtime::block_on(build_plan_from_selection_inner(
+                &state,
+                BuildPlanRequest {
+                    kind: PlanActionKindDto::Move,
+                    selection: SelectionSpec::Ids {
+                        scan_generation: summary.scan_generation.clone(),
+                        ids: vec![tree_id],
+                    },
+                    destination_grant_id: Some(dst_grant_id.clone()),
+                    destination_relative_name: None,
+                    include_hidden: true,
+                    quarantine_retention_days: 30,
+                },
+            ))?;
+            assert!(parent_move.sensitive_acknowledgements.is_empty());
+            assert!(parent_move.blocked_b_write_reasons.is_empty());
+            let moved = tauri::async_runtime::block_on(confirm_and_execute_inner(
+                &state,
+                ConfirmAndExecuteInput {
+                    plan_id: parent_move.plan_id,
+                    plan_digest: parent_move.plan_digest,
+                    item_count: None,
+                    sensitive_acknowledgements: Vec::new(),
+                    permanent_challenge_input: None,
+                },
+                None,
+            ))?;
+            assert!(moved.completed);
+            assert!(!tree.exists());
+            assert_eq!(
+                std::fs::read(dst_root.join("tree").join(".env"))?,
+                b"TREE_SECRET=1"
+            );
+            assert_eq!(
+                std::fs::read(dst_root.join("tree").join("nested").join("renamed.txt"))?,
+                b"nested file"
+            );
+        }
+
         let ids = report
             .entries
             .iter()
@@ -571,7 +708,7 @@ fn multi_selection_copy_and_move_keep_names_inside_selected_destination() -> Tes
     any(target_os = "macos", windows),
     ignore = "requires independent FILE_TIDY_TEST_ROOT"
 )]
-fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> TestResult {
+fn default_access_handles_sensitive_copy_move_and_permanent_challenge_lifecycle() -> TestResult {
     let tmp_root = match std::env::var_os("FILE_TIDY_TEST_ROOT") {
         Some(root) => PathBuf::from(root),
         None => std::env::temp_dir(),
@@ -590,7 +727,7 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
     std::fs::create_dir_all(&dst_root)?;
     std::fs::create_dir_all(&state_root)?;
 
-    // A file under a sensitive directory can be copied to a non-sensitive destination.
+    // Sensitive source paths remain usable without manual directory grants.
     let sensitive_dir = scan_root.join(".ssh");
     std::fs::create_dir_all(&sensitive_dir)?;
     let secret_file = sensitive_dir.join("secret.txt");
@@ -601,16 +738,15 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
     std::fs::write(&purge_file, b"delete me permanently")?;
 
     let state = AppState::new()?;
-    let dst_grant_id = tauri::async_runtime::block_on(async {
+    tauri::async_runtime::block_on(async {
         let mut session = state.session.lock().await;
         let state_gid = session.grant(&state_root, false)?;
         let sp = session.storage_plan(&state_gid)?;
         let digest = sp.digest().to_owned();
         session.initialize_storage(sp, &digest)?;
-        session.grant(&scan_root, false)?;
-        let dst_gid = session.grant(&dst_root, false)?;
-        Ok::<String, GuiError>(dst_gid.to_string())
+        Ok::<(), GuiError>(())
     })?;
+    let dst_grant_id = "picked-sensitive-destination".to_owned();
 
     {
         let mut roots = state.pending_roots.lock().map_err(|_| "lock poisoned")?;
@@ -644,6 +780,7 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
         search_text: String::new(),
         zone_filter: "all".to_owned(),
         category_filter: "all".to_owned(),
+        extension_filter: "all".to_owned(),
         hide_hidden: false,
         duplicate_group_id: None,
         skip_reason_filter: String::new(),
@@ -683,11 +820,40 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
         .find(|e| e.name_display == "trash.tmp")
         .ok_or("trash.tmp entry missing")?;
 
-    // Verify B-zone exposure in DTO
+    // Sensitivity is advisory and normal paths are allowed before any grants.
     assert!(secret_entry.policy.sensitive);
-    assert!(secret_entry.policy.blocked_reason.is_some());
+    assert!(secret_entry.policy.blocked_reason.is_none());
+    assert_eq!(secret_entry.policy.zone, ZoneKind::CDefaultAllowed);
+    assert_eq!(keep_entry.policy.zone, ZoneKind::CDefaultAllowed);
 
-    // 2) Copy out B-zone file (`.ssh/secret.txt` -> `dst_root/secret.txt`) succeeds with :content ack
+    let sensitive_entries = tauri::async_runtime::block_on(query_scan_entries_inner(
+        &state,
+        QueryScanEntriesRequest {
+            scan_generation: summary.scan_generation.clone(),
+            filter: ScanFilter {
+                zone_filter: "B_Sensitive".to_owned(),
+                ..browse_filter.clone()
+            },
+            sort: SortField::NameAsc,
+            offset: 0,
+            limit: 50,
+            tree_roots_only: false,
+        },
+    ))?;
+    assert!(
+        sensitive_entries
+            .entries
+            .iter()
+            .any(|entry| entry.id == secret_entry.id)
+    );
+    assert!(
+        sensitive_entries
+            .entries
+            .iter()
+            .all(|entry| entry.policy.sensitive && entry.policy.blocked_reason.is_none())
+    );
+
+    // 2) A sensitive file copy succeeds with the normal plan confirmation.
     let copy_preview = tauri::async_runtime::block_on(build_plan_from_selection_inner(
         &state,
         BuildPlanRequest {
@@ -703,19 +869,14 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
         },
     ))?;
     assert!(copy_preview.blocked_b_write_reasons.is_empty());
-    assert_eq!(copy_preview.sensitive_acknowledgements.len(), 1);
-    let ack_keys: Vec<String> = copy_preview
-        .sensitive_acknowledgements
-        .iter()
-        .map(|a| a.key.clone())
-        .collect();
+    assert!(copy_preview.sensitive_acknowledgements.is_empty());
     let copy_report = tauri::async_runtime::block_on(confirm_and_execute_inner(
         &state,
         ConfirmAndExecuteInput {
             plan_id: copy_preview.plan_id,
             plan_digest: copy_preview.plan_digest,
             item_count: None,
-            sensitive_acknowledgements: ack_keys,
+            sensitive_acknowledgements: Vec::new(),
             permanent_challenge_input: None,
         },
         None,
@@ -726,7 +887,7 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
         b"PRIVATE-KEY-BYTES"
     );
 
-    // 3) Move touching Zone B (`.ssh/secret.txt`) is rejected both in preview AND on confirm_and_execute
+    // 3) Moving that sensitive file also succeeds without per-file permission.
     let move_preview = tauri::async_runtime::block_on(build_plan_from_selection_inner(
         &state,
         BuildPlanRequest {
@@ -741,7 +902,8 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
             quarantine_retention_days: 30,
         },
     ))?;
-    assert!(!move_preview.blocked_b_write_reasons.is_empty());
+    assert!(move_preview.blocked_b_write_reasons.is_empty());
+    assert!(move_preview.sensitive_acknowledgements.is_empty());
     let move_exec = tauri::async_runtime::block_on(confirm_and_execute_inner(
         &state,
         ConfirmAndExecuteInput {
@@ -752,11 +914,15 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
             permanent_challenge_input: None,
         },
         None,
-    ));
-    assert!(matches!(move_exec, Err(GuiError::Rejected(_))));
-    assert!(secret_file.exists());
+    ))?;
+    assert!(move_exec.completed);
+    assert!(!secret_file.exists());
+    assert_eq!(
+        std::fs::read(dst_root.join("secret (1).txt"))?,
+        b"PRIVATE-KEY-BYTES"
+    );
 
-    // 4) SelectionSpec::Filtered with excludes targeting only C-zone `trash.tmp`
+    // 4) Filtered selection and permanent-delete challenges retain their checks.
     let purge_filter = ScanFilter {
         search_text: ".tmp".to_owned(),
         ..browse_filter
@@ -857,5 +1023,123 @@ fn end_to_end_scan_selection_copy_out_and_permanent_challenge_lifecycle() -> Tes
     assert!(keep_file.exists());
 
     let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+#[test]
+fn scan_summary_reports_per_category_file_counts_excluding_directories() -> TestResult {
+    let base_raw = std::env::current_dir()?
+        .join("target")
+        .join("category-summary-fixtures")
+        .join(format!(
+            "run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+    let sub = base_raw.join("assets");
+    std::fs::create_dir_all(&sub)?;
+    std::fs::write(base_raw.join("notes.txt"), b"hello")?;
+    std::fs::write(base_raw.join("readme.pdf"), b"world!")?;
+    std::fs::write(sub.join("photo.png"), b"imgdata")?;
+    std::fs::write(sub.join("main.rs"), b"fn main() {}")?;
+    std::fs::write(sub.join("Makefile"), b"all:")?;
+
+    let base = std::fs::canonicalize(&base_raw)?;
+    let state = AppState::new()?;
+    *state.pending_roots.lock().map_err(|_| "lock poisoned")? = vec![base.clone()];
+
+    let summary = tauri::async_runtime::block_on(start_scan_inner(
+        &state,
+        StartScanRequest {
+            all_volumes: false,
+            metadata_only: true,
+            no_duplicates: true,
+            stale_days: 30,
+            max_entries: 100,
+        },
+        None,
+    ))?;
+
+    let by_cat: std::collections::BTreeMap<&str, (u64, &str)> = summary
+        .category_counts
+        .iter()
+        .map(|item| (item.category, (item.count, item.logical_bytes.as_str())))
+        .collect();
+    assert_eq!(by_cat.get("document"), Some(&(2, "11")));
+    assert_eq!(by_cat.get("image"), Some(&(1, "7")));
+    assert_eq!(by_cat.get("code"), Some(&(1, "12")));
+    assert_eq!(by_cat.get("other"), Some(&(1, "4")));
+    assert_eq!(summary.category_counts.iter().map(|c| c.count).sum::<u64>(), 5);
+
+    let doc_cat = summary
+        .category_counts
+        .iter()
+        .find(|item| item.category == "document")
+        .ok_or("missing document category")?;
+    assert_eq!(doc_cat.extensions.len(), 2);
+    assert!(
+        doc_cat
+            .extensions
+            .iter()
+            .any(|ext| ext.extension == "txt" && ext.count == 1)
+    );
+    assert!(
+        doc_cat
+            .extensions
+            .iter()
+            .any(|ext| ext.extension == "pdf" && ext.count == 1)
+    );
+
+    let pdf_only = tauri::async_runtime::block_on(query_scan_entries_inner(
+        &state,
+        QueryScanEntriesRequest {
+            scan_generation: summary.scan_generation.clone(),
+            filter: ScanFilter {
+                tab: ScanTab::Browse,
+                parent_entry_id: None,
+                search_text: String::new(),
+                zone_filter: "all".to_owned(),
+                category_filter: "document".to_owned(),
+                extension_filter: "pdf".to_owned(),
+                hide_hidden: false,
+                duplicate_group_id: None,
+                skip_reason_filter: "all".to_owned(),
+            },
+            sort: SortField::NameAsc,
+            offset: 0,
+            limit: 20,
+            tree_roots_only: false,
+        },
+    ))?;
+    assert_eq!(pdf_only.total_count, 1);
+    assert_eq!(pdf_only.entries[0].name_display, "readme.pdf");
+
+    let no_ext_only = tauri::async_runtime::block_on(query_scan_entries_inner(
+        &state,
+        QueryScanEntriesRequest {
+            scan_generation: summary.scan_generation,
+            filter: ScanFilter {
+                tab: ScanTab::Browse,
+                parent_entry_id: None,
+                search_text: String::new(),
+                zone_filter: "all".to_owned(),
+                category_filter: "all".to_owned(),
+                extension_filter: "__none__".to_owned(),
+                hide_hidden: false,
+                duplicate_group_id: None,
+                skip_reason_filter: "all".to_owned(),
+            },
+            sort: SortField::NameAsc,
+            offset: 0,
+            limit: 20,
+            tree_roots_only: false,
+        },
+    ))?;
+    assert_eq!(no_ext_only.total_count, 1);
+    assert_eq!(no_ext_only.entries[0].name_display, "Makefile");
+
+    let _ = std::fs::remove_dir_all(&base_raw);
     Ok(())
 }

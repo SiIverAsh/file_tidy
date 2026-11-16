@@ -42,6 +42,7 @@ test("Tree browsing is enabled by the default filter and keeps filtered searches
   assert.equal(isTreeBrowseFilter({ ...filter, search_text: "report" }), false);
   assert.equal(isTreeBrowseFilter({ ...filter, zone_filter: "B_Sensitive" }), false);
   assert.equal(isTreeBrowseFilter({ ...filter, category_filter: "document" }), false);
+  assert.equal(isTreeBrowseFilter({ ...filter, extension_filter: "rs" }), false);
   assert.equal(isTreeBrowseFilter({ ...filter, parent_entry_id: "folder" }), false);
   assert.equal(isTreeBrowseFilter({ ...filter, tab: "duplicates" }), false);
 });

@@ -151,22 +151,6 @@ export class ReviewDrawer {
     stats.appendChild(size);
     body.appendChild(stats);
 
-    // Explicit B-zone write rejection callout (never confirmable!)
-    if (preview.blocked_b_write_reasons.length > 0) {
-      const bAlert = el("div", "alert alert--error");
-      bAlert.appendChild(
-        el(
-          "strong",
-          "",
-          "以下敏感项目不支持写入或删除，只能复制到已授权目录：",
-        ),
-      );
-      for (const reason of preview.blocked_b_write_reasons) {
-        bAlert.appendChild(el("p", "alert__line", reason));
-      }
-      body.appendChild(bAlert);
-    }
-
     if (preview.executable_error) {
       body.appendChild(
         el("div", "alert alert--error", preview.executable_error),
@@ -179,30 +163,6 @@ export class ReviewDrawer {
       opsWrap.appendChild(this.renderOperationCard(op, preview, drawer.selectedOpIds, drawer.executing));
     }
     body.appendChild(opsWrap);
-
-    // B-zone Copy-Out Content Read Acknowledgements (strictly copy-out only, no "Select All")
-    if (preview.sensitive_acknowledgements.length > 0) {
-      const bSection = el("div", "confirm-section confirm-section--warn");
-      bSection.appendChild(
-        el(
-          "h3",
-          "confirm-section__title",
-          "敏感文件复制确认",
-        ),
-      );
-      for (const ack of preview.sensitive_acknowledgements) {
-        const label = el("label", "ack-row");
-        const cb = el("input");
-        cb.type = "checkbox";
-        cb.checked = drawer.acknowledgedContentKeys.has(ack.key);
-        cb.disabled = drawer.executing;
-        cb.addEventListener("change", () => this.callbacks.onToggleAckKey(ack.key));
-        label.appendChild(cb);
-        label.appendChild(el("span", "ack-row__text", ack.description));
-        bSection.appendChild(label);
-      }
-      body.appendChild(bSection);
-    }
 
     // Large plan count confirmation
     if (preview.requires_count_confirmation) {
@@ -257,7 +217,7 @@ export class ReviewDrawer {
     drawer: AppStateModel["planDrawer"],
   ): boolean {
     if (!drawer.open || drawer.loading || drawer.executing) return false;
-    if (preview.blocked_b_write_reasons.length > 0 || preview.executable_error !== null) {
+    if (preview.executable_error !== null) {
       return false;
     }
     if (preview.operations.length === 0) {
@@ -272,11 +232,6 @@ export class ReviewDrawer {
       drawer.itemCountInput.trim() !== preview.confirmation_count
     ) {
       return false;
-    }
-    for (const ack of preview.sensitive_acknowledgements) {
-      if (!drawer.acknowledgedContentKeys.has(ack.key)) {
-        return false;
-      }
     }
     return true;
   }
@@ -410,7 +365,7 @@ export class ReviewDrawer {
         row.appendChild(el("span", "tag tag--muted", "隐藏"));
       }
       if (item.sensitive) {
-        const reason = describeSensitivityReason(item.sensitivity_reason) ?? "敏感受保护项";
+        const reason = describeSensitivityReason(item.sensitivity_reason) ?? "敏感标记";
         row.appendChild(el("span", "tag tag--warn", `敏感：${reason}`));
       }
       if (item.link_target_display) {

@@ -100,7 +100,8 @@ export function defaultFilter(): ScanFilter {
     search_text: "",
     zone_filter: "all",
     category_filter: "all",
-    hide_hidden: true,
+    extension_filter: "all",
+    hide_hidden: false,
     duplicate_group_id: null,
     skip_reason_filter: "all",
   };
@@ -261,6 +262,16 @@ export class AppStore {
 
   constructor() {
     this.state = createInitialState();
+  }
+
+  clearScanResults(): void {
+    this.state.scanSummary = null;
+    this.state.scanProgress = null;
+    this.state.scanFilter = defaultFilter();
+    this.state.selection = clearSelection("0");
+    this.state.totalFilteredCount = 0;
+    this.state.treemap = null;
+    this.state.inspectedEntry = null;
   }
 
   updateScanFilter(patch: Partial<ScanFilter>): void {

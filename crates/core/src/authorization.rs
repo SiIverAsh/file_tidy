@@ -190,6 +190,8 @@ pub struct Grant {
     pub(crate) mount: NativePath,
     pub(crate) persistent: bool,
     pub(crate) revoked: bool,
+    #[serde(skip)]
+    pub(crate) automatic: bool,
 }
 impl Grant {
     pub fn id(&self) -> &Id {
@@ -204,6 +206,9 @@ impl Grant {
     pub fn is_revoked(&self) -> bool {
         self.revoked
     }
+    pub fn is_automatic(&self) -> bool {
+        self.automatic
+    }
     pub(crate) fn validate(&self, policy: &Policy) -> Result<PathBuf> {
         if self.revoked {
             return Err(PlanningError::OutsideGrant);
@@ -215,7 +220,7 @@ impl Grant {
         {
             return Err(PlanningError::ChangedSincePlan);
         }
-        if policy.labels(&root).protected {
+        if policy.labels(&root).protected && !(self.automatic && root == self.mount.to_path()?) {
             return Err(PlanningError::ProtectedZone);
         }
         let location = file_tidy_platform::classify_location(&root)?;
@@ -246,6 +251,9 @@ impl Session {
     pub fn grants(&self) -> impl Iterator<Item = &Grant> {
         self.grants.values()
     }
+    pub fn authorization_epoch(&self) -> u64 {
+        self.epoch
+    }
     pub fn preview_grant(path: &Path) -> Result<Grant> {
         let mut session = Self::new()?;
         let id = session.grant(path, false)?;
@@ -262,8 +270,17 @@ impl Session {
         if let Some(existing) = self
             .grants
             .values()
-            .find(|g| !g.revoked && g.identity == review.identity)
+            .find(|g| !g.revoked && g.identity == review.identity && g.root == review.root)
         {
+            if existing.automatic {
+                let id = existing.id.clone();
+                let mut next = self.grants.clone();
+                let grant = next.get_mut(&id).ok_or(PlanningError::InvalidRequest)?;
+                grant.automatic = false;
+                grant.persistent = persistent;
+                self.update_grants(next)?;
+                return Ok(id);
+            }
             if !persistent || existing.persistent {
                 return Ok(existing.id.clone());
             }
@@ -304,8 +321,20 @@ impl Session {
         if let Some(existing) = self
             .grants
             .values()
-            .find(|g| !g.revoked && g.identity == identity)
+            .find(|g| !g.revoked && g.identity == identity && g.root == NativePath::new(&root))
         {
+            if existing.automatic {
+                if persistent && self.store.is_none() {
+                    return Err(PlanningError::StorageRequired);
+                }
+                let id = existing.id.clone();
+                let mut next = self.grants.clone();
+                let grant = next.get_mut(&id).ok_or(PlanningError::InvalidRequest)?;
+                grant.automatic = false;
+                grant.persistent = persistent;
+                self.update_grants(next)?;
+                return Ok(id);
+            }
             if !persistent || existing.persistent {
                 return Ok(existing.id.clone());
             }
@@ -325,6 +354,55 @@ impl Session {
             mount: NativePath::new(&location.mount_root),
             persistent,
             revoked: false,
+            automatic: false,
+        };
+        let mut next = self.grants.clone();
+        next.insert(id.clone(), grant);
+        self.update_grants(next)?;
+        Ok(id)
+    }
+    /// Admit a directory selected by the desktop workflow without a separate
+    /// permission dialog. The grant stays local to this session; OS permissions
+    /// and all per-operation filesystem checks still apply.
+    pub fn grant_default_access(&mut self, path: &Path) -> Result<Id> {
+        let policy = planning_policy()?;
+        let mut root = checked_existing(path, false)?;
+        let location = file_tidy_platform::classify_location(&root)?;
+        loop {
+            let labels = policy.labels(&root);
+            if labels.protected && root != location.mount_root {
+                return Err(PlanningError::ProtectedZone);
+            }
+            if (!labels.sensitive && labels.atomic_root.is_none()) || root == location.mount_root {
+                break;
+            }
+            root = root
+                .parent()
+                .ok_or(PlanningError::ProtectedRoot)?
+                .to_owned();
+        }
+        if root.components().any(|p| managed_component(p.as_os_str())) {
+            return Err(PlanningError::ProtectedRoot);
+        }
+        if let Ok(grant) = self.grant_for(&root, &policy) {
+            return Ok(grant.id.clone());
+        }
+        let info = file_tidy_platform::inspect(&root)?;
+        if info.kind != NodeKind::Directory {
+            return Err(PlanningError::UnsupportedNode);
+        }
+        let id = Id::new()?;
+        let grant = Grant {
+            id: id.clone(),
+            root: NativePath::new(&root),
+            identity: info
+                .identity
+                .ok_or(PlanningError::UnsupportedSafetyGuarantee)?
+                .into(),
+            mount: NativePath::new(&location.mount_root),
+            persistent: false,
+            revoked: false,
+            automatic: true,
         };
         let mut next = self.grants.clone();
         next.insert(id.clone(), grant);
@@ -360,26 +438,48 @@ impl Session {
         Ok(())
     }
     pub(crate) fn grant_for(&self, path: &Path, policy: &Policy) -> Result<&Grant> {
-        for grant in self.grants.values().filter(|g| !g.revoked) {
+        let mut candidates = self
+            .grants
+            .values()
+            .filter(|g| !g.revoked)
+            .filter_map(|g| {
+                g.root
+                    .to_path()
+                    .ok()
+                    .filter(|root| path.starts_with(root))
+                    .map(|root| (g, root))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_cached_key(|(_, root)| {
+            let labels = policy.labels(root);
+            (
+                labels.sensitive || labels.atomic_root.is_some(),
+                root.components().count(),
+            )
+        });
+        let mut invalid_grant = None;
+        for (grant, _) in candidates {
             let root_path = grant.root.to_path()?;
             if !path.starts_with(&root_path) {
                 continue;
             }
-            let root = grant.validate(policy)?;
+            let root = match grant.validate(policy) {
+                Ok(root) => root,
+                Err(error) => {
+                    invalid_grant.get_or_insert(error);
+                    continue;
+                }
+            };
             if !file_tidy_platform::is_mount_boundary(&root, path)? {
                 return Ok(grant);
             }
         }
-        Err(PlanningError::OutsideGrant)
+        Err(invalid_grant.unwrap_or(PlanningError::OutsideGrant))
     }
 }
 
 pub(crate) fn planning_policy() -> Result<Policy> {
-    let policy = Policy::new();
-    if !policy.warnings().is_empty() {
-        return Err(PlanningError::UnsupportedSafetyGuarantee);
-    }
-    Ok(policy)
+    Policy::for_planning().ok_or(PlanningError::UnsupportedSafetyGuarantee)
 }
 
 pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {

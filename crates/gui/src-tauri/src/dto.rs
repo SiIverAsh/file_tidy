@@ -21,6 +21,8 @@ pub enum ZoneKind {
     AProtected,
     #[serde(rename = "B_Sensitive")]
     BSensitive,
+    #[serde(rename = "C_DefaultAllowed")]
+    CDefaultAllowed,
     #[serde(rename = "C_GrantedSession")]
     CGrantedSession,
     #[serde(rename = "C_GrantedPersistent")]
@@ -81,6 +83,7 @@ pub fn build_policy_view(
 ) -> EntryPolicyView {
     let grant_match = grants.iter().find(|g| {
         !g.is_revoked()
+            && !g.is_automatic()
             && g.root()
                 .to_path()
                 .map(|root| path.starts_with(&root))
@@ -89,8 +92,6 @@ pub fn build_policy_view(
 
     let zone = if labels.protected {
         ZoneKind::AProtected
-    } else if labels.sensitive || has_sensitive_child {
-        ZoneKind::BSensitive
     } else if let Some(grant) = grant_match {
         if grant.is_persistent() {
             ZoneKind::CGrantedPersistent
@@ -98,7 +99,7 @@ pub fn build_policy_view(
             ZoneKind::CGrantedSession
         }
     } else {
-        ZoneKind::Unauthenticated
+        ZoneKind::CDefaultAllowed
     };
 
     let sensitivity_reason = if labels.sensitive || has_sensitive_child {
@@ -107,30 +108,19 @@ pub fn build_policy_view(
         None
     };
 
-    let mut allowed_actions = Vec::new();
-    let blocked_reason = match zone {
-        ZoneKind::AProtected => {
-            allowed_actions.push("copy_out");
-            Some(
-                "位于系统核心保护区（A 区）：禁止一切写入、移动或删除，仅允许复制到已授权 C 区。"
-                    .to_owned(),
-            )
-        }
-        ZoneKind::BSensitive => {
-            allowed_actions.push("copy_out");
-            Some("触及敏感隐私区（B 区）：禁止移动、重命名、隔离或删除；仅支持逐项内容许可后复制到非 B 的 C 区。".to_owned())
-        }
-        ZoneKind::Unauthenticated => {
-            allowed_actions.push("copy_out");
-            Some("尚未授予目录写入权限：当前仅支持只读查看或作为复制来源，请先在“授权与设置”授权该目录。".to_owned())
-        }
-        ZoneKind::CGrantedPersistent | ZoneKind::CGrantedSession => {
-            if labels.atomic_root.is_some() {
-                Some("属于项目/依赖/应用包受保护整体，不能单独拆开内部文件操作。".to_owned())
-            } else {
-                None
-            }
-        }
+    let blocked_reason = if labels.protected {
+        Some(
+            "位于系统核心保护区（A 区）：禁止写入、移动或删除，仅允许复制到普通本地目录。"
+                .to_owned(),
+        )
+    } else if labels
+        .atomic_root
+        .as_deref()
+        .is_some_and(|root| root != path)
+    {
+        Some("属于项目/依赖/应用包受保护整体，不能单独拆开内部文件操作。".to_owned())
+    } else {
+        None
     };
 
     EntryPolicyView {
@@ -139,7 +129,11 @@ pub fn build_policy_view(
         sensitive: labels.sensitive || has_sensitive_child,
         atomic_root_display: labels.atomic_root.as_deref().map(display_path),
         sensitivity_reason,
-        allowed_actions,
+        allowed_actions: if labels.protected {
+            vec!["copy_out"]
+        } else {
+            Vec::new()
+        },
         blocked_reason,
     }
 }
@@ -157,6 +151,21 @@ pub struct DuplicateGroupDto {
     pub size_bytes: String,
     pub duplicate_logical_bytes: String,
     pub blake3_prefix: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExtensionCountDto {
+    pub extension: String,
+    pub count: u64,
+    pub logical_bytes: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CategoryCountDto {
+    pub category: &'static str,
+    pub count: u64,
+    pub logical_bytes: String,
+    pub extensions: Vec<ExtensionCountDto>,
 }
 
 #[derive(Serialize)]
@@ -178,8 +187,95 @@ pub struct ScanSummaryDto {
     pub top_entry_ids: Vec<String>,
     pub stale_entry_ids: Vec<String>,
     pub duplicates: Vec<DuplicateGroupDto>,
+    pub category_counts: Vec<CategoryCountDto>,
     pub notices: Vec<String>,
     pub root_displays: Vec<String>,
+}
+
+const CATEGORY_ORDER: [Category; 8] = [
+    Category::Document,
+    Category::Image,
+    Category::Video,
+    Category::Audio,
+    Category::Archive,
+    Category::Code,
+    Category::Installer,
+    Category::Other,
+];
+
+fn entry_extension(entry: &FileEntry) -> String {
+    entry
+        .classification
+        .as_ref()
+        .and_then(|c| c.extension.as_deref())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            entry
+                .path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase)
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_category_counts(report: &ScanReport) -> Vec<CategoryCountDto> {
+    let mut totals: BTreeMap<Category, (u64, u64, BTreeMap<String, (u64, u64)>)> = BTreeMap::new();
+    for entry in &report.entries {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        let category = entry
+            .classification
+            .as_ref()
+            .map(|c| c.category)
+            .unwrap_or(Category::Other);
+        let bucket = totals
+            .entry(category)
+            .or_insert_with(|| (0, 0, BTreeMap::new()));
+        bucket.0 = bucket.0.saturating_add(1);
+        bucket.1 = bucket.1.saturating_add(entry.size_bytes);
+        let ext = entry_extension(entry);
+        let ext_bucket = bucket.2.entry(ext).or_insert((0, 0));
+        ext_bucket.0 = ext_bucket.0.saturating_add(1);
+        ext_bucket.1 = ext_bucket.1.saturating_add(entry.size_bytes);
+    }
+    let mut counts: Vec<(usize, CategoryCountDto)> = CATEGORY_ORDER
+        .iter()
+        .enumerate()
+        .filter_map(|(order, category)| {
+            totals.get(category).and_then(|(count, bytes, ext_map)| {
+                (*count > 0).then(|| {
+                    let mut extensions: Vec<ExtensionCountDto> = ext_map
+                        .iter()
+                        .map(|(ext, &(ext_count, ext_bytes))| ExtensionCountDto {
+                            extension: ext.clone(),
+                            count: ext_count,
+                            logical_bytes: ext_bytes.to_string(),
+                        })
+                        .collect();
+                    extensions.sort_by(|a, b| {
+                        b.count
+                            .cmp(&a.count)
+                            .then_with(|| a.extension.cmp(&b.extension))
+                    });
+                    (
+                        order,
+                        CategoryCountDto {
+                            category: category.as_str(),
+                            count: *count,
+                            logical_bytes: bytes.to_string(),
+                            extensions,
+                        },
+                    )
+                })
+            })
+        })
+        .collect();
+    counts.sort_by(|(order_a, a), (order_b, b)| {
+        b.count.cmp(&a.count).then_with(|| order_a.cmp(order_b))
+    });
+    counts.into_iter().map(|(_, item)| item).collect()
 }
 
 pub fn to_scan_summary_dto(
@@ -187,6 +283,7 @@ pub fn to_scan_summary_dto(
     report: &ScanReport,
     root_displays: Vec<String>,
 ) -> ScanSummaryDto {
+    let category_counts = summarize_category_counts(report);
     ScanSummaryDto {
         scan_generation: generation.to_string(),
         scanned_at_unix: report.scanned_at.unix_seconds.clone(),
@@ -216,6 +313,7 @@ pub fn to_scan_summary_dto(
                 blake3_prefix: g.blake3.chars().take(12).collect(),
             })
             .collect(),
+        category_counts,
         notices: report.notices.clone(),
         root_displays,
     }
@@ -239,6 +337,10 @@ pub enum SortField {
     ModifiedAsc,
 }
 
+fn default_extension_filter() -> String {
+    "all".to_owned()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScanFilter {
     pub tab: ScanTab,
@@ -246,6 +348,8 @@ pub struct ScanFilter {
     pub search_text: String,
     pub zone_filter: String,
     pub category_filter: String,
+    #[serde(default = "default_extension_filter")]
+    pub extension_filter: String,
     pub hide_hidden: bool,
     pub duplicate_group_id: Option<String>,
     pub skip_reason_filter: String,
@@ -306,6 +410,7 @@ pub fn entry_name_display(path: &Path) -> String {
 
 pub fn to_file_entry_dto(
     entry: &FileEntry,
+    size_bytes: u64,
     grants: &[&Grant],
     stale_set: &BTreeSet<u64>,
     sensitive_dirs: &BTreeSet<std::path::PathBuf>,
@@ -321,7 +426,7 @@ pub fn to_file_entry_dto(
             EntryKind::File => "file",
             EntryKind::Directory => "directory",
         },
-        size_bytes: entry.size_bytes.to_string(),
+        size_bytes: size_bytes.to_string(),
         allocated_bytes: entry.allocated_bytes.map(|n| n.to_string()),
         modified_unix: entry.modified.as_ref().map(|m| m.unix_seconds.clone()),
         hidden: entry.hidden,
@@ -476,12 +581,29 @@ pub fn filter_entries<'a>(
             }
         }
         if filter.category_filter != "all" {
+            if entry.kind != EntryKind::File {
+                return false;
+            }
             let cat = entry
                 .classification
                 .as_ref()
                 .map(|c| c.category.as_str())
                 .unwrap_or("other");
             if cat != filter.category_filter {
+                return false;
+            }
+        }
+        if filter.extension_filter != "all" {
+            if entry.kind != EntryKind::File {
+                return false;
+            }
+            let ext = entry_extension(entry);
+            let target = if filter.extension_filter == "__none__" {
+                ""
+            } else {
+                filter.extension_filter.as_str()
+            };
+            if ext != target {
                 return false;
             }
         }
@@ -492,11 +614,17 @@ pub fn filter_entries<'a>(
             let zone_str = match pv.zone {
                 ZoneKind::AProtected => "A_Protected",
                 ZoneKind::BSensitive => "B_Sensitive",
+                ZoneKind::CDefaultAllowed => "C_DefaultAllowed",
                 ZoneKind::CGrantedSession => "C_GrantedSession",
                 ZoneKind::CGrantedPersistent => "C_GrantedPersistent",
                 ZoneKind::Unauthenticated => "Unauthenticated",
             };
-            if zone_str != filter.zone_filter {
+            let matches = if filter.zone_filter == "B_Sensitive" {
+                pv.sensitive
+            } else {
+                zone_str == filter.zone_filter
+            };
+            if !matches {
                 return false;
             }
         }
@@ -631,36 +759,12 @@ pub struct PlanPreviewDto {
     pub blocked_b_write_reasons: Vec<String>,
 }
 
-/// Evaluates strict GUI B-zone policy:
-/// - Any `:write` acknowledgement or non-copy-out B-zone operation is rejected and listed in `blocked_b_write_reasons`.
-/// - Only `:content` acknowledgements on `Copy` / `UndoCopy` (copying out of B into non-B C) are surfaced as confirmable.
+/// Sensitivity is advisory in the GUI. The execution command supplies the core
+/// acknowledgements from this reviewed plan without requesting per-file input.
 pub fn to_plan_preview_dto(plan: &Plan, session: &Session) -> PlanPreviewDto {
     let preview = plan.preview();
     let policy = Policy::new();
     let grants: Vec<&Grant> = session.grants().collect();
-
-    let mut blocked_b_write_reasons = Vec::new();
-    let mut sensitive_acknowledgements = Vec::new();
-
-    for key in &preview.sensitive_acknowledgements {
-        if key.ends_with(":write") {
-            let desc = plan
-                .acknowledgement_description(key)
-                .unwrap_or_else(|_| key.clone());
-            blocked_b_write_reasons.push(format!(
-                "拒绝写入或修改 B 区敏感对象（仅允许从 B 复制出到非 B 的 C 目录）：{desc}"
-            ));
-        } else if key.ends_with(":content") {
-            let desc = plan
-                .acknowledgement_description(key)
-                .unwrap_or_else(|_| key.clone());
-            sensitive_acknowledgements.push(SensitiveAckDto {
-                key: key.clone(),
-                description: desc,
-                kind: "copy_out_content",
-            });
-        }
-    }
 
     let operations: Vec<PlannedOperationDto> = preview
         .operations
@@ -671,13 +775,7 @@ pub fn to_plan_preview_dto(plan: &Plan, session: &Session) -> PlanPreviewDto {
                 .sensitive_acknowledgements
                 .iter()
                 .any(|key| key.starts_with(&destination_prefix) && key.ends_with(":write"));
-            to_planned_op_dto(
-                op,
-                &policy,
-                &grants,
-                destination_sensitive,
-                &mut blocked_b_write_reasons,
-            )
+            to_planned_op_dto(op, &policy, &grants, destination_sensitive)
         })
         .collect();
 
@@ -699,13 +797,13 @@ pub fn to_plan_preview_dto(plan: &Plan, session: &Session) -> PlanPreviewDto {
         confirmation_count: preview.confirmation_count.to_string(),
         total_bytes: preview.total_bytes.clone(),
         requires_count_confirmation: preview.requires_count_confirmation,
-        sensitive_acknowledgements,
+        sensitive_acknowledgements: Vec::new(),
         has_permanent_delete: preview
             .operations
             .iter()
             .any(|op| op.kind == OperationKind::PermanentDelete),
         executable_error,
-        blocked_b_write_reasons,
+        blocked_b_write_reasons: Vec::new(),
     }
 }
 
@@ -714,7 +812,6 @@ fn to_planned_op_dto(
     policy: &Policy,
     grants: &[&Grant],
     destination_sensitive: bool,
-    blocked_b_write_reasons: &mut Vec<String>,
 ) -> PlannedOperationDto {
     let source_path = op.source.to_path().ok();
     let source_labels = source_path
@@ -722,13 +819,6 @@ fn to_planned_op_dto(
         .map(|p| policy.labels(p))
         .unwrap_or_default();
     let has_sensitive_child = op.manifest.iter().any(|m| m.sensitive);
-
-    if has_sensitive_child && !matches!(op.kind, OperationKind::Copy | OperationKind::UndoCopy) {
-        blocked_b_write_reasons.push(format!(
-            "操作 {:?} 涉及 B 区敏感项（{}），核心策略禁止对 B 区执行写/移动/隔离/永久删除。",
-            op.kind, op.source.display
-        ));
-    }
 
     let source_policy = match source_path.as_deref() {
         Some(p) => build_policy_view(p, &source_labels, grants, has_sensitive_child),
@@ -756,12 +846,6 @@ fn to_planned_op_dto(
                     .map(|parent| policy.labels(&parent))
                     .unwrap_or_else(|_| policy.labels(p));
                 lbl.sensitive |= destination_sensitive;
-                if lbl.sensitive {
-                    blocked_b_write_reasons.push(format!(
-                        "目标路径位于 B 敏感区，禁止写入：{}",
-                        d.path.display
-                    ));
-                }
                 build_policy_view(p, &lbl, grants, false)
             });
             let dto = DestinationDto {
@@ -1074,6 +1158,7 @@ pub fn to_recovery_dto(report: &RecoveryReport) -> RecoveryReportDto {
 pub struct PickedScanRootsDto {
     pub roots_display: Vec<String>,
     pub policies: Vec<EntryPolicyView>,
+    pub cancelled: bool,
 }
 
 #[derive(Serialize)]
@@ -1092,4 +1177,51 @@ pub struct PickedDestinationDto {
 
 pub fn category_str_matches(_cat: Category) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitivity_and_sensitive_children_do_not_require_directory_authorization() {
+        let labels = PolicyLabels {
+            sensitive: true,
+            ..PolicyLabels::default()
+        };
+        for has_sensitive_child in [false, true] {
+            let view = build_policy_view(Path::new("workspace"), &labels, &[], has_sensitive_child);
+            assert_eq!(view.zone, ZoneKind::CDefaultAllowed);
+            assert!(view.sensitive);
+            assert!(view.blocked_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn default_access_keeps_system_and_atomic_child_restrictions() {
+        let protected = PolicyLabels {
+            protected: true,
+            ..PolicyLabels::default()
+        };
+        let view = build_policy_view(Path::new("system"), &protected, &[], false);
+        assert_eq!(view.zone, ZoneKind::AProtected);
+        assert!(view.blocked_reason.is_some());
+        assert_eq!(view.allowed_actions, vec!["copy_out"]);
+
+        let root = Path::new("project");
+        let atomic = PolicyLabels {
+            atomic_root: Some(root.to_path_buf()),
+            ..PolicyLabels::default()
+        };
+        assert!(
+            build_policy_view(root, &atomic, &[], false)
+                .blocked_reason
+                .is_none()
+        );
+        assert!(
+            build_policy_view(&root.join("child"), &atomic, &[], false)
+                .blocked_reason
+                .is_some()
+        );
+    }
 }

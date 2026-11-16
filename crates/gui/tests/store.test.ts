@@ -5,7 +5,7 @@ import {
   formatCountdown,
   parseBigIntSafe,
 } from "../src/components/safe-text.ts";
-import { describeSensitivityReason } from "../src/components/zone-badge.ts";
+import { describeSensitivityReason, describeZoneLabel } from "../src/components/zone-badge.ts";
 import type { SelectionSpec } from "../src/api/types.ts";
 import {
   AppStore,
@@ -82,10 +82,11 @@ test("Changing filters clears the old filtered selection before notifying plan c
   assert.equal(selectedCountEstimate(store.state.selection, 20, "1"), 0);
 });
 
-test("B-zone cascade reasons have clear human descriptions", () => {
+test("Default directory access is allowed and sensitivity descriptions are advisory", () => {
+  assert.equal(describeZoneLabel("C_DefaultAllowed").text, "默认允许");
   assert.match(
     describeSensitivityReason("contains_sensitive_child") ?? "",
-    /级联拒绝原因/,
+    /无需逐项授权/,
   );
   assert.match(
     describeSensitivityReason("hardlink_alias_propagated") ?? "",
