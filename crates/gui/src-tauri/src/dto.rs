@@ -203,6 +203,13 @@ const CATEGORY_ORDER: [Category; 8] = [
     Category::Other,
 ];
 
+#[derive(Default)]
+struct CategoryTotals {
+    count: u64,
+    logical_bytes: u64,
+    extensions: BTreeMap<String, (u64, u64)>,
+}
+
 fn entry_extension(entry: &FileEntry) -> String {
     entry
         .classification
@@ -220,7 +227,7 @@ fn entry_extension(entry: &FileEntry) -> String {
 }
 
 fn summarize_category_counts(report: &ScanReport) -> Vec<CategoryCountDto> {
-    let mut totals: BTreeMap<Category, (u64, u64, BTreeMap<String, (u64, u64)>)> = BTreeMap::new();
+    let mut totals: BTreeMap<Category, CategoryTotals> = BTreeMap::new();
     for entry in &report.entries {
         if entry.kind != EntryKind::File {
             continue;
@@ -230,13 +237,11 @@ fn summarize_category_counts(report: &ScanReport) -> Vec<CategoryCountDto> {
             .as_ref()
             .map(|c| c.category)
             .unwrap_or(Category::Other);
-        let bucket = totals
-            .entry(category)
-            .or_insert_with(|| (0, 0, BTreeMap::new()));
-        bucket.0 = bucket.0.saturating_add(1);
-        bucket.1 = bucket.1.saturating_add(entry.size_bytes);
+        let bucket = totals.entry(category).or_default();
+        bucket.count = bucket.count.saturating_add(1);
+        bucket.logical_bytes = bucket.logical_bytes.saturating_add(entry.size_bytes);
         let ext = entry_extension(entry);
-        let ext_bucket = bucket.2.entry(ext).or_insert((0, 0));
+        let ext_bucket = bucket.extensions.entry(ext).or_insert((0, 0));
         ext_bucket.0 = ext_bucket.0.saturating_add(1);
         ext_bucket.1 = ext_bucket.1.saturating_add(entry.size_bytes);
     }
@@ -244,9 +249,10 @@ fn summarize_category_counts(report: &ScanReport) -> Vec<CategoryCountDto> {
         .iter()
         .enumerate()
         .filter_map(|(order, category)| {
-            totals.get(category).and_then(|(count, bytes, ext_map)| {
-                (*count > 0).then(|| {
-                    let mut extensions: Vec<ExtensionCountDto> = ext_map
+            totals.get(category).and_then(|bucket| {
+                (bucket.count > 0).then(|| {
+                    let mut extensions: Vec<ExtensionCountDto> = bucket
+                        .extensions
                         .iter()
                         .map(|(ext, &(ext_count, ext_bytes))| ExtensionCountDto {
                             extension: ext.clone(),
@@ -263,8 +269,8 @@ fn summarize_category_counts(report: &ScanReport) -> Vec<CategoryCountDto> {
                         order,
                         CategoryCountDto {
                             category: category.as_str(),
-                            count: *count,
-                            logical_bytes: bytes.to_string(),
+                            count: bucket.count,
+                            logical_bytes: bucket.logical_bytes.to_string(),
                             extensions,
                         },
                     )

@@ -1071,7 +1071,10 @@ fn scan_summary_reports_per_category_file_counts_excluding_directories() -> Test
     assert_eq!(by_cat.get("image"), Some(&(1, "7")));
     assert_eq!(by_cat.get("code"), Some(&(1, "12")));
     assert_eq!(by_cat.get("other"), Some(&(1, "4")));
-    assert_eq!(summary.category_counts.iter().map(|c| c.count).sum::<u64>(), 5);
+    assert_eq!(
+        summary.category_counts.iter().map(|c| c.count).sum::<u64>(),
+        5
+    );
 
     let doc_cat = summary
         .category_counts
